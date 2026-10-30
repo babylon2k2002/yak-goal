@@ -312,6 +312,20 @@ mod tests {
             .with_tool(COMPRESS_TOOL_NAME, call_id)
     }
 
+    fn block_with_span(
+        id: &str,
+        call_id: Option<&str>,
+        active: bool,
+        span: Option<(&str, &str)>,
+    ) -> CompressionBlock {
+        let mut block = block(id, call_id, active);
+        if let Some((start, end)) = span {
+            block.start_ref = Some(start.to_string());
+            block.end_ref = Some(end.to_string());
+        }
+        block
+    }
+
     fn block(id: &str, call_id: Option<&str>, active: bool) -> CompressionBlock {
         CompressionBlock {
             block_id: id.to_string(),
@@ -446,7 +460,9 @@ mod tests {
     #[test]
     fn a_long_summary_in_a_live_call_is_stubbed() {
         let mut state = create_initial_state();
-        state.blocks.push(block("b1", Some("c1"), true));
+        state
+            .blocks
+            .push(block_with_span("b1", Some("c1"), true, Some(("m00001", "m00002"))));
         let long = "x".repeat(500);
         let text = format!(
             "{{\"content\":[{{\"startId\":\"m00001\",\"endId\":\"m00002\",\"summary\":\"{long}\"}}]}}"
@@ -464,7 +480,9 @@ mod tests {
     #[test]
     fn a_short_summary_is_left_alone() {
         let mut state = create_initial_state();
-        state.blocks.push(block("b1", Some("c1"), true));
+        state
+            .blocks
+            .push(block_with_span("b1", Some("c1"), true, Some(("m00001", "m00002"))));
         let text = args(&[("m00001", "m00002")]);
         let msgs = vec![user("t1.0"), compress_call("t1.1", "c1", &text)];
         let out = hide_consumed_compress_calls(&state, &msgs);
@@ -473,6 +491,18 @@ mod tests {
             text,
             "an unchanged call must stay byte-identical for the prefix cache"
         );
+    }
+
+    #[test]
+    fn a_block_without_a_recorded_span_leaves_its_call_untouched() {
+        // Without the refs the block cannot say which ranges are still live,
+        // and a wrong rewrite is worse than a stale one.
+        let mut state = create_initial_state();
+        state.blocks.push(block("b1", Some("c1"), true));
+        let text = args(&[("m00001", "m00002")]);
+        let msgs = vec![user("t1.0"), compress_call("t1.1", "c1", &text)];
+        let out = hide_consumed_compress_calls(&state, &msgs);
+        assert_eq!(out.messages[1].text_or_empty(), text);
     }
 
     #[test]
