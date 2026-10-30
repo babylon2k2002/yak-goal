@@ -133,7 +133,23 @@ pub fn apply_compression(
         foldable.push(message);
     }
 
-    if foldable.is_empty() {
+    // A consumed block's summary counts toward what this fold replaces.
+    let mut consumed_block_ids = Vec::new();
+    for block_id in &range.nested_block_ids {
+        if let Some(block) = block_by_id(state, block_id)
+            && block.active
+        {
+            compressed_tokens +=
+                crate::agent::bigctx::tokenize::default_count_tokens(&block.summary);
+            consumed_block_ids.push(block.block_id.clone());
+        }
+    }
+
+    // Distilling blocks into a higher tier is the NORMAL case for this check:
+    // such a range cites `bN..bN`, so it carries no message ids at all. Bailing
+    // on `foldable.is_empty()` before collecting the nested blocks made every
+    // tier-2 fold fail with "nothing to compress".
+    if foldable.is_empty() && consumed_block_ids.is_empty() {
         if protected_seen > 0 {
             return Err(CompressError::AllProtected);
         }
@@ -142,19 +158,9 @@ pub fn apply_compression(
         });
     }
 
-    // A consumed block's summary counts toward what this fold replaces.
-    let mut consumed_block_ids = Vec::new();
-    for block_id in &range.nested_block_ids {
-        if let Some(block) = block_by_id(state, block_id) {
-            if block.active {
-                compressed_tokens += crate::agent::bigctx::tokenize::default_count_tokens(
-                    &block.summary,
-                );
-                consumed_block_ids.push(block.block_id.clone());
-            }
-        }
-    }
-
+    // A pure distillation has no message mass to compare against the floor: the
+    // thing being replaced is the blocks' summaries, and folding them is the
+    // point of the tier rather than an optimisation that must clear a bar.
     if compressed_tokens < config.compress.min_range_tokens && consumed_block_ids.is_empty() {
         return Err(CompressError::RangeTooSmall {
             tokens: compressed_tokens,
@@ -495,6 +501,79 @@ mod tests {
     }
 
     #[test]
+    fn a_pure_block_range_compresses_without_any_message_ids() {
+        // Regression: a `b1..b1` range carries no message ids, so collecting
+        // the nested blocks AFTER the empty-check made every tier-2 fold fail
+        // with "nothing to compress" — the normal distillation path.
+        let mut state = create_initial_state();
+        let msgs = vec![user("t1.1", &big(400))];
+        let c = cfg();
+        apply_compression(
+            &mut state,
+            &msgs,
+            &range(&["t1.1"], &[]),
+            SUMMARY,
+            &no_protection(),
+            &c,
+            None,
+            0,
+        )
+        .unwrap();
+
+        // no message ids at all, only the block
+        let out = apply_compression(
+            &mut state,
+            &msgs,
+            &range(&[], &["b1"]),
+            SUMMARY,
+            &no_protection(),
+            &c,
+            None,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(out.tier, Tier::Two);
+        assert_eq!(out.message_count, 0);
+        assert_eq!(out.consumed_block_ids, vec!["b1"]);
+        assert!(out.compressed_tokens > 0, "the block's summary counts");
+    }
+
+    #[test]
+    fn a_pure_block_range_ignores_the_message_range_floor() {
+        // The floor exists to stop someone folding three tiny messages. A
+        // distillation replaces summaries, so the floor does not apply.
+        let mut state = create_initial_state();
+        let msgs = vec![user("t1.1", &big(400))];
+        let mut c = cfg();
+        c.compress.min_range_tokens = 0;
+        apply_compression(
+            &mut state,
+            &msgs,
+            &range(&["t1.1"], &[]),
+            SUMMARY,
+            &no_protection(),
+            &c,
+            None,
+            0,
+        )
+        .unwrap();
+
+        c.compress.min_range_tokens = 1_000_000;
+        let out = apply_compression(
+            &mut state,
+            &msgs,
+            &range(&[], &["b1"]),
+            SUMMARY,
+            &no_protection(),
+            &c,
+            None,
+            0,
+        );
+        assert!(out.is_ok(), "the floor must not gate a distillation: {out:?}");
+    }
+
+    #[test]
     fn a_consumed_blocks_coverage_is_inherited() {
         let mut state = create_initial_state();
         let msgs = vec![user("t1.1", &big(400))];
@@ -563,7 +642,7 @@ mod tests {
     #[test]
     fn tier_two_distillation_fires_on_the_configured_count() {
         let mut state = create_initial_state();
-        let mut c = default_config(200_000);
+        let mut c = cfg();
         c.tiers.tier2_trigger = 2;
         assert_eq!(distillation_due(&state, &c), None);
 
@@ -587,7 +666,7 @@ mod tests {
     #[test]
     fn distillation_is_off_when_tiers_are_disabled() {
         let mut state = create_initial_state();
-        let mut c = default_config(200_000);
+        let mut c = cfg();
         c.tiers.enabled = false;
         c.tiers.tier2_trigger = 1;
         let msgs = vec![user("t1.1", &big(400))];
