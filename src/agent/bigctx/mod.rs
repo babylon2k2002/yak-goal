@@ -22,6 +22,14 @@
 //! provider knowledge. The host (see [`super::compact`]) owns the mapping to
 //! and from `Msg` and decides when to run.
 
+// The algorithm is complete and tested but not yet wired into a session: no
+// production path calls it, so every item in here is "never used" from rustc's
+// point of view. Silencing that at the module boundary is deliberate — a
+// per-item `#[allow]` would be a lie (the item IS unused) and would also mask
+// the day one of them genuinely rots. This comes off the moment `session` and
+// `compact` start calling in.
+#![allow(dead_code)]
+
 pub mod boundaries;
 pub mod compress;
 pub mod config;
