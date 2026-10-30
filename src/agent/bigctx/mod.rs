@@ -25,6 +25,7 @@
 pub mod boundaries;
 pub mod compress;
 pub mod config;
+pub mod host;
 pub mod protected;
 pub mod prune;
 pub mod refs;
@@ -35,6 +36,7 @@ pub mod types;
 pub use boundaries::{ResolvedRange, parse_boundary, resolve_boundaries};
 pub use compress::{CompressError, CompressOutcome, apply_compression, decompress_block};
 pub use config::{BigctxConfig, default_config};
+pub use host::{IdScheme, Projection, project, render};
 pub use protected::{Protection, compute_protection};
 pub use prune::{PruneOptions, prune, summary_message_id};
 pub use refs::{assign_refs, empty_ref_map, index_to_ref, ref_to_index};
