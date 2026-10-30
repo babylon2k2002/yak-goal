@@ -752,6 +752,13 @@ fn recoverable_failure(error: &str) -> bool {
     if error == "interrupted" {
         return false;
     }
+    // A misconfiguration is not a flaky link. `Err(String)` carries both, so
+    // the transport-shaped fallback at the bottom of this function used to
+    // resend an unknown provider kind five times before reporting it — five
+    // identical failures for something no retry can fix.
+    if crate::providers::is_config_error(error) {
+        return false;
+    }
     if crate::providers::is_truncation(error)
         || error.starts_with("stream: ")
         || error.starts_with("stream idle ")

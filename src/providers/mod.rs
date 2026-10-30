@@ -599,6 +599,18 @@ pub fn is_truncation(error: &str) -> bool {
     error == TRUNCATED_STREAM
 }
 
+/// Whether an error is a misconfiguration rather than a failure of the link.
+///
+/// Both arrive as `Err(String)`, and the retry logic decides what to resend by
+/// pattern-matching the text. A configuration error that does not look like
+/// `HTTP <n>` therefore fell through to the "assume the transport broke"
+/// branch and was resent the full retry budget — five identical failures for
+/// something no retry can fix, and five extra round trips before the user is
+/// told their provider kind is wrong.
+pub fn is_config_error(error: &str) -> bool {
+    error.starts_with("Unknown provider kind: ") || error.starts_with("invalid --thinking ")
+}
+
 /// Run an SSE request, parsing each event's data as JSON and handing
 /// (event_type, value) to `on_value`. An `error` event aborts with its
 /// message (parsed when possible, raw otherwise). A stream that closes

@@ -1281,3 +1281,27 @@ fn an_unknown_provider_fails_without_stream_recovery() {
     assert_eq!(error.message, "Unknown provider kind: unknown-wire");
     assert_eq!(recovered, 0);
 }
+
+#[test]
+fn a_config_error_is_not_resent() {
+    // Regression: `recoverable_failure` decided by text shape, and a
+    // configuration error matches none of the transport patterns — so it fell
+    // through to "assume the link broke" and was resent the full budget.
+    assert!(!recoverable_failure("Unknown provider kind: unknown-wire"));
+    assert!(!recoverable_failure("invalid --thinking 'huge' (off, minimal, low, medium, high, xhigh)"));
+}
+
+#[test]
+fn a_transport_failure_is_still_resent() {
+    // The guard above must not swallow the cases retrying exists for.
+    assert!(recoverable_failure("HTTP 503 from gateway"));
+    assert!(recoverable_failure("HTTP 429 rate limited"));
+    assert!(recoverable_failure("stream: connection reset"));
+    assert!(recoverable_failure(crate::providers::TRUNCATED_STREAM));
+    assert!(recoverable_failure("something with no prefix at all"));
+}
+
+#[test]
+fn an_interrupt_is_never_resent() {
+    assert!(!recoverable_failure("interrupted"));
+}
