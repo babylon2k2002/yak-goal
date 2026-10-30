@@ -345,6 +345,10 @@ impl Session {
         // each `RoundEnd` and reset for the next round
         let mut round_reasoning = String::new();
         let mut round_started = std::time::Instant::now();
+        // The model is sent the compressed view, not the raw history. A fold
+        // replaces a range with a summary; the originals stay in `self.seed`,
+        // so nothing is lost and a later turn can restore them.
+        let mut view_seed = self.bigctx_view();
         let identity = TaskIdentity {
             model,
             cwd: &self.cwd,
@@ -549,10 +553,6 @@ impl Session {
         // interrupt; the watcher is paused around approval prompts, which
         // read the same stdin
         let mut watcher = crate::term::lineedit::KeyWatcher::start();
-        // The model is sent the compressed view, not the raw history. A fold
-        // replaces a range with a summary; the originals stay in `self.seed`,
-        // so nothing is lost and a later turn can restore them.
-        let mut view_seed = self.bigctx_view();
         let mut on_approval = |req: ApprovalRequest| {
             // keystrokes have no meaning while the watcher runs, so stopping
             // it just hands the terminal back to the approval prompt
@@ -680,6 +680,10 @@ impl Session {
         let view = std::cell::RefCell::new(crate::term::render::TaskView::new(2, &model_id, true));
         view.borrow_mut().terminal_md(2);
         let started = std::time::Instant::now();
+        // The model is sent the compressed view, not the raw history. A fold
+        // replaces a range with a summary; the originals stay in `self.seed`,
+        // so nothing is lost and a later turn can restore them.
+        let mut view_seed = self.bigctx_view();
         let identity = TaskIdentity {
             model,
             cwd: &self.cwd,
@@ -817,10 +821,6 @@ impl Session {
         // thing. The hardcoded refusals never consult an approval prompt at
         // all, so they still deny under this flag.
         let unattended_allow = self.unattended_allow;
-        // The model is sent the compressed view, not the raw history. A fold
-        // replaces a range with a summary; the originals stay in `self.seed`,
-        // so nothing is lost and a later turn can restore them.
-        let mut view_seed = self.bigctx_view();
         let mut on_approval = |req: ApprovalRequest| {
             if unattended_allow {
                 emit_event(&serde_json::json!({
