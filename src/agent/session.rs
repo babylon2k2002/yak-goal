@@ -562,9 +562,6 @@ impl Session {
             // keystrokes have no meaning while the watcher runs, so stopping
             // it just hands the terminal back to the approval prompt
             watcher.stop();
-        // keep the compression state the pass produced: its block ids and refs
-        // are what let a later turn restore what this one folded
-        self.bigctx = bigctx_state;
             // silence the spinner and close the thinking trace so the
             // banner lands on a clean line
             view.borrow_mut().pause();
@@ -591,6 +588,9 @@ impl Session {
             },
         );
         watcher.stop();
+        // keep the compression state the pass produced: its block ids and refs
+        // are what let a later turn restore what this one folded
+        self.bigctx = bigctx_state;
         // an interrupted task may never see TurnEnd: flush any partial
         // markdown line here too (abort is idempotent)
         view.borrow_mut().abort();
