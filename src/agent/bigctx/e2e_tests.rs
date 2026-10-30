@@ -246,15 +246,16 @@ fn a_compress_call_made_by_the_model_survives_the_turn() {
         "the block must cover the messages it folded"
     );
 
-    // And the tool's reply reached the model as a tool result.
+    // And the tool's reply reached the model as a tool result. The seed already
+    // carries eight `read` results, so find the one this tool produced by name.
     let tool_reply = outcome
         .history
         .iter()
         .find_map(|m| match m {
-            Msg::ToolResult { content, .. } => Some(content.clone()),
+            Msg::ToolResult { name, content, .. } if name == "compress" => Some(content.clone()),
             _ => None,
         })
-        .expect("the tool result rides the history");
+        .expect("the compress tool result rides the history");
     assert!(
         tool_reply.contains("Compressed:") && tool_reply.contains("b1"),
         "the model must be told which block it created: {tool_reply}"
@@ -269,10 +270,12 @@ fn a_compress_call_made_by_the_model_survives_the_turn() {
 #[test]
 fn the_next_turn_sends_a_smaller_view_than_the_history() {
     let history = history_with_bulk();
-    let mut state = crate::agent::bigctx::create_initial_state();
 
-    // Fold everything but the pinned first user message.
+    // Fold everything but the pinned first user message. The state must be the
+    // one the session assigned refs to — a fresh state has no refs and every
+    // screened range fails to resolve.
     let session = bigctx_session(&history);
+    let mut state = session.state.clone();
     let ranges = crate::agent::bigctx::screen(
         &session.messages,
         &session.state,
@@ -298,16 +301,6 @@ fn the_next_turn_sends_a_smaller_view_than_the_history() {
         &state,
     )
     .expect("the screened range must resolve");
-
-    let mut next = 1u64;
-    crate::agent::bigctx::assign_refs(
-        &projection.messages,
-        &mut state.message_refs,
-        &mut next,
-        |_| false,
-    )
-    .unwrap();
-    state.next_ref_index = next;
 
     let protection = crate::agent::bigctx::compute_protection(
         &projection.messages,
@@ -389,11 +382,18 @@ fn the_tools_refuse_to_run_without_a_session() {
     let tools = crate::agent::bigctx::bigctx_tools(BigctxHandle::new());
     let mut log = |_| {};
     for tool in &tools {
-        let out = tool.execute(
-            &json!({"content": [], "blockId": "b1"}),
-            std::path::Path::new("."),
-            &mut log,
-        );
+        // Arguments each tool would accept, so the refusal comes from the
+        // missing session rather than from argument validation.
+        let args = match tool.name() {
+            "compress" => json!({"content": [{
+                "startId": "m00001",
+                "endId": "m00002",
+                "summary": "a summary long enough to clear the minimum size check"
+            }]}),
+            "decompress" => json!({"blockId": "b1"}),
+            _ => json!({}),
+        };
+        let out = tool.execute(&args, std::path::Path::new("."), &mut log);
         assert!(
             out.error.is_some(),
             "`{}` must refuse without a session",
