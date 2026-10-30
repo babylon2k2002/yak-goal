@@ -131,7 +131,6 @@ pub fn advance_survival(state: &mut CompressionState, threshold: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::bigctx::prune::summary_message_id;
     use crate::agent::bigctx::state::create_initial_state;
     use crate::agent::bigctx::types::{
         BlockGeneration, CompressionBlock, MessageContentType, MessageRole, Tier,
@@ -178,10 +177,18 @@ mod tests {
         state.blocks.push(block("b1", &["t1.0"], &[]));
         state.blocks.push(block("b2", &[], &["b1"]));
         state.blocks[0].active = false;
-        let msgs = vec![user("t1.0")];
+        // The view shows b2's rendered summary, not b1's — that is what a
+        // parent fold looks like to the host.
+        let msgs = vec![CoreMessage::new(
+            summary_message_id("b2"),
+            MessageRole::System,
+            MessageContentType::Text,
+        )
+        .with_text("[Compressed conversation section]
+merged")];
         let (next, _) = sync_blocks(&msgs, &state);
         assert!(!next.blocks[0].active, "b1 lives inside b2 now");
-        assert!(next.blocks[1].active);
+        assert!(next.blocks[1].active, "b2 is the visible representation");
     }
 
     #[test]

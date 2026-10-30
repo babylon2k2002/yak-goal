@@ -194,8 +194,10 @@ mod tests {
     fn a_fold_replaces_its_material_with_a_summary() {
         let cfg = default_config(200_000);
         let mut state = create_initial_state();
-        state.blocks.push(block("b1", &["t1.0"]));
-        let msgs = vec![user("t1.0", "folded away"), user("t1.1", "still here")];
+        state.blocks.push(block("b1", &["t1.1"]));
+        // t1.0 is the first user message, and prune pins that one: folding it
+        // would lose the task statement and move the prefix-cache anchor.
+        let msgs = vec![user("t1.0", "the task"), user("t1.1", "folded away")];
 
         let out = process_turn(&msgs, &state, &cfg);
         assert!(
@@ -203,10 +205,13 @@ mod tests {
             "the folded material must be replaced by a summary"
         );
         assert!(
-            !out.messages.iter().any(|m| m.id == "t1.0"),
-            "the original must be gone from the view"
+            !out.messages.iter().any(|m| m.id == "t1.1"),
+            "the folded message must be gone from the view"
         );
-        assert!(out.messages.iter().any(|m| m.id == "t1.1"));
+        assert!(
+            out.messages.iter().any(|m| m.id == "t1.0"),
+            "the first user message is pinned"
+        );
     }
 
     #[test]
