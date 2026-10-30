@@ -2537,4 +2537,141 @@ mod tests {
             "a\nb"
         );
     }
+
+    // ── bigctx wiring ──────────────────────────────────────────────────────
+
+    fn fold_first_block(session: &mut Session, covers: &[&str]) {
+        use crate::agent::bigctx::{
+            BlockGeneration, CompressionBlock, Tier, create_initial_state,
+        };
+        let mut state = create_initial_state();
+        state.blocks.push(CompressionBlock {
+            block_id: "b1".into(),
+            run_id: "r1".into(),
+            tier: Tier::One,
+            topic: None,
+            summary: "the earlier exchange, condensed".into(),
+            direct_message_ids: covers.iter().map(|s| s.to_string()).collect(),
+            effective_message_ids: covers.iter().map(|s| s.to_string()).collect(),
+            direct_block_ids: vec![],
+            compressed_tokens: 500,
+            created_at: 0,
+            survived_count: 0,
+            generation: BlockGeneration::Young,
+            active: true,
+            expanded: false,
+            duration_ms: None,
+            compress_call_id: None,
+        });
+        session.bigctx = Some(state);
+    }
+
+    #[test]
+    fn a_session_with_no_blocks_sends_its_history_verbatim() {
+        let seed = vec![Msg::user("a"), Msg::assistant("b")];
+        let session = tight_session(seed.clone());
+        let (view, state) = bigctx_view(
+            &session.seed,
+            session.bigctx.as_ref(),
+            session.bigctx_round,
+            None,
+        );
+        assert_eq!(view, seed, "nothing folded means nothing to project");
+        assert!(state.is_none(), "and no state is created");
+    }
+
+    #[test]
+    fn a_fold_replaces_the_range_in_the_view_but_not_the_seed() {
+        let seed = vec![
+            Msg::user("the task"),
+            Msg::assistant("first answer"),
+            Msg::assistant("second answer"),
+        ];
+        let mut session = tight_session(seed.clone());
+        fold_first_block(&mut session, &["t1.1"]);
+
+        let (view, _state) = bigctx_view(
+            &session.seed,
+            session.bigctx.as_ref(),
+            session.bigctx_round,
+            None,
+        );
+
+        assert!(
+            view.iter().any(|m| matches!(m, Msg::Summary { .. })),
+            "the folded range must become a summary in the view"
+        );
+        assert_eq!(
+            session.seed, seed,
+            "the seed keeps the originals — a fold is reversible"
+        );
+        assert!(
+            view.len() <= seed.len(),
+            "folding must not grow the request"
+        );
+    }
+
+    #[test]
+    fn the_first_user_message_survives_a_fold() {
+        // prune pins it: losing it loses the task statement and moves the
+        // provider's prefix-cache anchor.
+        let seed = vec![Msg::user("the task"), Msg::assistant("answer")];
+        let mut session = tight_session(seed);
+        fold_first_block(&mut session, &["t1.0"]);
+
+        let (view, _) = bigctx_view(
+            &session.seed,
+            session.bigctx.as_ref(),
+            session.bigctx_round,
+            None,
+        );
+        assert!(
+            view.iter()
+                .any(|m| matches!(m, Msg::User { text, .. } if text == "the task")),
+            "the pinned first user message must stay visible"
+        );
+    }
+
+    #[test]
+    fn the_state_survives_a_projection_so_a_later_turn_can_restore() {
+        let seed = vec![Msg::user("task"), Msg::assistant("a"), Msg::assistant("b")];
+        let mut session = tight_session(seed);
+        fold_first_block(&mut session, &["t1.1"]);
+
+        let (_view, state) = bigctx_view(
+            &session.seed,
+            session.bigctx.as_ref(),
+            session.bigctx_round,
+            None,
+        );
+        let state = state.expect("a projection must return state");
+        assert!(
+            state.blocks.iter().any(|b| b.block_id == "b1"),
+            "the block record must survive, or the fold is not reversible"
+        );
+        assert!(
+            state.message_refs.ref_for("t1.1").is_some(),
+            "refs are what a restore names"
+        );
+    }
+
+    #[test]
+    fn projection_is_idempotent_across_turns() {
+        let seed = vec![Msg::user("task"), Msg::assistant("a"), Msg::assistant("b")];
+        let mut session = tight_session(seed);
+        fold_first_block(&mut session, &["t1.1"]);
+
+        let (first_view, first_state) = bigctx_view(
+            &session.seed,
+            session.bigctx.as_ref(),
+            session.bigctx_round,
+            None,
+        );
+        let (second_view, _) = bigctx_view(&session.seed, first_state.as_ref(), session.bigctx_round, None);
+        assert_eq!(
+            first_view.len(),
+            second_view.len(),
+            "a second pass over the same history must not change the shape"
+        );
+    }
 }
