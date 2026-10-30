@@ -38,6 +38,9 @@ pub mod state;
 pub mod sync;
 pub mod tokenize;
 pub mod tools;
+
+#[cfg(test)]
+mod e2e_tests;
 pub mod turn_integrity;
 pub mod types;
 
