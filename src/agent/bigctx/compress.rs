@@ -287,6 +287,7 @@ mod tests {
     use crate::agent::bigctx::boundaries::BoundaryKind;
     use crate::agent::bigctx::config::default_config;
     use crate::agent::bigctx::protected::{Protection, compute_protection};
+    use crate::agent::bigctx::state::CompressionStateExt;
     use crate::agent::bigctx::state::create_initial_state;
     use crate::agent::bigctx::types::{MessageContentType, MessageRole};
 
@@ -351,7 +352,7 @@ mod tests {
         let mut state = create_initial_state();
         let msgs = vec![user("t1.1", &big(400)), user("t1.2", &big(400))];
         let mut prot = Protection::default();
-        prot.protected_bases.insert("t1.1".to_string());
+        prot.protect_base("t1.1");
 
         let out = apply_compression(
             &mut state,
@@ -374,7 +375,7 @@ mod tests {
         let mut state = create_initial_state();
         let msgs = vec![user("t1.1", &big(400))];
         let mut prot = Protection::default();
-        prot.protected_bases.insert("t1.1".to_string());
+        prot.protect_base("t1.1");
 
         let err = apply_compression(
             &mut state,

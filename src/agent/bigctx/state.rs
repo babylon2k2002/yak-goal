@@ -101,14 +101,17 @@ pub fn advance_survival(state: &mut CompressionState, promotion_threshold: u32) 
 /// Helpers the host calls on a state; kept as an extension trait so the plain
 /// struct stays a serde-shaped record.
 pub trait CompressionStateExt {
-    fn active_blocks(&self) -> impl Iterator<Item = &CompressionBlock>;
+    /// Every active block, in creation order.
+    fn live_blocks(&self) -> Vec<&CompressionBlock>;
+    /// Ids covered by any active block, base-normalised.
     fn covered(&self) -> std::collections::BTreeSet<String>;
+    /// True when `id` (or any projection of its base) is folded.
     fn is_covered(&self, id: &str) -> bool;
 }
 
 impl CompressionStateExt for CompressionState {
-    fn active_blocks(&self) -> impl Iterator<Item = &CompressionBlock> {
-        self.blocks.iter().filter(|b| b.active)
+    fn live_blocks(&self) -> Vec<&CompressionBlock> {
+        self.blocks.iter().filter(|b| b.active).collect()
     }
 
     fn covered(&self) -> std::collections::BTreeSet<String> {
@@ -117,7 +120,8 @@ impl CompressionStateExt for CompressionState {
 
     fn is_covered(&self, id: &str) -> bool {
         let base = base_id_of(id);
-        self.active_blocks()
+        self.live_blocks()
+            .iter()
             .any(|b| b.effective_message_ids.iter().any(|i| base_id_of(i) == base))
     }
 }

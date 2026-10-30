@@ -35,6 +35,22 @@ pub struct Protection {
 }
 
 impl Protection {
+    /// Mark a base id as unfoldable. The host uses this to add its own rules
+    /// (a pinned message, a user-marked range) on top of the computed set.
+    pub fn protect_base(&mut self, base_id: impl Into<String>) {
+        self.protected_bases.insert(base_id.into());
+    }
+
+    /// Mark a whole tool exchange as unfoldable by its call id.
+    pub fn protect_call(&mut self, call_id: impl Into<String>) {
+        self.protected_calls.insert(call_id.into());
+    }
+
+    /// True when this base id is protected.
+    pub fn protects_base(&self, base_id: &str) -> bool {
+        self.protected_bases.contains(base_id)
+    }
+
     pub fn is_protected(&self, message: &CoreMessage) -> bool {
         if self.protected_bases.contains(base_id_of(&message.id)) {
             return true;
