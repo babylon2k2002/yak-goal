@@ -22,13 +22,17 @@
 //! provider knowledge. The host (see [`super::compact`]) owns the mapping to
 //! and from `Msg` and decides when to run.
 
+pub mod boundaries;
 pub mod config;
+pub mod prune;
 pub mod refs;
 pub mod state;
 pub mod tokenize;
 pub mod types;
 
+pub use boundaries::{ResolvedRange, parse_boundary, resolve_boundaries};
 pub use config::{BigctxConfig, default_config};
+pub use prune::{PruneOptions, prune, summary_message_id};
 pub use refs::{assign_refs, empty_ref_map, index_to_ref, ref_to_index};
 pub use state::{
     CompressionStateExt, active_blocks, allocate_block_id, allocate_run_id, block_by_id,
