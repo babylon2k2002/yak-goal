@@ -500,6 +500,8 @@ mod tests {
             run_id: "r1".to_string(),
             tier: Tier::One,
             topic: None,
+            start_ref: None,
+            end_ref: None,
             summary: summary.to_string(),
             direct_message_ids: covers.iter().map(|s| s.to_string()).collect(),
             effective_message_ids: covers.iter().map(|s| s.to_string()).collect(),

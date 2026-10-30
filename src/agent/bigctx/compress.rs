@@ -98,6 +98,37 @@ pub fn apply_compression(
     compress_call_id: Option<String>,
     now: u64,
 ) -> Result<CompressOutcome, CompressError> {
+    apply_compression_with_refs(
+        state,
+        messages,
+        range,
+        summary,
+        protected,
+        config,
+        compress_call_id,
+        None,
+        now,
+    )
+}
+
+/// As [`apply_compression`], but recording the refs the call cited.
+///
+/// The refs are kept on the block so a later pass can rewrite a still-live
+/// compress call down to the ranges that still exist, and so the call's
+/// arguments can be recognised by range when its call id is not stable across a
+/// host round trip.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_compression_with_refs(
+    state: &mut CompressionState,
+    messages: &[CoreMessage],
+    range: &ResolvedRange,
+    summary: &str,
+    protected: &crate::agent::bigctx::protected::Protection,
+    config: &crate::agent::bigctx::config::BigctxConfig,
+    compress_call_id: Option<String>,
+    cited: Option<(String, String)>,
+    now: u64,
+) -> Result<CompressOutcome, CompressError> {
     let summary_tokens = crate::agent::bigctx::tokenize::default_count_tokens(summary);
     if summary_tokens < config.compress.min_summary_tokens {
         return Err(CompressError::SummarySize {
@@ -206,6 +237,8 @@ pub fn apply_compression(
         run_id,
         tier,
         topic: None,
+        start_ref: cited.as_ref().map(|(s, _)| s.clone()),
+        end_ref: cited.as_ref().map(|(_, e)| e.clone()),
         summary: summary.trim().to_string(),
         direct_message_ids,
         effective_message_ids: effective,

@@ -2612,6 +2612,8 @@ mod tests {
             run_id: "r1".into(),
             tier: Tier::One,
             topic: None,
+            start_ref: None,
+            end_ref: None,
             summary: "the earlier exchange, condensed".into(),
             direct_message_ids: covers.iter().map(|s| s.to_string()).collect(),
             effective_message_ids: covers.iter().map(|s| s.to_string()).collect(),

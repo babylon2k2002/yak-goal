@@ -25,6 +25,7 @@
 pub mod boundaries;
 pub mod compress;
 pub mod config;
+pub mod hide_consumed;
 pub mod host;
 pub mod protected;
 pub mod pipeline;
@@ -41,6 +42,7 @@ pub mod types;
 pub use boundaries::{ResolvedRange, parse_boundary, resolve_boundaries};
 pub use compress::{CompressError, CompressOutcome, apply_compression, decompress_block};
 pub use config::{BigctxConfig, default_config};
+pub use hide_consumed::{HideResult, hide_consumed_compress_calls};
 pub use host::{IdScheme, Projection, project, render};
 pub use pipeline::{TurnResult, process_turn};
 pub use protected::{Protection, compute_protection};

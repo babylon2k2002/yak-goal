@@ -161,6 +161,13 @@ pub struct CompressionBlock {
     /// Optional label the model supplied, shown in the summary header.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
+    /// The refs the compress call cited. Kept so a live call can be rewritten
+    /// down to the ranges that still exist; `direct_message_ids` records what
+    /// was covered, which is not the same thing after a snap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_ref: Option<String>,
     pub summary: String,
     /// The message ids this fold itself covered. Anchoring uses these (not the
     /// merged effective set) so a re-fold rewrites as little cached prefix as
@@ -317,6 +324,8 @@ mod tests {
             run_id: "r1".into(),
             tier: Tier::One,
             topic: None,
+            start_ref: None,
+            end_ref: None,
             summary: "s".into(),
             direct_message_ids: vec!["t1.1#r0".into()],
             effective_message_ids: vec!["t1.1#r0".into(), "t1.2".into()],

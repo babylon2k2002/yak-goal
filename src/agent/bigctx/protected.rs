@@ -337,6 +337,8 @@ mod tests {
             run_id: "r1".into(),
             tier: Tier::One,
             topic: None,
+            start_ref: None,
+            end_ref: None,
             summary: "s".into(),
             direct_message_ids: vec!["t1.2".into()],
             effective_message_ids: vec!["t1.2".into()],

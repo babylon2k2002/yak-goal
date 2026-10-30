@@ -78,6 +78,12 @@ pub fn process_turn(
         },
     );
 
+    // 3b. Hide compress calls whose blocks are gone, and stub the summaries a
+    //     live call repeats. A long session otherwise pays for the receipts:
+    //     the arguments duplicate every summary the block already holds.
+    let hidden = crate::agent::bigctx::hide_consumed_compress_calls(&next, &view);
+    let view = hidden.messages;
+
     // 4/5. The fold gate runs against the full array, not the view, so that a
     //      requested range is judged the way it will be applied.
     let requested = collect_fold_candidates(&view, &next, &protection);
@@ -165,6 +171,8 @@ mod tests {
             run_id: "r1".to_string(),
             tier: Tier::One,
             topic: None,
+            start_ref: None,
+            end_ref: None,
             summary: "a summary".to_string(),
             direct_message_ids: covers.iter().map(|s| s.to_string()).collect(),
             effective_message_ids: covers.iter().map(|s| s.to_string()).collect(),

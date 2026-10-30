@@ -488,6 +488,8 @@ mod tests {
             run_id: "r1".into(),
             tier: crate::agent::bigctx::types::Tier::One,
             topic: None,
+            start_ref: None,
+            end_ref: None,
             summary: "the first two messages".into(),
             direct_message_ids: vec!["t1.0".into(), "t1.1".into()],
             effective_message_ids: vec!["t1.0".into(), "t1.1".into()],

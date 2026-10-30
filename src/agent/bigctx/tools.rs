@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
-use crate::agent::bigctx::compress::{CompressError, apply_compression};
+use crate::agent::bigctx::compress::{CompressError, apply_compression_with_refs};
 use crate::agent::bigctx::config::BigctxConfig;
 use crate::agent::bigctx::protected::compute_protection;
 use crate::agent::bigctx::state::covered_message_ids;
@@ -363,7 +363,7 @@ fn apply_ranges(
             }
         };
 
-        match apply_compression(
+        match apply_compression_with_refs(
             &mut session.state,
             &session.messages,
             &resolved,
@@ -371,6 +371,7 @@ fn apply_ranges(
             &protection,
             &session.config,
             None,
+            Some((range.start.clone(), range.end.clone())),
             0,
         ) {
             Ok(outcome) => {
