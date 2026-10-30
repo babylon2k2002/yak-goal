@@ -26,6 +26,35 @@ pub struct NudgeConfig {
     pub min_growth_ratio: f64,
     /// Usage fraction that always nudges, ignoring cadence.
     pub emergency_threshold_pct: f64,
+    /// Master switch: no nudge is injected when false.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Growth step as a fraction of the window (before the floor/cap clamp).
+    #[serde(default = "growth_ratio_default")]
+    pub growth_ratio: f64,
+    /// Ceiling on the adaptive growth step, so a huge window does not go quiet.
+    #[serde(default = "growth_cap_default")]
+    pub growth_cap: u64,
+    /// Reclaimable mass needed for a pressure-band nudge, as a fraction of the
+    /// window (floored at 5000 tokens).
+    #[serde(default = "min_pressure_benefit_ratio_default")]
+    pub min_pressure_benefit_ratio: f64,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn growth_ratio_default() -> f64 {
+    0.02
+}
+
+fn growth_cap_default() -> u64 {
+    40_000
+}
+
+fn min_pressure_benefit_ratio_default() -> f64 {
+    0.01
 }
 
 /// Tier distillation triggers.
@@ -110,6 +139,10 @@ pub fn default_config(model_context_limit: u64) -> BigctxConfig {
             min_growth_floor: 20_000,
             min_growth_ratio: 0.45,
             emergency_threshold_pct: 0.95,
+            enabled: true,
+            growth_ratio: 0.02,
+            growth_cap: 40_000,
+            min_pressure_benefit_ratio: 0.01,
         },
         truncate: TruncateConfig {
             threshold: 0.95,
