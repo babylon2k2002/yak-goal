@@ -137,12 +137,25 @@ pub fn project(history: &[Msg], scheme: IdScheme) -> Projection {
                 }
 
                 if !text.trim().is_empty() {
+                    // A discriminator means "one of several projections of this
+                    // base". When the turn carries nothing else, the text IS the
+                    // message, so it keeps the bare base id — a lone `#t0` would
+                    // make a one-core turn look like it lost siblings.
+                    let only_text = tool_calls.is_empty()
+                        && reasoning
+                            .as_deref()
+                            .is_none_or(|r| r.trim().is_empty());
+                    let core_id = if only_text {
+                        base.clone()
+                    } else {
+                        format!("{base}#t0")
+                    };
                     push_core(
                         &mut out,
                         &base,
-                        &format!("{base}#t0"),
+                        &core_id,
                         CoreMessage::new(
-                            format!("{base}#t0"),
+                            core_id.clone(),
                             MessageRole::Assistant,
                             MessageContentType::Text,
                         )
@@ -176,7 +189,7 @@ pub fn project(history: &[Msg], scheme: IdScheme) -> Projection {
                 // emit an empty turn before a tool call) still needs an entry, or
                 // the projection would silently drop a message and shift every
                 // id after it.
-                if out.base_origin.get(&base).is_none() {
+                if !out.messages.iter().any(|m| m.base_id() == base) {
                     push_core(
                         &mut out,
                         &base,
@@ -375,6 +388,29 @@ mod tests {
         assert_eq!(p.messages[1].base_id(), p.messages[2].base_id());
         assert_eq!(p.messages[2].tool_name.as_deref(), Some("read"));
         assert_eq!(p.messages[2].tool_call_id.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn a_text_only_assistant_turn_keeps_the_bare_base_id() {
+        // A discriminator means "one projection among several". When the text is
+        // the whole message, `#t0` would imply siblings that do not exist.
+        let history = vec![user("q"), assistant("a")];
+        let p = project(&history, IdScheme::default());
+        assert_eq!(p.messages[1].id, "t1.1");
+    }
+
+    #[test]
+    fn a_reasoning_plus_text_turn_discriminates_both() {
+        let history = vec![Msg::Assistant {
+            text: "answer".to_string(),
+            tool_calls: Vec::new(),
+            reasoning: Some("thought".to_string()),
+            reasoning_meta: None,
+        }];
+        let p = project(&history, IdScheme::default());
+        assert_eq!(p.messages.len(), 2);
+        assert_eq!(p.messages[0].id, "t1.0#r0");
+        assert_eq!(p.messages[1].id, "t1.0#t0");
     }
 
     #[test]
