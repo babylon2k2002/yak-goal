@@ -54,7 +54,7 @@ fn test_opts() -> AgentOptions<'static> {
 fn deny_callbacks() -> RunCallbacks<'static> {
     RunCallbacks {
         on_update: Box::leak(Box::new(|_| {})),
-        on_approval: Box::leak(Box::new(|_| approval::ApprovalResponse::Deny)),
+        on_approval: Box::leak(Box::new(|_| crate::agent::ApprovalResponse::Deny)),
     }
 }
 
