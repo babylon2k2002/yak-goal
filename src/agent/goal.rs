@@ -490,14 +490,15 @@ fn update(goal: &GoalRuntime, args: &Value) -> ToolOutput {
             current.blocked_turns = current.blocked_turns.saturating_add(1);
             if current.blocked_turns < BLOCKED_AFTER_TURNS {
                 let left = BLOCKED_AFTER_TURNS - current.blocked_turns;
+                // read before the store below takes ownership of `current`
+                let turn = current.blocked_turns;
                 // stay active: reporting the refusal in the result makes the
                 // next continuation tell the model to try another route
                 let _ = goal.store(current);
                 return ToolOutput::err(format!(
-                    "not blocked yet: this is goal turn {} of the required {BLOCKED_AFTER_TURNS} \
+                    "not blocked yet: this is goal turn {turn} of the required {BLOCKED_AFTER_TURNS} \
                      with the same blocker ({left} more). Try a different route this turn; if it \
-                     still cannot move, report the same blocker again next turn.",
-                    current.blocked_turns
+                     still cannot move, report the same blocker again next turn."
                 ));
             }
             current.status = GoalStatus::Blocked;

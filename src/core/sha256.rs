@@ -76,9 +76,8 @@ pub fn digest(data: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Hex digest, lowercase (test vectors and diagnostics; the wire wants
-/// base64url).
-#[cfg(test)]
+/// Hex digest, lowercase (test vectors, diagnostics and the goal-file name;
+/// the wire wants base64url).
 pub fn hex(data: &[u8]) -> String {
     digest(data).iter().map(|b| format!("{b:02x}")).collect()
 }
