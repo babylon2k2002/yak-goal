@@ -35,6 +35,11 @@ pub struct NudgeDecision {
     pub tier: Option<Tier>,
     /// Tokens the model could reclaim by folding what is currently offered.
     pub pending_tokens: u64,
+    /// The context size the decision was made at, so the renderer describes the
+    /// same situation the decision judged.
+    pub token_count: u64,
+    /// Usage fraction at that size (0.0–1.0+).
+    pub pressure: f64,
 }
 
 impl NudgeDecision {
@@ -44,6 +49,8 @@ impl NudgeDecision {
             reason: reason.into(),
             tier: None,
             pending_tokens: 0,
+            token_count: 0,
+            pressure: 0.0,
         }
     }
 }
@@ -124,6 +131,8 @@ pub fn decide_nudge(
             ),
             tier: best,
             pending_tokens: best_pending,
+            token_count,
+            pressure: usage,
         };
     }
 
@@ -181,6 +190,8 @@ pub fn decide_nudge(
         ),
         tier: best,
         pending_tokens: best_pending,
+        token_count,
+        pressure: usage,
     }
 }
 
