@@ -549,6 +549,10 @@ impl Session {
         // interrupt; the watcher is paused around approval prompts, which
         // read the same stdin
         let mut watcher = crate::term::lineedit::KeyWatcher::start();
+        // The model is sent the compressed view, not the raw history. A fold
+        // replaces a range with a summary; the originals stay in `self.seed`,
+        // so nothing is lost and a later turn can restore them.
+        let mut view_seed = self.bigctx_view();
         let mut on_approval = |req: ApprovalRequest| {
             // keystrokes have no meaning while the watcher runs, so stopping
             // it just hands the terminal back to the approval prompt
@@ -563,10 +567,6 @@ impl Session {
             watcher = crate::term::lineedit::KeyWatcher::start();
             answer
         };
-        // The model is sent the compressed view, not the raw history. A fold
-        // replaces a range with a summary; the originals stay in `self.seed`,
-        // so nothing is lost and a later turn can restore them.
-        let mut view_seed = self.bigctx_view();
         let result = run_agent(
             RunRequest {
                 model,
@@ -817,6 +817,10 @@ impl Session {
         // thing. The hardcoded refusals never consult an approval prompt at
         // all, so they still deny under this flag.
         let unattended_allow = self.unattended_allow;
+        // The model is sent the compressed view, not the raw history. A fold
+        // replaces a range with a summary; the originals stay in `self.seed`,
+        // so nothing is lost and a later turn can restore them.
+        let mut view_seed = self.bigctx_view();
         let mut on_approval = |req: ApprovalRequest| {
             if unattended_allow {
                 emit_event(&serde_json::json!({
@@ -832,10 +836,6 @@ impl Session {
         };
         // no KeyWatcher here: stdin belongs to the caller (usually a pipe),
         // and ctrl-c kills this process like any other child
-        // The model is sent the compressed view, not the raw history. A fold
-        // replaces a range with a summary; the originals stay in `self.seed`,
-        // so nothing is lost and a later turn can restore them.
-        let mut view_seed = self.bigctx_view();
         let result = run_agent(
             RunRequest {
                 model,
