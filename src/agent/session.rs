@@ -345,15 +345,19 @@ impl Session {
         // each `RoundEnd` and reset for the next round
         let mut round_reasoning = String::new();
         let mut round_started = std::time::Instant::now();
-        // The model is sent the compressed view, not the raw history. A fold
-        // replaces a range with a summary; the originals stay in `self.seed`,
-        // so nothing is lost and a later turn can restore them.
-        let mut view_seed = self.bigctx_view();
         let identity = TaskIdentity {
             model,
             cwd: &self.cwd,
             system: self.system.as_deref(),
         };
+        // The model is sent the compressed view, not the raw history. A fold
+        // replaces a range with a summary; the originals stay in `self.seed`,
+        // so nothing is lost and a later turn can restore them.
+        //
+        // Projected here, after `identity` has taken its shared borrows and
+        // before the closures take `&mut self`: `bigctx_view` needs `&mut self`
+        // (it advances the state), and a borrow held across it would conflict.
+        let mut view_seed = self.bigctx_view();
         let mut on_update = |u: AgentUpdate| {
             match u {
                 AgentUpdate::Delta(text) => {
@@ -680,15 +684,19 @@ impl Session {
         let view = std::cell::RefCell::new(crate::term::render::TaskView::new(2, &model_id, true));
         view.borrow_mut().terminal_md(2);
         let started = std::time::Instant::now();
-        // The model is sent the compressed view, not the raw history. A fold
-        // replaces a range with a summary; the originals stay in `self.seed`,
-        // so nothing is lost and a later turn can restore them.
-        let mut view_seed = self.bigctx_view();
         let identity = TaskIdentity {
             model,
             cwd: &self.cwd,
             system: self.system.as_deref(),
         };
+        // The model is sent the compressed view, not the raw history. A fold
+        // replaces a range with a summary; the originals stay in `self.seed`,
+        // so nothing is lost and a later turn can restore them.
+        //
+        // Projected here, after `identity` has taken its shared borrows and
+        // before the closures take `&mut self`: `bigctx_view` needs `&mut self`
+        // (it advances the state), and a borrow held across it would conflict.
+        let mut view_seed = self.bigctx_view();
         let mut on_update = |u: AgentUpdate| match u {
             AgentUpdate::Compacting => {
                 view.borrow_mut().relabel("compacting context");
