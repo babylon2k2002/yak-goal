@@ -31,6 +31,8 @@ use std::collections::BTreeSet;
 
 use serde_json::{Map, Value};
 
+use crate::agent::bigctx::types::CoreMessage;
+
 /// Reserved key marking a crushed envelope.
 ///
 /// A payload that legitimately contains this key cannot be told apart from
