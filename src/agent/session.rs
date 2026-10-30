@@ -116,6 +116,10 @@ pub struct Session {
     /// Which round the current id scheme started at. Bumped whenever the prefix
     /// is rewritten, so a message id is never reused for different content.
     pub bigctx_round: u64,
+    /// The cell the `compress` / `decompress` / `acp_status` tools read. Shared
+    /// with them because a tool runs on the tool thread while the state belongs
+    /// to the session.
+    pub bigctx_handle: crate::agent::bigctx::BigctxHandle,
 }
 
 /// Project a history through the reversible-compression pipeline.
