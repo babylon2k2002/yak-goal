@@ -25,7 +25,7 @@ use crate::agent::bigctx::config::BigctxConfig;
 use crate::agent::bigctx::types::{CompressionState, NudgeState, Tier};
 
 /// What the nudge decided.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NudgeDecision {
     /// True when a nudge should be injected this turn.
     pub inject: bool,
