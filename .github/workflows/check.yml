@@ -1,0 +1,59 @@
+name: check
+
+# Fast feedback loop for edits made without a local Rust toolchain.
+#
+# Two things this is NOT: it never runs on a push (a force-push must not spend
+# minutes), and it never uploads an artifact (build-windows.yml owns the
+# deliverable). It exists so `cargo check` + `cargo test` can be requested by
+# hand and read back in ~90 s instead of waiting for a full release build.
+on:
+  workflow_dispatch:
+    inputs:
+      test_filter:
+        description: "Only run tests whose name contains this (empty = all)"
+        type: string
+        default: ""
+      clippy:
+        description: "Also run clippy (slower; lints are not denied)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: ${{ inputs.clippy && 'clippy' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: check-windows-x64-msvc
+          # the check job and the release job must not evict each other
+          shared-key: ""
+
+      # `cargo check` first: a type error should surface in ~40 s rather than
+      # after a full codegen. --all-targets so test-only code is checked too.
+      - name: cargo check
+        run: cargo check --all-targets --locked --message-format=short
+
+      - name: cargo test
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $filter = "${{ inputs.test_filter }}"
+          if ($filter) {
+            cargo test --locked $filter -- --nocapture
+          } else {
+            cargo test --locked
+          }
+
+      - name: clippy
+        if: ${{ inputs.clippy }}
+        run: cargo clippy --all-targets --locked --message-format=short

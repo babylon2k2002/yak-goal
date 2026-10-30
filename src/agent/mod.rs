@@ -3,6 +3,7 @@
 //! `ToolCall`) lives in `providers` — see `providers/mod.rs`.
 
 pub mod approval;
+pub mod bigctx;
 pub mod blacklist;
 pub mod compact;
 pub mod ext;
