@@ -322,6 +322,11 @@ mod tests {
         "x".repeat(n)
     }
 
+    /// Long enough to clear `compress.min_summary_tokens` (50). The text is
+    /// deliberately repetitive: these tests are about block bookkeeping, not
+    /// about what a good summary reads like.
+    const SUMMARY: &str = "the assistant read the auth module and found that the token check lives in verify.rs, line 42; the decision was to keep the 60s connect budget, and the open question is whether the retry belongs in the transport layer or above it";
+
     #[test]
     fn a_plain_range_becomes_a_tier_one_block() {
         let mut state = create_initial_state();
@@ -330,7 +335,7 @@ mod tests {
             &mut state,
             &msgs,
             &range(&["t1.1", "t1.2"], &[]),
-            "a summary that is long enough to pass the minimum length check",
+            SUMMARY,
             &no_protection(),
             &cfg(),
             None,
@@ -358,7 +363,7 @@ mod tests {
             &mut state,
             &msgs,
             &range(&["t1.1", "t1.2"], &[]),
-            "a summary that is long enough to pass the minimum length check",
+            SUMMARY,
             &prot,
             &cfg(),
             None,
@@ -381,7 +386,7 @@ mod tests {
             &mut state,
             &msgs,
             &range(&["t1.1"], &[]),
-            "a summary that is long enough to pass the minimum length check",
+            SUMMARY,
             &prot,
             &cfg(),
             None,
@@ -440,7 +445,7 @@ mod tests {
             &mut state,
             &msgs,
             &range(&["t1.1"], &[]),
-            "a summary that is long enough to pass the minimum length check",
+            SUMMARY,
             &no_protection(),
             &c,
             None,
@@ -461,7 +466,7 @@ mod tests {
             &mut state,
             &msgs,
             &range(&["t1.1"], &[]),
-            "first summary that is long enough to pass the minimum length check",
+            SUMMARY,
             &no_protection(),
             &c,
             None,
@@ -474,7 +479,7 @@ mod tests {
             &mut state,
             &msgs,
             &range(&[], &["b1"]),
-            "second summary that is long enough to pass the minimum length check",
+            SUMMARY,
             &no_protection(),
             &c,
             None,
@@ -499,7 +504,7 @@ mod tests {
             &mut state,
             &msgs,
             &range(&["t1.1"], &[]),
-            "first summary that is long enough to pass the minimum length check",
+            SUMMARY,
             &no_protection(),
             &c,
             None,
@@ -510,7 +515,7 @@ mod tests {
             &mut state,
             &msgs,
             &range(&[], &["b1"]),
-            "second summary that is long enough to pass the minimum length check",
+            SUMMARY,
             &no_protection(),
             &c,
             None,
@@ -533,7 +538,7 @@ mod tests {
             &mut state,
             &msgs,
             &range(&["t1.1"], &[]),
-            "a summary that is long enough to pass the minimum length check",
+            SUMMARY,
             &no_protection(),
             &cfg(),
             None,
@@ -568,7 +573,7 @@ mod tests {
                 &mut state,
                 &msgs,
                 &range(&[&format!("t1.{i}")], &[]),
-                "a summary that is long enough to pass the minimum length check",
+                SUMMARY,
                 &no_protection(),
                 &c,
                 None,
@@ -590,7 +595,7 @@ mod tests {
             &mut state,
             &msgs,
             &range(&["t1.1"], &[]),
-            "a summary that is long enough to pass the minimum length check",
+            SUMMARY,
             &no_protection(),
             &c,
             None,
@@ -612,7 +617,7 @@ mod tests {
             &mut state,
             &msgs,
             &range(&["t1.1"], &[]),
-            "a summary that is long enough to pass the minimum length check",
+            SUMMARY,
             &prot,
             &c,
             None,
