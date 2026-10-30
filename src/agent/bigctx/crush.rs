@@ -811,29 +811,33 @@ mod tests {
     #[test]
     fn a_run_of_identical_objects_can_be_read_back() {
         // Losslessness is the whole claim of json-fold; check it by decoding.
+        // Twenty identical rows are all-constant, so the envelope hoists every
+        // field and omits `items` entirely — a decoder merges `const` into each
+        // of the `rows` entries.
         let row = r#"{"status":"ok","service":"billing","region":"eu-west-1"}"#;
         let text = format!("[{}]", vec![row; 20].join(","));
         let (out, _) = crush_json(&text).unwrap();
         let envelope: Value = serde_json::from_str(&out).unwrap();
-        let items = envelope
-            .get("items")
-            .or_else(|| envelope.get("item"))
-            .expect("an envelope carries its rows");
-        // Every row of the envelope must still hold the three fields.
-        let rows = match items {
-            Value::Array(rows) => rows.clone(),
-            other => vec![other.clone()],
-        };
-        for row in &rows {
-            let merged = row
-                .as_object()
-                .cloned()
-                .unwrap_or_default();
-            if merged.is_empty() {
-                continue; // a row fully covered by the const block
-            }
-        }
-        assert!(!out.is_empty());
+
+        assert_eq!(envelope.get(CRUSH_KEY).and_then(Value::as_str), Some("rows"));
+        assert_eq!(envelope.get("rows").and_then(Value::as_u64), Some(20));
+        let consts = envelope
+            .get("const")
+            .and_then(Value::as_object)
+            .expect("the hoisted fields");
+        assert_eq!(consts.get("status").and_then(Value::as_str), Some("ok"));
+        assert_eq!(
+            consts.get("service").and_then(Value::as_str),
+            Some("billing")
+        );
+        assert_eq!(
+            consts.get("region").and_then(Value::as_str),
+            Some("eu-west-1")
+        );
+        assert!(
+            envelope.get("items").is_none(),
+            "no row varies, so items is omitted"
+        );
     }
 
     #[test]
@@ -919,18 +923,33 @@ mod tests {
     fn python_comments_and_blank_runs_are_elided() {
         let code = "# a comment\n# another\n\ndef f(x):\n    return x\n\n\n\ndef g():\n    return 2\n";
         let out = crush_code(code).unwrap();
-        assert!(out.contains("elided"));
-        assert!(out.contains("def f(x):"));
+        assert!(out.contains("def f(x):"), "code lines must survive");
         assert!(out.contains("return x"));
-        assert!(out.len() < code.len());
+        assert!(!out.contains("# a comment"), "comments go");
+        assert!(out.len() < code.len(), "{} vs {}", out.len(), code.len());
+    }
+
+    #[test]
+    fn a_long_comment_run_is_marked() {
+        // The marker only appears when it is smaller than the run it replaces;
+        // a long run is where annotating pays off.
+        let mut code = String::new();
+        for i in 0..40 {
+            code.push_str(&format!("# a long explanatory comment line number {i}\n"));
+        }
+        code.push_str("def f(x):\n    return x\n");
+        let out = crush_code(&code).unwrap();
+        assert!(out.contains("elided"), "a 40-line run earns a marker: {out}");
+        assert!(out.contains("def f(x):"));
     }
 
     #[test]
     fn js_comments_and_blank_runs_are_elided() {
         let code = "// a comment\n// another\n\nfunction f(x) {\n  return x;\n}\n\n\n\nfunction g() {\n  return 2;\n}\n";
         let out = crush_code(code).unwrap();
-        assert!(out.contains("elided"));
         assert!(out.contains("function f(x)"));
+        assert!(!out.contains("// a comment"), "comments go");
+        assert!(out.len() < code.len());
     }
 
     #[test]
