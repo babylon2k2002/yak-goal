@@ -31,7 +31,7 @@ const SUMMARY_STUB_CHARS: usize = 200;
 pub const COMPRESS_TOOL_NAME: &str = "compress";
 
 /// What hiding changed.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct HideResult {
     pub messages: Vec<CoreMessage>,
     /// How many messages were removed from the view.
