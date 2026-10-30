@@ -52,30 +52,21 @@ pub fn sync_blocks(messages: &[CoreMessage], state: &CompressionState) -> (Compr
 
     // Every block a parent consumed, so a consumed child is never reactivated
     // by the "still present" check below.
-    let consumed: BTreeSet<&str> = next
+    let consumed: BTreeSet<String> = next
         .blocks
         .iter()
-        .flat_map(|block| block.direct_block_ids.iter().map(String::as_str))
-        .collect();
-
-    let mut previously_active: BTreeSet<String> = next
-        .blocks
-        .iter()
-        .filter(|b| b.active)
-        .map(|b| b.block_id.clone())
+        .flat_map(|block| block.direct_block_ids.iter().cloned())
         .collect();
 
     for block in &mut next.blocks {
-        if consumed.contains(block.block_id.as_str()) {
+        if consumed.contains(&block.block_id) {
             block.active = false;
-            previously_active.remove(&block.block_id);
             continue;
         }
         if block.expanded {
             // Deliberately restored. Keep it inactive; a fresh compress of the
             // same range creates a NEW block.
             block.active = false;
-            previously_active.remove(&block.block_id);
             continue;
         }
 
@@ -92,7 +83,6 @@ pub fn sync_blocks(messages: &[CoreMessage], state: &CompressionState) -> (Compr
         if !still_present {
             block.active = false;
             result.deactivated.push(block.block_id.clone());
-            previously_active.remove(&block.block_id);
         }
     }
 
