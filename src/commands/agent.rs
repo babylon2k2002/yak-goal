@@ -384,6 +384,7 @@ fn execute_mode(args: &ParsedArgs) -> Result<i32, String> {
         // refs belonged to the previous process and are not on disk
         bigctx: None,
         bigctx_round: 1,
+        bigctx_handle: crate::agent::bigctx::BigctxHandle::new(),
     };
 
     // a continued thread may already exceed its window: project it down

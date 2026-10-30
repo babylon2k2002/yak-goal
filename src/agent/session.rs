@@ -153,6 +153,32 @@ pub fn bigctx_view(
     (view, Some(turn.state))
 }
 
+/// Build the tool-facing view of a turn: the same state and message array the
+/// request was built from.
+///
+/// The tools must fold the array the protection rules were computed against. A
+/// different array would let `compress` fold something the next turn treats as
+/// protected, and the fold would silently undo itself.
+pub fn bigctx_turn(
+    seed: &[Msg],
+    state: Option<&crate::agent::bigctx::CompressionState>,
+    round: u64,
+    window: Option<u64>,
+) -> crate::agent::bigctx::BigctxSession {
+    let scheme = crate::agent::bigctx::IdScheme {
+        round: round.max(1),
+        first_slot: 0,
+    };
+    let projection = crate::agent::bigctx::project(seed, scheme);
+    crate::agent::bigctx::BigctxSession {
+        state: state
+            .cloned()
+            .unwrap_or_else(crate::agent::bigctx::create_initial_state),
+        messages: projection.messages,
+        config: crate::agent::bigctx::default_config(window.unwrap_or(200_000)),
+    }
+}
+
 impl Session {
     /// A resumed thread can already be over the window. Project its
     /// oversized tool results down before the first request — the very cut
@@ -215,6 +241,12 @@ impl Session {
         if let Some(goal) = self.goal.as_ref() {
             tools.extend(crate::agent::goal::tools(goal));
         }
+        // The context tools are registered here, not in `builtin_tools`:
+        // that list is the always-on file/bash set with its own wire budget,
+        // and these three carry long descriptions the budget is not sized for.
+        // They are also useless without a session to compress, so they belong
+        // to the session's registry rather than the global one.
+        tools.extend(crate::agent::bigctx::bigctx_tools(self.bigctx_handle.clone()));
         self.extensions.mount_tools(&mut tools);
         self.tools = tools;
     }
@@ -359,6 +391,16 @@ impl Session {
             self.bigctx_round,
             self.model.as_ref().and_then(|m| m.context_window),
         );
+        // Hand the tools the same state and view this request is built from.
+        // They fold *the array the protection rules were computed against*;
+        // a different one would let them compress something the next turn
+        // treats as protected.
+        self.bigctx_handle.set(bigctx_turn(
+            &self.seed,
+            bigctx_state.as_ref(),
+            self.bigctx_round,
+            self.model.as_ref().and_then(|m| m.context_window),
+        ));
         let mut on_update = |u: AgentUpdate| {
             match u {
                 AgentUpdate::Delta(text) => {
@@ -588,9 +630,14 @@ impl Session {
             },
         );
         watcher.stop();
-        // keep the compression state the pass produced: its block ids and refs
-        // are what let a later turn restore what this one folded
-        self.bigctx = bigctx_state;
+        // Keep the state the pass produced — and read it back from the handle,
+        // because that is where the `compress` tool wrote. The `bigctx_state`
+        // captured before the request is the *pre-tool* snapshot; storing it
+        // would throw away every fold the model just made.
+        self.bigctx = self.bigctx_handle.with(|s| s.state.clone()).or(bigctx_state);
+        // the handle must not outlive the turn: a tool called on the next task
+        // would otherwise read a state that no longer matches the history
+        self.bigctx_handle.clear();
         // an interrupted task may never see TurnEnd: flush any partial
         // markdown line here too (abort is idempotent)
         view.borrow_mut().abort();
@@ -799,6 +846,12 @@ impl Session {
             self.bigctx_round,
             self.model.as_ref().and_then(|m| m.context_window),
         );
+        self.bigctx_handle.set(bigctx_turn(
+            &self.seed,
+            bigctx_state.as_ref(),
+            self.bigctx_round,
+            self.model.as_ref().and_then(|m| m.context_window),
+        ));
         let mut on_update = |u: AgentUpdate| {
             match &u {
                 AgentUpdate::ReasoningDelta(text) => {
@@ -871,8 +924,9 @@ impl Session {
             },
         );
         crate::core::http::clear_interrupt();
-        // keep the compression state the pass produced (see the interactive path)
-        self.bigctx = bigctx_state;
+        // see the interactive path: the handle holds whatever the tools wrote
+        self.bigctx = self.bigctx_handle.with(|s| s.state.clone()).or(bigctx_state);
+        self.bigctx_handle.clear();
         self.usage.add(total);
         self.last_usage = last_usage;
         match result {
@@ -1412,6 +1466,7 @@ mod tests {
             goal: None,
             bigctx: None,
             bigctx_round: 1,
+            bigctx_handle: crate::agent::bigctx::BigctxHandle::new(),
         }
     }
 
@@ -1580,6 +1635,7 @@ mod tests {
             goal: None,
             bigctx: None,
             bigctx_round: 1,
+            bigctx_handle: crate::agent::bigctx::BigctxHandle::new(),
         };
         let (_outcome, _) = session
             .run_task("list the files", vec![])
@@ -1847,6 +1903,7 @@ mod tests {
             goal: None,
             bigctx: None,
             bigctx_round: 1,
+            bigctx_handle: crate::agent::bigctx::BigctxHandle::new(),
         };
         let history = vec![
             Msg::user("write the docs"),
@@ -1925,6 +1982,7 @@ mod tests {
             goal: None,
             bigctx: None,
             bigctx_round: 1,
+            bigctx_handle: crate::agent::bigctx::BigctxHandle::new(),
         };
         // a store whose directory vanishes after opening: append_turn cannot
         // create the thread file (ENOENT), which is exactly the shape of a

@@ -34,6 +34,7 @@ pub mod refs;
 pub mod state;
 pub mod sync;
 pub mod tokenize;
+pub mod tools;
 pub mod turn_integrity;
 pub mod types;
 
@@ -52,6 +53,7 @@ pub use state::{
 };
 pub use sync::{SyncResult, advance_survival, sync_blocks};
 pub use tokenize::{count_message_tokens, default_count_tokens};
+pub use tools::{BigctxHandle, BigctxSession, bigctx_tools};
 pub use turn_integrity::{Withdrawals, turn_groups, withdrawals};
 pub use types::{
     BlockGeneration, CompressionBlock, CompressionState, CompressionStats, CoreMessage,
