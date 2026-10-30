@@ -37,6 +37,7 @@ pub mod host;
 pub mod protected;
 pub mod pipeline;
 pub mod prune;
+pub mod recommend;
 pub mod refs;
 pub mod state;
 pub mod sync;
@@ -51,6 +52,7 @@ pub use host::{IdScheme, Projection, project, render};
 pub use pipeline::{TurnResult, process_turn};
 pub use protected::{Protection, compute_protection};
 pub use prune::{PruneOptions, prune, summary_message_id};
+pub use recommend::{ContextRanges, CompressibleRange, ProtectedRange, build_context_ranges, screen};
 pub use refs::{assign_refs, empty_ref_map, index_to_ref, ref_to_index};
 pub use state::{
     CompressionStateExt, active_blocks, allocate_block_id, allocate_run_id, block_by_id,
