@@ -35,16 +35,20 @@ pub mod compress;
 pub mod config;
 pub mod host;
 pub mod protected;
+pub mod pipeline;
 pub mod prune;
 pub mod refs;
 pub mod state;
+pub mod sync;
 pub mod tokenize;
+pub mod turn_integrity;
 pub mod types;
 
 pub use boundaries::{ResolvedRange, parse_boundary, resolve_boundaries};
 pub use compress::{CompressError, CompressOutcome, apply_compression, decompress_block};
 pub use config::{BigctxConfig, default_config};
 pub use host::{IdScheme, Projection, project, render};
+pub use pipeline::{TurnResult, process_turn};
 pub use protected::{Protection, compute_protection};
 pub use prune::{PruneOptions, prune, summary_message_id};
 pub use refs::{assign_refs, empty_ref_map, index_to_ref, ref_to_index};
@@ -52,7 +56,9 @@ pub use state::{
     CompressionStateExt, active_blocks, allocate_block_id, allocate_run_id, block_by_id,
     covered_message_ids, create_initial_state, highest_active_tier,
 };
+pub use sync::{SyncResult, advance_survival, sync_blocks};
 pub use tokenize::{count_message_tokens, default_count_tokens};
+pub use turn_integrity::{Withdrawals, turn_groups, withdrawals};
 pub use types::{
     BlockGeneration, CompressionBlock, CompressionState, CompressionStats, CoreMessage,
     MessageContentType, MessageRefMap, MessageRole, NudgeState, Tier,
