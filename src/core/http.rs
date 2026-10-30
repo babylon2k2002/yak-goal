@@ -911,16 +911,21 @@ mod tests {
             got.push((ev.to_string(), data.to_string()));
             false
         };
+        // the closure holds `got` mutably for as long as it lives, so every
+        // read of `got` has to happen after it is dropped
         assert!(!frame.line("event: message", &mut feed));
         assert!(!frame.line("data: {\"a\":1,", &mut feed));
         assert!(!frame.line("data: \"b\":2}", &mut feed));
-        assert!(got.is_empty(), "nothing is delivered before the blank line");
         assert!(!frame.line("", &mut feed));
-        assert_eq!(got, vec![("message".to_string(), "{\"a\":1,\n\"b\":2}".to_string())]);
         // the frame resets, so the next event carries only its own data
         assert!(!frame.line("data: next", &mut feed));
         assert!(!frame.line("", &mut feed));
+        drop(feed);
         assert_eq!(got.len(), 2);
+        assert_eq!(
+            got[0],
+            ("message".to_string(), "{\"a\":1,\n\"b\":2}".to_string())
+        );
         assert_eq!(got[1], ("".to_string(), "next".to_string()));
     }
 
@@ -937,6 +942,7 @@ mod tests {
         frame.line("data:  two spaces", &mut feed);
         frame.line("data:no space", &mut feed);
         frame.line("", &mut feed);
+        drop(feed);
         assert_eq!(got, vec![" two spaces\nno space".to_string()]);
     }
 
