@@ -700,12 +700,6 @@ impl Session {
         // Projected here, after `identity` has taken its shared borrows and
         // before the closures take `&mut self`: `bigctx_view` needs `&mut self`
         // (it advances the state), and a borrow held across it would conflict.
-        let (mut view_seed, bigctx_state) = bigctx_view(
-            &self.seed,
-            self.bigctx.as_ref(),
-            self.bigctx_round,
-            self.model.as_ref().and_then(|m| m.context_window),
-        );
         let mut on_update = |u: AgentUpdate| match u {
             AgentUpdate::Compacting => {
                 view.borrow_mut().relabel("compacting context");
@@ -797,6 +791,14 @@ impl Session {
             cwd: &self.cwd,
             system: self.system.as_deref(),
         };
+        // the json path sends the compressed view too, so a --json session gets
+        // the same folding as the terminal one
+        let (mut view_seed, bigctx_state) = bigctx_view(
+            &self.seed,
+            self.bigctx.as_ref(),
+            self.bigctx_round,
+            self.model.as_ref().and_then(|m| m.context_window),
+        );
         let mut on_update = |u: AgentUpdate| {
             match &u {
                 AgentUpdate::ReasoningDelta(text) => {
