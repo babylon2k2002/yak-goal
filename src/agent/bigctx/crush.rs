@@ -503,12 +503,14 @@ fn trim_hash_comments(text: &str) -> Option<String> {
     // `elided` is the pending run not yet emitted as a marker; `total` is the
     // running sum, which is what `finalize` needs.
     let mut elided = 0usize;
+    let mut elided_chars = 0usize;
     let mut total = 0usize;
     let mut in_docstring: Option<&str> = None;
 
     for line in text.lines() {
         if let Some(quote) = in_docstring {
             elided += 1;
+            elided_chars += line.len() + 1;
             total += 1;
             if line.trim().contains(quote) {
                 in_docstring = None;
@@ -521,6 +523,7 @@ fn trim_hash_comments(text: &str) -> Option<String> {
             // A one-line docstring closes on itself.
             let rest = &trimmed[3..];
             elided += 1;
+            elided_chars += line.len() + 1;
             total += 1;
             if !rest.contains(quote) {
                 in_docstring = Some(quote);
@@ -529,13 +532,14 @@ fn trim_hash_comments(text: &str) -> Option<String> {
         }
         if trimmed.starts_with('#') || trimmed.is_empty() {
             elided += 1;
+            elided_chars += line.len() + 1;
             total += 1;
             continue;
         }
-        flush_elided(&mut out, &mut elided, "#");
+        flush_elided(&mut out, &mut elided, &mut elided_chars, "#");
         out.push(line.to_string());
     }
-    flush_elided(&mut out, &mut elided, "#");
+    flush_elided(&mut out, &mut elided, &mut elided_chars, "#");
 
     finalize(text, &out, total)
 }
@@ -544,6 +548,7 @@ fn trim_hash_comments(text: &str) -> Option<String> {
 fn trim_slash_comments(text: &str) -> Option<String> {
     let mut out: Vec<String> = Vec::new();
     let mut elided = 0usize;
+    let mut elided_chars = 0usize;
     let mut total = 0usize;
 
     for line in text.lines() {
@@ -552,23 +557,43 @@ fn trim_slash_comments(text: &str) -> Option<String> {
         // merely contains `/*` mid-line is code and stays.
         if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.is_empty() {
             elided += 1;
+            elided_chars += line.len() + 1;
             total += 1;
             continue;
         }
-        flush_elided(&mut out, &mut elided, "//");
+        flush_elided(&mut out, &mut elided, &mut elided_chars, "//");
         out.push(line.to_string());
     }
-    flush_elided(&mut out, &mut elided, "//");
+    flush_elided(&mut out, &mut elided, &mut elided_chars, "//");
 
     finalize(text, &out, total)
 }
 
-fn flush_elided(out: &mut Vec<String>, elided: &mut usize, marker: &str) {
+/// Emit a marker for an elided run, but only when the marker is smaller than
+/// the lines it replaces.
+///
+/// A marker costs roughly thirty characters. Replacing one blank line with it
+/// grows the payload, and a crush that grows the payload is refused — so a file
+/// with a few stray blanks would be passed through as "uncrushable" instead of
+/// being trimmed where it actually pays. Short runs are therefore dropped
+/// outright rather than marked.
+fn flush_elided(
+    out: &mut Vec<String>,
+    elided: &mut usize,
+    elided_chars: &mut usize,
+    marker: &str,
+) {
     if *elided == 0 {
         return;
     }
-    out.push(format!("{marker} [acp-crush: elided {} lines]", *elided));
+    let marker_line = format!("{marker} [acp-crush: elided {} lines]", *elided);
+    // Keep the marker only when it is genuinely smaller than the text it stands
+    // in for. A run of blank lines is cheaper to delete silently than to mark.
+    if marker_line.len() < *elided_chars {
+        out.push(marker_line);
+    }
     *elided = 0;
+    *elided_chars = 0;
 }
 
 fn finalize(original: &str, emitted: &[String], elided: usize) -> Option<String> {
