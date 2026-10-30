@@ -1,0 +1,16 @@
+[package]
+name = "yak"
+version = "0.4.6"
+edition = "2024"
+description = "A plugin-based harness for LLMs in Rust."
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+unicode-width = "0.2"
+ureq = { version = "3.4.0", default-features = false, features = ["json", "rustls"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1

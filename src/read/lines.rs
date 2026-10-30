@@ -1,0 +1,286 @@
+//! Line-window machinery for the plain-text read path: files stream through
+//! a BufReader and never load whole. Offsets skip lines without keeping
+//! them, the window stops at its limit, and totals are exact only when the
+//! lookahead hits EOF — the scan never continues just to count lines.
+
+use std::io::BufRead;
+
+use super::LineCount;
+
+/// Head bytes kept for a single line while scanning; the line still counts
+/// when longer, but only this head is stored (LINE_CHAR_CAP chars need at
+/// most 4 bytes each, so minified files stay bounded).
+const LINE_SCAN_CAP: usize = 8 * 1024;
+
+pub(super) struct WindowResult {
+    pub lines: Vec<String>,
+    pub total: LineCount,
+    /// 1-based file line number of `lines[0]`; 0 when offset ran past EOF.
+    pub start: usize,
+    /// the scan reached end-of-input inside the window
+    pub eof: bool,
+    /// true byte length of `lines[0]` before the char cap: the tool uses it
+    /// to name a line that dwarfs the whole read cap (the first-line
+    /// message), so the model can go past it with bash instead of stepping
+    /// offsets into it forever.
+    pub first_line_bytes: usize,
+    /// whether `lines[0]` was char-capped (its true length only known via
+    /// `first_line_bytes`)
+    pub first_line_capped: bool,
+}
+
+/// Read-side errors: transport, and content the tool refuses to hand the
+/// model.
+#[derive(Debug)]
+pub(super) enum WindowError {
+    Io(std::io::Error),
+    /// a line in the window is genuinely not UTF-8 — reported, never
+    /// transliterated (a latin-1 byte→char pass would hand the model
+    /// mojibake it cannot know is mojibake)
+    NonUtf8,
+}
+
+/// Skip `offset-1` lines, collect `limit`, read one line past the window to
+/// learn whether the input ends.
+pub(super) fn window_reader(
+    r: &mut dyn BufRead,
+    offset: usize,
+    limit: usize,
+) -> Result<WindowResult, WindowError> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut count = 0usize;
+    let mut first_line_bytes = 0usize;
+    let mut first_line_capped = false;
+    loop {
+        // honor ctrl-c mid-read: a huge windowed file must not keep chewing
+        // lines after the user asked to stop (see ReadTool interrupt path)
+        if crate::core::http::interrupted() {
+            return Err(WindowError::Io(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "interrupted by user",
+            )));
+        }
+        let Some((raw, raw_len)) = read_line(r).map_err(WindowError::Io)? else {
+            return Ok(WindowResult {
+                total: LineCount::Exact(count),
+                start: if lines.is_empty() { 0 } else { offset },
+                eof: true,
+                lines,
+                first_line_bytes,
+                first_line_capped,
+            });
+        };
+        count += 1;
+        if count < offset {
+            continue;
+        }
+        if lines.len() == limit {
+            // one line exists past the window: the total is a lower bound
+            return Ok(WindowResult {
+                total: LineCount::AtLeast(count),
+                start: offset,
+                eof: false,
+                lines,
+                first_line_bytes,
+                first_line_capped,
+            });
+        }
+        let first = lines.is_empty();
+        let mut line = decode_line(&raw, count == 1)?;
+        if first {
+            // the newline is not part of it: this is the size the tool names
+            // when the line dwarfs the cap
+            first_line_bytes = raw_len;
+            first_line_capped = cap_line(&mut line);
+        } else {
+            cap_line(&mut line);
+        }
+        lines.push(line);
+    }
+}
+
+/// One raw line without its newline, paired with its true byte length:
+/// bytes past LINE_SCAN_CAP are dropped from the stored head but still
+/// counted, so a pathological single line costs at most this much memory
+/// while its real size stays reportable (the tool names it when the line
+/// dwarfs the whole read cap). `None` at end of input.
+fn read_line(r: &mut dyn BufRead) -> std::io::Result<Option<(Vec<u8>, usize)>> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut true_len = 0usize;
+    loop {
+        let buf = r.fill_buf()?;
+        if buf.is_empty() {
+            return Ok((!out.is_empty()).then_some((out, true_len)));
+        }
+        match buf.iter().position(|&b| b == b'\n') {
+            Some(i) => {
+                // the cap binds this branch too: a newline at the end of a
+                // long run would otherwise append the whole prefix
+                let keep = i.min(LINE_SCAN_CAP.saturating_sub(out.len()));
+                out.extend_from_slice(&buf[..keep]);
+                true_len += i;
+                r.consume(i + 1);
+                return Ok(Some((out, true_len)));
+            }
+            None => {
+                let n = buf.len();
+                let keep = n.min(LINE_SCAN_CAP.saturating_sub(out.len()));
+                out.extend_from_slice(&buf[..keep]);
+                true_len += n;
+                r.consume(n);
+            }
+        }
+    }
+}
+
+/// Decode one raw line: strip the UTF-8 BOM on the first line, drop a
+/// trailing carriage return, then require UTF-8. Splitting bytes on
+/// `\n` is safe for multibyte sequences: 0x0A never appears inside one.
+fn decode_line(raw: &[u8], first: bool) -> Result<String, WindowError> {
+    let mut raw = raw;
+    if first {
+        raw = raw.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(raw);
+    }
+    raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+    match std::str::from_utf8(raw) {
+        Ok(s) => Ok(s.to_string()),
+        // an incomplete multibyte char at the very end is a cut, not a
+        // corruption: the line-cap or scan-cap split it mid-char, so the
+        // valid prefix is the whole truth there is
+        Err(e) if e.error_len().is_none() => Ok(std::str::from_utf8(&raw[..e.valid_up_to()])
+            .unwrap_or_default()
+            .to_string()),
+        Err(_) => Err(WindowError::NonUtf8),
+    }
+}
+
+/// Cap one line at LINE_CHAR_CAP chars with an ellipsis; returns whether it
+/// was cut.
+fn cap_line(line: &mut String) -> bool {
+    match line.char_indices().nth(super::LINE_CHAR_CAP) {
+        Some((idx, _)) => {
+            line.truncate(idx);
+            line.push('…');
+            true
+        }
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn result(bytes: &[u8], offset: usize, limit: usize) -> WindowResult {
+        window_reader(&mut Cursor::new(bytes), offset, limit).unwrap()
+    }
+
+    #[test]
+    fn test_window_reads_offset_and_limit() {
+        let text = b"one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
+        let w = result(text, 3, 4);
+        assert_eq!(w.lines, ["three", "four", "five", "six"]);
+        assert_eq!(w.start, 3);
+        assert!(matches!(w.total, LineCount::AtLeast(7)));
+        assert!(!w.eof);
+    }
+
+    #[test]
+    fn test_window_exact_when_eof_reached() {
+        let w = result(b"a\nb\nc\n", 2, 2);
+        assert_eq!(w.lines, ["b", "c"]);
+        assert!(matches!(w.total, LineCount::Exact(3)));
+        assert!(w.eof);
+    }
+
+    #[test]
+    fn test_window_offset_past_end_signals_with_exact_count() {
+        let w = result(b"a\nb\n", 5, 2);
+        assert!(w.lines.is_empty());
+        assert_eq!(w.start, 0);
+        assert!(matches!(w.total, LineCount::Exact(2)));
+    }
+
+    #[test]
+    fn test_window_empty_input() {
+        let w = result(b"", 1, 10);
+        assert!(w.lines.is_empty());
+        assert!(matches!(w.total, LineCount::Exact(0)));
+    }
+
+    #[test]
+    fn test_window_last_line_without_newline() {
+        let w = result(b"a\nb", 2, 5);
+        assert_eq!(w.lines, ["b"]);
+        assert!(matches!(w.total, LineCount::Exact(2)));
+    }
+
+    #[test]
+    fn test_decode_line_bom_crlf_and_cuts() {
+        assert_eq!(decode_line(b"\xEF\xBB\xBFhi", true).unwrap(), "hi");
+        // the BOM only strips on the first line
+        assert_eq!(decode_line(b"\xEF\xBB\xBFhi", false).unwrap(), "\u{feff}hi");
+        assert_eq!(decode_line(b"hi\r", false).unwrap(), "hi");
+        // genuinely non-utf-8 bytes are refused, never transliterated
+        assert!(matches!(
+            decode_line(&[0xE4, 0x62], false),
+            Err(WindowError::NonUtf8)
+        ));
+        assert_eq!(decode_line("中文".as_bytes(), false).unwrap(), "中文");
+    }
+
+    #[test]
+    fn test_huge_single_line_is_capped() {
+        let mut text = vec![b'x'; 2 * 1024 * 1024];
+        text.push(b'\n');
+        text.extend_from_slice(b"after\n");
+        let w = result(&text, 1, 10);
+        assert_eq!(w.lines.len(), 2);
+        let capped = w.lines[0].chars().count();
+        assert_eq!(capped, super::super::LINE_CHAR_CAP + 1); // payload + ellipsis
+        assert!(w.lines[0].ends_with('…'));
+        assert_eq!(w.lines[1], "after");
+        assert!(matches!(w.total, LineCount::Exact(2)));
+        // the true size is reported, not the stored head's: the tool's
+        // "line dwarfs the read cap, use bash" message keys on it
+        assert_eq!(w.first_line_bytes, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn newline_at_end_of_one_buffer_still_respects_the_scan_cap() {
+        // a line ending just inside the second 64 KiB chunk used to append
+        // the whole prefix, blowing past LINE_SCAN_CAP
+        let mut text = vec![b'x'; 64 * 1024 + 100];
+        text.push(b'\n');
+        text.extend_from_slice(b"after\n");
+        let w = result(&text, 1, 10);
+        assert_eq!(w.lines[0].chars().count(), super::super::LINE_CHAR_CAP + 1);
+        assert_eq!(w.first_line_bytes, 64 * 1024 + 100);
+        assert_eq!(w.lines[1], "after");
+    }
+
+    #[test]
+    fn true_length_counts_the_newlineless_tail() {
+        // no \n at all: the None branch accumulates the same true length
+        let text = vec![b'y'; 100 * 1024];
+        let w = result(&text, 1, 10);
+        assert_eq!(w.first_line_bytes, 100 * 1024);
+        assert!(w.eof);
+    }
+
+    #[test]
+    fn test_incomplete_tail_decodes_valid_prefix() {
+        // a multibyte char cut mid-sequence is a cap artifact, not
+        // corruption: the valid prefix is the answer
+        assert!(matches!(
+            window_reader(&mut Cursor::new(b"ab\xe4\xb8"), 1, 10),
+            Ok(w) if w.lines == ["ab"]
+        ));
+        // but a complete non-utf-8 sequence is refused outright
+        assert!(matches!(
+            window_reader(&mut Cursor::new(&[0xE4, 0x62, b'\n']), 1, 10),
+            Err(WindowError::NonUtf8)
+        ));
+    }
+}

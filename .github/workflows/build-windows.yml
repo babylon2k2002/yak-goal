@@ -1,0 +1,92 @@
+name: build-windows
+
+# Manual only: nothing here runs on a push, so a force-push or a tag never
+# spends minutes building an unverified tree. The artifact is the point, not a
+# release — pick the run by id and download that one.
+on:
+  workflow_dispatch:
+    inputs:
+      run_tests:
+        description: "Run `cargo test` before building (the tree is not known-good, so this can fail the run)"
+        type: boolean
+        default: false
+      rust_toolchain:
+        description: "Rust toolchain to build with (edition 2024 + let-chains need >= 1.88)"
+        type: string
+        default: "stable"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # standard GitHub-hosted runner: no paid larger runner, no self-hosted box
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Show the commit this artifact comes from
+        shell: pwsh
+        run: |
+          Write-Host "sha    : ${{ github.sha }}"
+          Write-Host "ref    : ${{ github.ref_name }}"
+          Write-Host "run    : ${{ github.run_id }}"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ inputs.rust_toolchain }}
+          # no `target:` — a windows-latest runner's default host triple *is*
+          # x86_64-pc-windows-msvc, so the default target is the one we want
+
+      - name: Report the toolchain actually used
+        run: rustc --version --verbose
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x64-msvc
+
+      - name: cargo test (optional)
+        if: ${{ inputs.run_tests }}
+        run: cargo test --locked
+
+      - name: cargo build --release
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      # The binary is self-contained: no DLLs, no data files, no assets are
+      # read at runtime (the only compile-time include is README.md, pulled in
+      # by tests/readme_help.rs). The docs and examples ride along because the
+      # examples are the extension tools themselves — `examples/extensions/`
+      # is where `ls`, `plan`, `search`, `memory`, `webfetch` and `subagent`
+      # live, so a binary without them is missing half the tool set.
+      - name: Stage the artifact
+        shell: pwsh
+        run: |
+          $stage = "dist/yak-${{ github.sha }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $exe = "target/x86_64-pc-windows-msvc/release/yak.exe"
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+          $size = (Get-Item $exe).Length
+          if ($size -lt 1MB) { throw "yak.exe is only $size bytes — the build did not really run" }
+          Copy-Item $exe $stage
+          Copy-Item LICENSE, README.md, Cargo.toml, Cargo.lock $stage
+          Copy-Item -Recurse examples $stage/examples
+          Copy-Item -Recurse docs $stage/docs
+          # provenance for whoever unzips this later
+          @(
+            "built from : ${{ github.repository }}"
+            "commit     : ${{ github.sha }}"
+            "run        : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            "toolchain  : ${{ inputs.rust_toolchain }}"
+            "tests      : ${{ inputs.run_tests }}"
+            "sha256     : " + (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          ) | Set-Content -Encoding utf8 $stage/BUILD-INFO.txt
+          Get-ChildItem $stage | Format-Table Name, Length
+          Write-Host "staged $size bytes of yak.exe"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yak-windows-x64-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 3

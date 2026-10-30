@@ -1,0 +1,1244 @@
+//! Anthropic Messages API native adapter, with thinking-delta streaming.
+
+use serde_json::{Value, json};
+
+use super::{Attachment, CacheTtl, Msg, PromptInput, ResolvedModel};
+use crate::core::attachments::{Kind, kind_of};
+use crate::core::http::{Event, HttpRequest, StopReason, Usage};
+
+/// Push the buffered run of tool results as one user turn (Anthropic groups
+/// consecutive tool_result blocks into a single message).
+fn flush_results(messages: &mut Vec<Value>, pending: &mut Vec<Value>) {
+    if !pending.is_empty() {
+        messages.push(json!({"role": "user", "content": std::mem::take(pending)}));
+    }
+}
+
+/// One content block for an attachment: images, PDFs and plain-text
+/// documents are native; audio has no Anthropic wire form.
+fn attachment_block(a: &Attachment) -> Result<Value, String> {
+    if a.base64_data.is_empty() {
+        // a resumed thread stores provenance, not pixels: bytes that could not
+        // be reloaded are reported as a note, never sent as an empty block
+        return Ok(json!({
+            "type": "text",
+            "text": format!(
+                "[{}: attached earlier in this conversation, bytes not available]",
+                super::reference(a)
+            )
+        }));
+    }
+    let mime = a.mime_type.as_str();
+    match kind_of(mime) {
+        Some(Kind::Image) => Ok(json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": mime, "data": a.base64_data}
+        })),
+        Some(Kind::Pdf) => Ok(json!({
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": a.base64_data}
+        })),
+        // a text document is native here only for these two mimes; anything
+        // else textual (and every audio clip) has no Messages wire form
+        Some(Kind::Text) if mime == "text/plain" || mime == "text/csv" => {
+            let text = super::decoded_text(a)?;
+            Ok(json!({
+                "type": "document",
+                "source": {"type": "text", "media_type": mime, "data": text}
+            }))
+        }
+        _ => Err(format!(
+            "anthropic models take image, PDF and text attachments, not '{mime}'"
+        )),
+    }
+}
+
+/// The `cache_control` value one breakpoint carries. An entry lives five
+/// minutes unless the request asks for the hour, which interactive work needs
+/// — an approval prompt, a long test run or a user reading the answer spaces
+/// two rounds further apart than five minutes often enough, and every entry
+/// that lapses means the next round re-writes the whole prompt at write price.
+/// `CacheTtl` owns which lifetime that is and how the config spells it; the
+/// provider's own default leaves the field off entirely.
+fn marker(ttl: Option<CacheTtl>) -> Value {
+    match ttl.and_then(CacheTtl::field) {
+        Some(t) => json!({"type": "ephemeral", "ttl": t}),
+        None => json!({"type": "ephemeral"}),
+    }
+}
+
+/// Mark one message's last content block as a prompt-cache breakpoint.
+/// Caching is opt-in on the Messages API; without a marker nothing caches.
+fn mark_message(msg: &mut Value, ttl: Option<CacheTtl>) {
+    let content = &mut msg["content"];
+    if content.is_string() {
+        let text = content.as_str().unwrap_or("").to_string();
+        *content = json!([{
+            "type": "text",
+            "text": text,
+            "cache_control": marker(ttl)
+        }]);
+    } else if let Some(blocks) = content.as_array_mut()
+        && let Some(block) = blocks.last_mut()
+    {
+        block["cache_control"] = marker(ttl);
+    }
+}
+
+/// Cache breakpoints for one request. The API allows four; a conversation
+/// breakpoint only ever *reads* for the rounds that follow it, so a single
+/// marker on the moving tip caches almost nothing — every round rewrites the
+/// whole history at write price (1.25x) and reads none of it back. Two
+/// markers fix that: the anchor is the message the previous request ended on
+/// (stable, so this round reads everything up to it) and the tip is where
+/// this request ends (so the next round reads this one in turn). The system
+/// block carries the third, which covers tools+system together.
+fn mark_cache_breakpoints(messages: &mut [Value], anchor: Option<usize>, ttl: Option<CacheTtl>) {
+    let Some(last) = messages.len().checked_sub(1) else {
+        return;
+    };
+    // the anchor is an index into the *conversation*, which the assembled
+    // message list may only extend (a trailing user turn); an index at or
+    // past the tip is not a stable prefix and would collide with the tip
+    // marker (the API refuses more than one breakpoint per block)
+    if let Some(i) = anchor.filter(|i| *i < last) {
+        mark_message(&mut messages[i], ttl);
+    }
+    mark_message(&mut messages[last], ttl);
+}
+
+pub fn build_body(
+    m: &ResolvedModel,
+    input: &PromptInput<'_>,
+    stream: bool,
+) -> Result<Value, String> {
+    // orphan pairing resolved from the borrowed history: no Vec<Msg> copy
+    // of the whole conversation per round
+    let last_result = super::last_result_index(input.history);
+    let mut messages: Vec<Value> = Vec::new();
+    let mut pending_results: Vec<Value> = Vec::new();
+    // assembled position of the last message the previous request carried:
+    // the stable anchor a cache breakpoint can read back. The caller names a
+    // prefix length n, which at the top of iteration n is exactly what the
+    // flushes so far have produced (a trailing tool-result run included).
+    let mut anchor: Option<usize> = None;
+    for (i, msg) in input.history.iter().enumerate() {
+        if input.cache_anchor == Some(i) {
+            flush_results(&mut messages, &mut pending_results);
+            anchor = messages.len().checked_sub(1);
+        }
+        match msg {
+            Msg::User { text, attachments } => {
+                flush_results(&mut messages, &mut pending_results);
+                messages.push(json!({
+                    "role": "user",
+                    "content": super::user_content(m.supports_images(), text, attachments, attachment_block)?
+                }));
+            }
+            Msg::Assistant {
+                text,
+                tool_calls,
+                reasoning,
+                reasoning_meta,
+            } => {
+                flush_results(&mut messages, &mut pending_results);
+                // An interrupted, unsigned thinking-only response stays in
+                // the transcript, but it has no replayable content on this
+                // wire: an empty assistant message is a 400, and the
+                // recovery path that produced this state would then fail
+                // for a second reason. Skip it instead.
+                if text.is_empty()
+                    && tool_calls.is_empty()
+                    && reasoning_meta
+                        .as_ref()
+                        .and_then(|meta| meta["signature"].as_str())
+                        .is_none()
+                {
+                    continue;
+                }
+                if tool_calls.is_empty() && reasoning_meta.is_none() {
+                    messages.push(json!({"role": "assistant", "content": text}));
+                } else {
+                    let mut blocks: Vec<Value> = Vec::new();
+                    // extended thinking must be replayed, signature and all,
+                    // by the assistant turn that carries a tool call; a trace
+                    // whose signature was never captured cannot be replayed
+                    // (the API refuses it), so it is dropped
+                    if let Some(meta) = reasoning_meta
+                        && let Some(signature) = meta.get("signature").and_then(Value::as_str)
+                    {
+                        blocks.push(json!({
+                            "type": "thinking",
+                            "thinking": reasoning.as_deref().unwrap_or(""),
+                            "signature": signature,
+                        }));
+                    }
+                    if !text.is_empty() {
+                        blocks.push(json!({"type": "text", "text": text}));
+                    }
+                    for c in tool_calls {
+                        blocks.push(json!({"type": "tool_use", "id": c.id, "name": c.name, "input": c.arguments}));
+                    }
+                    messages.push(json!({"role": "assistant", "content": blocks}));
+                }
+                for call in tool_calls {
+                    if !super::call_answered(&last_result, &call.id, i) {
+                        pending_results.push(json!({
+                            "type": "tool_result",
+                            "tool_use_id": call.id,
+                            "content": super::ORPHAN_RESULT,
+                            "is_error": true,
+                        }));
+                    }
+                }
+            }
+            Msg::ToolResult {
+                call_id,
+                content,
+                error,
+                attachments,
+                ..
+            } => {
+                // Anthropic's tool_result natively takes image blocks
+                // inlines them too — so the shared string-only helper is
+                // bypassed: text parts first, then attachment blocks
+                let blocks = if attachments.is_empty() {
+                    json!(content)
+                } else if m.supports_images() {
+                    let mut parts = vec![json!({"type": "text", "text": content})];
+                    for a in attachments {
+                        parts.push(attachment_block(a)?);
+                    }
+                    Value::Array(parts)
+                } else {
+                    json!(format!(
+                        "{content}\n[image omitted: current model does not support images]"
+                    ))
+                };
+                pending_results.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": blocks,
+                    "is_error": error.is_some(),
+                }));
+            }
+            Msg::Summary { text } => {
+                flush_results(&mut messages, &mut pending_results);
+                messages.push(
+                    json!({"role": "user", "content": format!("<summary>\n{text}\n</summary>")}),
+                );
+            }
+        }
+    }
+    flush_results(&mut messages, &mut pending_results);
+    // the caller named the whole history as stable: the anchor is its last
+    // assembled message, which the final flush above may just have produced
+    if input.cache_anchor == Some(input.history.len()) {
+        anchor = messages.len().checked_sub(1);
+    }
+    // an empty prompt with no attachments means "continue after tool results"
+    if !input.prompt.is_empty() || !input.attachments.is_empty() {
+        messages.push(json!({
+            "role": "user",
+            "content": super::user_content(m.supports_images(), input.prompt, input.attachments, attachment_block)?
+        }));
+    }
+    if !input.history.is_empty() {
+        mark_cache_breakpoints(&mut messages, anchor, input.cache_ttl);
+    }
+
+    let mut body = json!({
+        "model": m.model_id,
+        "max_tokens": 8192,
+        "messages": messages,
+        "stream": stream,
+    });
+    if let Some(system) = input.system {
+        // a breakpoint on the last system block caches tools+system together
+        body["system"] = json!([{
+            "type": "text",
+            "text": system,
+            "cache_control": marker(input.cache_ttl)
+        }]);
+    }
+    if !input.tools.is_empty() {
+        let mut tools: Vec<Value> = input
+            .tools
+            .iter()
+            .map(|t| {
+                json!({"name": t.name, "description": t.description, "input_schema": t.parameters})
+            })
+            .collect();
+        // no system prompt to pin: the breakpoint falls to the last tool
+        if input.system.is_none()
+            && let Some(last) = tools.last_mut()
+        {
+            last["cache_control"] = marker(input.cache_ttl);
+        }
+        body["tools"] = Value::Array(tools);
+        // no parallel flag here: Anthropic allows parallel tool use by
+        // default (`tool_choice.disable_parallel_tool_use` is false), unlike
+        // the OpenAI-compat wire which wants an explicit
+        // `parallel_tool_calls: true`.
+    }
+    super::apply_options(&mut body, &m.options);
+    // effort level → thinking budget; applied after the -o loop so a
+    // hand-set max_tokens is respected unless the budget needs more room
+    if let Some(level) = input.reasoning
+        && let Some(budget) = super::thinking_budget(level)
+    {
+        body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
+        let max = body["max_tokens"].as_u64().unwrap_or(8192);
+        if max <= budget {
+            body["max_tokens"] = json!(budget + 4096);
+        }
+    }
+    Ok(body)
+}
+
+fn map_stop(reason: &str) -> StopReason {
+    match reason {
+        "tool_use" => StopReason::ToolUse,
+        "max_tokens" => StopReason::Length,
+        _ => StopReason::Stop,
+    }
+}
+
+/// Merge the fields one usage event carries into the running total.
+/// Anthropic splits usage across events: `message_start` seeds `input_tokens`
+/// plus the cache read/write counts, `message_delta` later carries only
+/// `output_tokens`. Fields absent from an event keep their previous value;
+/// gateways that repeat everything in one event work the same way.
+/// `input_tokens` excludes the cache read and write, but `Usage.input` means
+/// the whole prompt (the openai-compat `prompt_tokens` semantics), so token
+/// counts and the `cache N%` footer stay comparable across provider kinds.
+fn apply_usage(u: &Value, usage: &mut Option<Usage>) {
+    let read = u["cache_read_input_tokens"].as_u64();
+    let write = u["cache_creation_input_tokens"].as_u64();
+    let input = u["input_tokens"].as_u64().or(u["prompt_tokens"].as_u64());
+    let output = u["output_tokens"]
+        .as_u64()
+        .or(u["completion_tokens"].as_u64());
+    if input.is_none() && output.is_none() && read.is_none() && write.is_none() {
+        return;
+    }
+    let mut cur = usage.take().unwrap_or_default();
+    if let Some(p) = input {
+        // A half the event does not repeat falls back to the count already
+        // known: `input_tokens` is the same request's cumulative count, so an
+        // event echoing it without the split (proxies do) must not drop the
+        // cache counts `message_start` established.
+        let r = read.unwrap_or(cur.cached);
+        let w = write.unwrap_or(cur.cached_write);
+        cur.input = p + r + w;
+        cur.cached = r;
+        cur.cached_write = w;
+    }
+    if let Some(c) = output {
+        cur.output = c;
+    }
+    *usage = Some(cur);
+}
+
+/// Feed one SSE event (type + parsed data) through the request state.
+pub(crate) fn feed_event(
+    event_type: &str,
+    chunk: &Value,
+    usage: &mut Option<Usage>,
+    stop: &mut StopReason,
+    on_event: &mut dyn FnMut(Event),
+) {
+    let index = || chunk["index"].as_u64().unwrap_or(0) as usize;
+    match event_type {
+        "content_block_start" => {
+            if chunk["content_block"]["type"] == "tool_use" {
+                on_event(Event::ToolCallDelta {
+                    index: index(),
+                    id: chunk["content_block"]["id"].as_str().map(str::to_string),
+                    name: chunk["content_block"]["name"].as_str().map(str::to_string),
+                    fragment: String::new(),
+                });
+            }
+        }
+        "content_block_delta" => {
+            if let Some(text) = chunk["delta"]["text"].as_str() {
+                on_event(Event::Delta(text.to_string()));
+            }
+            if let Some(text) = chunk["delta"]["thinking"].as_str() {
+                on_event(Event::ReasoningDelta {
+                    text: text.to_string(),
+                    meta: None,
+                });
+            }
+            // the signature that must be replayed with the trace on the
+            // next turn rides its own delta, after the visible text
+            if chunk["delta"]["type"] == "signature_delta"
+                && let Some(sig) = chunk["delta"]["signature"].as_str()
+            {
+                on_event(Event::ReasoningDelta {
+                    text: String::new(),
+                    meta: Some(json!({"signature": sig})),
+                });
+            }
+            if chunk["delta"]["type"] == "input_json_delta"
+                && let Some(frag) = chunk["delta"]["partial_json"].as_str()
+            {
+                on_event(Event::ToolCallDelta {
+                    index: index(),
+                    name: None,
+                    id: None,
+                    fragment: frag.to_string(),
+                });
+            }
+        }
+        "message_start" => {
+            let u = if chunk["message"]["usage"].is_object() {
+                &chunk["message"]["usage"]
+            } else {
+                &chunk["usage"]
+            };
+            apply_usage(u, usage);
+        }
+        "message_delta" => {
+            apply_usage(&chunk["usage"], usage);
+            if let Some(reason) = chunk["delta"]["stop_reason"].as_str() {
+                *stop = map_stop(reason);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Emit events for a complete (non-streaming) response. Returns usage.
+pub(crate) fn feed_complete(value: &Value, on_event: &mut dyn FnMut(Event)) -> Option<Usage> {
+    let mut usage = None;
+    apply_usage(&value["usage"], &mut usage);
+    for (i, block) in value["content"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .enumerate()
+    {
+        match block["type"].as_str() {
+            Some("text") => {
+                if let Some(text) = block["text"].as_str() {
+                    on_event(Event::Delta(text.to_string()));
+                }
+            }
+            Some("thinking") => {
+                if let Some(text) = block["thinking"].as_str() {
+                    on_event(Event::ReasoningDelta {
+                        text: text.to_string(),
+                        meta: block["signature"]
+                            .as_str()
+                            .map(|signature| json!({"signature": signature})),
+                    });
+                }
+            }
+            Some("tool_use") => {
+                on_event(Event::ToolCallDelta {
+                    index: i,
+                    id: block["id"].as_str().map(str::to_string),
+                    name: block["name"].as_str().map(str::to_string),
+                    fragment: block["input"].to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
+    let stop = value["stop_reason"]
+        .as_str()
+        .map(map_stop)
+        .unwrap_or_default();
+    on_event(Event::Done { usage, stop });
+    usage
+}
+
+pub fn run(
+    m: &ResolvedModel,
+    input: &PromptInput,
+    stream: bool,
+    on_event: &mut dyn FnMut(Event),
+) -> Result<(), String> {
+    let url = format!("{}/v1/messages", m.base_url.trim_end_matches('/'));
+    let mut headers = vec![("Content-Type".into(), "application/json".into())];
+    if let Some(key) = &m.api_key {
+        headers.extend(super::auth_headers(&m.kind, key));
+    }
+    headers.extend(super::gateway_headers(&url));
+    let body = build_body(m, input, stream)?.to_string();
+    super::check_request_body(&body, input)?;
+    super::dispatch(
+        HttpRequest { url, headers, body },
+        stream,
+        |event_type, chunk, usage, stop, on_event| {
+            feed_event(event_type, chunk, usage, stop, on_event);
+            Ok(())
+        },
+        |value, on_event| {
+            feed_complete(value, on_event);
+        },
+        on_event,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::testutil::{att, input};
+    use crate::providers::{ToolCall, ToolCallAccumulator, ToolDef};
+
+    fn model(kind: &str) -> ResolvedModel {
+        crate::providers::testutil::model(kind)
+    }
+    use serde_json::json;
+
+    #[test]
+    fn unsigned_thinking_only_history_does_not_send_an_empty_assistant() {
+        // an interrupted thinking-only round: no text, no tool call, no
+        // signature — nothing this wire can replay, so it must not become
+        // an empty assistant message (the API refuses one)
+        let history = vec![
+            Msg::user("go"),
+            Msg::Assistant {
+                text: String::new(),
+                tool_calls: vec![],
+                reasoning: Some("unfinished".into()),
+                reasoning_meta: None,
+            },
+        ];
+        let mut request = input(&history, &[]);
+        request.prompt = "Continue";
+        let body = build_body(&model("anthropic"), &request, true).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        // the prompt only: no assistant message was emitted for the trace
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|msg| msg["role"] == "user"));
+    }
+
+    #[test]
+    fn pdf_attachment_rides_a_document_block() {
+        let mut i = input(&[], &[]);
+        let atts = [att("application/pdf", Some("doc.pdf"))];
+        i.attachments = &atts;
+        let body = build_body(&model("anthropic"), &i, false).unwrap();
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[1]["type"], "document");
+        assert_eq!(content[1]["source"]["media_type"], "application/pdf");
+        assert_eq!(content[1]["source"]["data"], "AAAA");
+    }
+
+    #[test]
+    fn audio_attachment_errors() {
+        let mut i = input(&[], &[]);
+        let atts = [att("audio/mpeg", None)];
+        i.attachments = &atts;
+        let err = build_body(&model("anthropic"), &i, false).unwrap_err();
+        assert!(err.contains("audio/mpeg"), "{err}");
+        assert!(err.contains("image, PDF and text"), "{err}");
+    }
+
+    #[test]
+    fn a_stored_attachment_without_bytes_rides_as_a_note() {
+        // a resumed thread stores provenance, not pixels: an empty payload must
+        // never reach the wire as an empty base64 source
+        let mut i = input(&[], &[]);
+        let atts = [Attachment {
+            mime_type: "image/png".into(),
+            base64_data: String::new(),
+            filename: Some("m05.png".into()),
+            path: Some("/tmp/mg/m05.png".into()),
+            url: None,
+        }];
+        i.attachments = &atts;
+        let body = build_body(&model("anthropic"), &i, false).unwrap();
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[1]["type"], "text");
+        assert!(content[1]["text"].as_str().unwrap().contains("m05.png"));
+    }
+
+    #[test]
+    fn text_attachment_rides_a_plain_text_document() {
+        let mut i = input(&[], &[]);
+        // base64 of "hello notes"
+        let atts = [Attachment {
+            mime_type: "text/plain".into(),
+            base64_data: crate::b64::encode(b"hello notes"),
+            filename: Some("notes.txt".into()),
+            path: None,
+            url: None,
+        }];
+        i.attachments = &atts;
+        let body = build_body(&model("anthropic"), &i, false).unwrap();
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[1]["type"], "document");
+        assert_eq!(content[1]["source"]["type"], "text");
+        assert_eq!(content[1]["source"]["media_type"], "text/plain");
+        assert_eq!(content[1]["source"]["data"], "hello notes");
+    }
+
+    #[test]
+    fn non_utf8_text_attachment_errors() {
+        let mut i = input(&[], &[]);
+        let atts = [Attachment {
+            mime_type: "text/csv".into(),
+            base64_data: crate::b64::encode(&[0xff, 0xfe, 0x00]),
+            filename: Some("rows.csv".into()),
+            path: None,
+            url: None,
+        }];
+        i.attachments = &atts;
+        let err = build_body(&model("anthropic"), &i, false).unwrap_err();
+        assert!(err.contains("UTF-8"), "{err}");
+    }
+
+    /// Extended thinking must ride back with the assistant turn that made
+    /// the tool call — signature included — or the next request is a 400.
+    #[test]
+    fn a_thinking_trace_replays_its_signature_on_the_tool_round() {
+        let history = vec![
+            Msg::user("think then run"),
+            Msg::Assistant {
+                text: "let me look".into(),
+                tool_calls: vec![ToolCall {
+                    id: "t1".into(),
+                    name: "ls".into(),
+                    arguments: json!({}),
+                }],
+                reasoning: Some("weighing options".into()),
+                reasoning_meta: Some(json!({"signature": "sig-abc"})),
+            },
+            Msg::tool_result("t1", "ls", "a"),
+        ];
+        let mut i = input(&history, &[]);
+        i.prompt = "";
+        let body = build_body(&model("anthropic"), &i, false).unwrap();
+        let blocks = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["thinking"], "weighing options");
+        assert_eq!(blocks[0]["signature"], "sig-abc");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[2]["type"], "tool_use");
+    }
+
+    /// A trace whose signature was never captured cannot be replayed (the API
+    /// rejects a thinking block without one), so the text is dropped rather
+    /// than sent malformed.
+    #[test]
+    fn a_thinking_trace_without_a_signature_is_not_replayed() {
+        let history = vec![
+            Msg::user("hi"),
+            Msg::Assistant {
+                text: "hello".into(),
+                tool_calls: vec![],
+                reasoning: Some("hmm".into()),
+                reasoning_meta: None,
+            },
+        ];
+        let mut i = input(&history, &[]);
+        i.prompt = "";
+        let body = build_body(&model("anthropic"), &i, false).unwrap();
+        let text = body["messages"][1]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, "hello", "the trace is dropped, the answer is not");
+    }
+
+    /// The signature arrives on its own SSE delta after the thinking text and
+    /// must be captured, not dropped with the empty chunk.
+    #[test]
+    fn a_signature_delta_is_captured() {
+        let mut usage = None;
+        let mut stop = StopReason::default();
+        let mut events: Vec<(String, Option<Value>)> = Vec::new();
+        let mut on_event = |e: Event| {
+            if let Event::ReasoningDelta { text, meta } = e {
+                events.push((text, meta));
+            }
+        };
+        feed_event(
+            "content_block_delta",
+            &json!({"index": 0, "delta": {"type": "thinking_delta", "thinking": "why"}}),
+            &mut usage,
+            &mut stop,
+            &mut on_event,
+        );
+        feed_event(
+            "content_block_delta",
+            &json!({"index": 0, "delta": {"type": "signature_delta", "signature": "sig-1"}}),
+            &mut usage,
+            &mut stop,
+            &mut on_event,
+        );
+        assert_eq!(events[0], ("why".to_string(), None));
+        assert_eq!(events[1].1, Some(json!({"signature": "sig-1"})));
+    }
+
+    #[test]
+    fn consecutive_tool_results_merge_into_one_user_turn() {
+        let history = vec![
+            Msg::user("run both"),
+            Msg::Assistant {
+                text: "thinking...".into(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "t1".into(),
+                        name: "ls".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "t2".into(),
+                        name: "read".into(),
+                        arguments: json!({"path":"x"}),
+                    },
+                ],
+                reasoning: None,
+                reasoning_meta: None,
+            },
+            Msg::tool_result("t1", "ls", "a"),
+            Msg::ToolResult {
+                call_id: "t2".into(),
+                name: "read".into(),
+                content: "boom".into(),
+                error: Some(crate::providers::ToolError::Failed),
+                attachments: Vec::new(),
+            },
+        ];
+        let body = build_body(&model("anthropic"), &input(&history, &[]), true).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        // user, assistant(text+2 tool_use), user(2 tool_result), user(prompt)
+        assert_eq!(msgs.len(), 4);
+        let blocks = msgs[1]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "tool_use");
+        assert_eq!(blocks[1]["id"], "t1");
+        assert_eq!(blocks[1]["input"], json!({}));
+        let results = msgs[2]["content"].as_array().unwrap();
+        assert_eq!(msgs[2]["role"], "user");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["tool_use_id"], "t1");
+        assert_eq!(results[1]["is_error"], true);
+    }
+
+    /// The two-marker scheme across the shapes a conversation takes: first
+    /// request, a request extending a persisted turn, and the case where the
+    /// anchor and the tip coincide (a tool round) — that one must collapse to
+    /// a single marker, because the API refuses two on one block.
+    #[test]
+    fn cache_breakpoints_pin_the_stable_prefix_and_the_tip() {
+        fn marked(b: &Value) -> usize {
+            b["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| {
+                    m["content"].as_array().is_some_and(|blocks| {
+                        blocks.iter().any(|b| b.get("cache_control").is_some())
+                    })
+                })
+                .count()
+        }
+
+        // first request: nothing is stable, so only the tip is marked
+        let history = vec![Msg::user("hi")];
+        let mut i = input(&history, &[]);
+        let body = build_body(&model("anthropic"), &i, false).unwrap();
+        // history(1) then the live prompt
+        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(marked(&body), 1, "the tip alone: {body}");
+
+        // round 2: the previous request carried the whole conversation, so
+        // its last message is the anchor while the new prompt is the tip
+        let history = vec![
+            Msg::user("hi"),
+            Msg::Assistant {
+                text: "hello".into(),
+                tool_calls: vec![],
+                reasoning: None,
+                reasoning_meta: None,
+            },
+        ];
+        i.history = &history;
+        i.cache_anchor = Some(2);
+        let body = build_body(&model("anthropic"), &i, false).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3, "history(2) then the live prompt");
+        assert_eq!(
+            msgs[1]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"}),
+            "the persisted turn is the anchor: {body}"
+        );
+        assert_eq!(
+            msgs[2]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"}),
+            "the live prompt is the tip: {body}"
+        );
+        assert!(
+            msgs[0]["content"][0].get("cache_control").is_none(),
+            "the oldest turn is covered by the anchor, not marked again: {body}"
+        );
+        assert_eq!(marked(&body), 2);
+
+        // an anchor that already covers everything still resolves to the
+        // last persisted message, one behind the live prompt
+        i.cache_anchor = Some(1);
+        let body = build_body(&model("anthropic"), &i, false).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs[0]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert_eq!(
+            msgs[2]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert_eq!(marked(&body), 2);
+
+        // a tool round adds no user turn, so the anchor resolves onto the tip
+        // itself and must collapse to one marker
+        let only = vec![Msg::user("hi")];
+        let mut i = input(&only, &[]);
+        i.prompt = "";
+        i.cache_anchor = Some(1);
+        let body = build_body(&model("anthropic"), &i, false).unwrap();
+        assert_eq!(marked(&body), 1, "anchor and tip coincide: {body}");
+    }
+
+    /// `agent.cache_ttl` reaches every breakpoint the request carries, so the
+    /// whole prompt — tools and system included — lives for the hour it asks
+    /// for instead of the default five minutes; naming the default leaves the
+    /// wire exactly as it was.
+    #[test]
+    fn the_long_cache_ttl_rides_every_breakpoint() {
+        let history = vec![Msg::user("hi"), Msg::assistant("ok")];
+        let tools = [crate::providers::testutil::tool_def()];
+        let mut i = input(&history, &tools);
+        i.system = Some("you are yak");
+        i.cache_anchor = Some(2);
+        i.cache_ttl = Some(CacheTtl::Hour);
+        let body = build_body(&model("anthropic"), &i, false).unwrap();
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"}),
+            "{body}"
+        );
+        assert!(
+            body["tools"][0].get("cache_control").is_none(),
+            "the system block already covers the tools: {body}"
+        );
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs[1]["content"][0]["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"}),
+            "the anchor: {body}"
+        );
+        assert_eq!(
+            msgs[2]["content"][0]["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"}),
+            "the tip: {body}"
+        );
+
+        // the fallback breakpoint (no system prompt, so the last tool)
+        // carries the lifetime too
+        let mut i = input(&history, &tools);
+        i.cache_anchor = Some(2);
+        i.cache_ttl = Some(CacheTtl::Hour);
+        let body = build_body(&model("anthropic"), &i, false).unwrap();
+        assert_eq!(
+            body["tools"][0]["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"}),
+            "{body}"
+        );
+
+        // `CacheTtl::Default` is the API's own five minutes: asking for it
+        // adds no field, so the request stays byte-identical to one that
+        // asked for no lifetime at all
+        let mut five = input(&history, &tools);
+        five.cache_anchor = Some(2);
+        five.cache_ttl = Some(CacheTtl::Default);
+        let plain = build_body(&model("anthropic"), &five, false).unwrap();
+        assert!(
+            !serde_json::to_string(&plain).unwrap().contains("\"ttl\""),
+            "naming the default must not add a field: {plain}"
+        );
+    }
+
+    #[test]
+    fn thinking_maps_to_budget_and_raises_max_tokens() {
+        let mut i = input(&[], &[]);
+        i.reasoning = Some("medium");
+        let body = build_body(&model("anthropic"), &i, false).unwrap();
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "enabled", "budget_tokens": 16384})
+        );
+        // default max_tokens (8192) must exceed the budget
+        assert_eq!(body["max_tokens"], json!(16384 + 4096));
+
+        // a user-set max_tokens above the budget is left alone
+        let mut m = model("anthropic");
+        m.options = vec![("max_tokens".to_string(), "90000".to_string())];
+        let body = build_body(&m, &i, false).unwrap();
+        assert_eq!(body["max_tokens"], json!(90000));
+
+        // unset → no thinking block at all
+        let body = build_body(&model("anthropic"), &input(&[], &[]), false).unwrap();
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn tools_wire_shape() {
+        let tools = vec![ToolDef {
+            name: "bash".into(),
+            description: "run a command".into(),
+            parameters: json!({"type":"object","properties":{"command":{"type":"string"}}}),
+        }];
+        let body = build_body(&model("anthropic"), &input(&[], &tools), false).unwrap();
+        assert_eq!(body["tools"][0]["name"], "bash");
+        assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+        assert!(body.get("tools").unwrap().as_array().unwrap().len() == 1);
+    }
+
+    #[test]
+    fn system_breakpoint_pins_tools_and_system() {
+        let tools = vec![ToolDef {
+            name: "ls".into(),
+            description: "list files".into(),
+            parameters: json!({"type": "object"}),
+        }];
+        let history = [Msg::user("hi")];
+        let mut i = input(&history, &tools);
+        i.system = Some("be brief");
+        let body = build_body(&model("anthropic"), &i, false).unwrap();
+        let blocks = body["system"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "be brief");
+        // the marker caches tools+system together; tools carry none of their own
+        assert_eq!(blocks[0]["cache_control"], json!({"type": "ephemeral"}));
+        assert!(body["tools"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn no_system_moves_the_breakpoint_to_the_last_tool() {
+        let tools = vec![
+            ToolDef {
+                name: "ls".into(),
+                description: "list files".into(),
+                parameters: json!({"type": "object"}),
+            },
+            ToolDef {
+                name: "read".into(),
+                description: "read a file".into(),
+                parameters: json!({"type": "object"}),
+            },
+        ];
+        let body = build_body(
+            &model("anthropic"),
+            &input(&[Msg::user("hi")], &tools),
+            false,
+        )
+        .unwrap();
+        assert!(body.get("system").is_none());
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(
+            body["tools"][1]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+    }
+
+    #[test]
+    fn conversation_tip_carries_the_breakpoint() {
+        let history = vec![Msg::user("hi")];
+        let body = build_body(&model("anthropic"), &input(&history, &[]), false).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        // earlier turns stay plain unmarked strings
+        assert_eq!(msgs[0]["content"], json!("hi"));
+        let tip = msgs[1]["content"].as_array().unwrap();
+        assert_eq!(tip.len(), 1);
+        assert_eq!(tip[0]["type"], "text");
+        assert_eq!(tip[0]["text"], "go");
+        assert_eq!(tip[0]["cache_control"], json!({"type": "ephemeral"}));
+    }
+
+    #[test]
+    fn tool_result_tip_carries_the_breakpoint() {
+        let history = vec![
+            Msg::user("run"),
+            Msg::Assistant {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "t1".into(),
+                    name: "bash".into(),
+                    arguments: json!({"command": "ls"}),
+                }],
+                reasoning: None,
+                reasoning_meta: None,
+            },
+            Msg::tool_result("t1", "bash", "out"),
+        ];
+        let mut i = input(&history, &[]);
+        i.prompt = ""; // continue after tool results
+        let body = build_body(&model("anthropic"), &i, false).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        let tip = msgs.last().unwrap()["content"].as_array().unwrap();
+        assert_eq!(tip.len(), 1);
+        assert_eq!(tip[0]["type"], "tool_result");
+        assert_eq!(tip[0]["cache_control"], json!({"type": "ephemeral"}));
+    }
+
+    #[test]
+    fn first_round_prompt_stays_unmarked() {
+        // no history: a one-shot prompt is never resent, so a breakpoint on
+        // it would pay the cache-write premium for a read that never comes
+        let body = build_body(&model("anthropic"), &input(&[], &[]), false).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["content"], json!("go"));
+    }
+
+    #[test]
+    fn streaming_usage_merges_message_start_and_delta() {
+        // the documented split: input + cache counts in message_start, only
+        // output_tokens in message_delta — both must land in one Usage
+        let mut usage = None;
+        let mut stop = StopReason::default();
+        feed_event(
+            "message_start",
+            &json!({
+                "type": "message_start",
+                "message": {"usage": {"input_tokens": 25, "cache_read_input_tokens": 500,
+                                       "cache_creation_input_tokens": 40}}
+            }),
+            &mut usage,
+            &mut stop,
+            &mut |_| {},
+        );
+        assert!(usage.is_none() || usage.as_ref().unwrap().output == 0);
+        feed_event(
+            "message_delta",
+            &json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 15}
+            }),
+            &mut usage,
+            &mut stop,
+            &mut |_| {},
+        );
+        let u = usage.expect("usage recorded");
+        assert_eq!(u.input, 565);
+        assert_eq!(u.cached, 500);
+        assert_eq!(u.output, 15);
+        assert_eq!(stop, StopReason::Stop);
+    }
+
+    #[test]
+    fn streaming_usage_accepts_everything_in_message_delta() {
+        // lenient gateways repeat the full usage object on message_delta
+        let mut usage = None;
+        let mut stop = StopReason::default();
+        feed_event(
+            "message_delta",
+            &json!({"usage": {"input_tokens": 7, "output_tokens": 9}}),
+            &mut usage,
+            &mut stop,
+            &mut |_| {},
+        );
+        let u = usage.expect("usage recorded");
+        assert_eq!((u.input, u.output), (7, 9));
+    }
+
+    #[test]
+    fn usage_folds_cache_tokens_into_input() {
+        let value = json!({
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_read_input_tokens": 500,
+                "cache_creation_input_tokens": 40
+            },
+            "content": []
+        });
+        let usage = feed_complete(&value, &mut |_| {}).unwrap();
+        assert_eq!(usage.input, 640);
+        assert_eq!(usage.cached, 500);
+        assert_eq!(usage.cached_write, 40);
+        assert_eq!(usage.output, 20);
+        // the whole-prompt denominator keeps the share at or below 100%
+        assert_eq!(usage.cache_percent(), 78);
+    }
+
+    /// `message_start` carries the split; `message_delta` carries the request's
+    /// cumulative counts. A delta that repeats `input_tokens` without the cache
+    /// halves must not drop what the start established — the whole-prompt total
+    /// would fall under its own cached part and the context estimate with it.
+    #[test]
+    fn a_delta_without_the_cache_split_keeps_the_counts_it_was_given() {
+        let mut usage = None;
+        let mut stop = StopReason::default();
+        let mut feed = |event_type: &str, chunk: &Value| {
+            feed_event(event_type, chunk, &mut usage, &mut stop, &mut |_| {});
+        };
+        feed(
+            "message_start",
+            &json!({
+                "message": {"usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 1,
+                    "cache_read_input_tokens": 500,
+                    "cache_creation_input_tokens": 40
+                }}
+            }),
+        );
+        feed(
+            "message_delta",
+            &json!({
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"input_tokens": 100, "output_tokens": 20}
+            }),
+        );
+        let usage = usage.unwrap();
+        assert_eq!(usage.input, 640, "the prompt total keeps its cached halves");
+        assert_eq!(usage.cached, 500);
+        assert_eq!(usage.cached_write, 40);
+        assert_eq!(usage.output, 20);
+        assert_eq!(usage.cache_percent(), 78);
+    }
+
+    #[test]
+    fn feed_event_streams_tool_use_and_stop_reason() {
+        let mut usage = None;
+        let mut stop = StopReason::default();
+        let mut acc = ToolCallAccumulator::default();
+        let mut feed = |event_type: &str, chunk: &Value| {
+            feed_event(event_type, chunk, &mut usage, &mut stop, &mut |e| {
+                if let Event::ToolCallDelta {
+                    index,
+                    name,
+                    id,
+                    fragment,
+                } = e
+                {
+                    acc.push(index, id.as_deref(), name.as_deref(), &fragment);
+                }
+            });
+        };
+        feed(
+            "content_block_start",
+            &json!({
+                "index": 1,
+                "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read", "input": {}}
+            }),
+        );
+        feed(
+            "content_block_delta",
+            &json!({
+                "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"pa"}
+            }),
+        );
+        feed(
+            "content_block_delta",
+            &json!({
+                "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": "th\":\"a\"}"}
+            }),
+        );
+        feed(
+            "message_delta",
+            &json!({
+                "delta": {"stop_reason": "tool_use"},
+                "usage": {"input_tokens": 7, "output_tokens": 8}
+            }),
+        );
+
+        assert_eq!(stop, StopReason::ToolUse);
+        assert_eq!(
+            usage,
+            Some(Usage {
+                input: 7,
+                output: 8,
+                cached: 0,
+                cached_write: 0,
+            })
+        );
+        let calls = acc.finish();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "toolu_1");
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].arguments, json!({"path": "a"}));
+    }
+
+    #[test]
+    fn buffered_thinking_signature_is_replayed_with_tool_calls() {
+        let response = json!({
+            "content": [
+                {"type": "thinking", "thinking": "reason", "signature": "signed"},
+                {"type": "tool_use", "id": "t1", "name": "read", "input": {"path": "a"}}
+            ],
+            "stop_reason": "tool_use"
+        });
+        let mut reasoning = None;
+        let mut meta = None;
+        feed_complete(&response, &mut |event| {
+            if let Event::ReasoningDelta {
+                text,
+                meta: signature,
+            } = event
+            {
+                reasoning = Some(text);
+                meta = signature;
+            }
+        });
+        let history = vec![Msg::Assistant {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "t1".into(),
+                name: "read".into(),
+                arguments: json!({"path": "a"}),
+            }],
+            reasoning,
+            reasoning_meta: meta,
+        }];
+        let body = build_body(&model("anthropic"), &input(&history, &[]), false).unwrap();
+        assert_eq!(
+            body["messages"][0]["content"][0],
+            json!({
+                "type": "thinking", "thinking": "reason", "signature": "signed"
+            })
+        );
+    }
+
+    #[test]
+    fn feed_complete_handles_tool_use_blocks() {
+        let value = json!({
+            "content": [
+                {"type": "text", "text": "doing it"},
+                {"type": "tool_use", "id": "t9", "name": "bash", "input": {"command": "ls"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        });
+        let mut acc = ToolCallAccumulator::default();
+        let mut stop_seen = None;
+        let usage = feed_complete(&value, &mut |e| match e {
+            Event::ToolCallDelta {
+                index,
+                name,
+                id,
+                fragment,
+            } => acc.push(index, id.as_deref(), name.as_deref(), &fragment),
+            Event::Done { stop, .. } => stop_seen = Some(stop),
+            _ => {}
+        });
+        assert_eq!(
+            usage,
+            Some(Usage {
+                input: 1,
+                output: 2,
+                cached: 0,
+                cached_write: 0,
+            })
+        );
+        assert_eq!(stop_seen, Some(StopReason::ToolUse));
+        assert_eq!(acc.finish()[0].arguments, json!({"command": "ls"}));
+    }
+}

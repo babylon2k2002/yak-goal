@@ -1,0 +1,32 @@
+# build output
+/target
+*.pdb
+
+# yak's own runtime state (never source): ~/.yak relocated into the tree
+.yak/
+
+# python bytecode from the example extensions
+__pycache__/
+*.pyc
+
+# secrets and local config — must never reach the repo
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+secrets.json
+
+# editor and OS droppings
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# local scratch the tools above are allowed to make
+/tmp/

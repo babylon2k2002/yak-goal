@@ -1,0 +1,695 @@
+//! user_dir resolution and the files kept there: config.json (providers with
+//! inline api keys, the "models" settings family and hand-added tables like
+//! "agent").
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+use crate::jsonfmt;
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct Config {
+    #[serde(default)]
+    pub providers: BTreeMap<String, Provider>,
+    /// resolved aliases off the same bytes, so per-model resolution does
+    /// not re-read the file (see `load` — one read, all the side tables)
+    #[serde(skip)]
+    pub aliases: BTreeMap<String, String>,
+    /// the `models.default` string, carried so model resolution does not
+    /// re-read the file for it
+    #[serde(skip)]
+    pub default_model: Option<String>,
+    /// the `models.thinking` string riding the default model
+    #[serde(skip)]
+    pub default_thinking: Option<String>,
+    /// the per-model `models.options` table, resolved once at `load`
+    #[serde(skip)]
+    pub model_options: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Provider {
+    pub kind: String,
+    pub base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub models: Vec<String>,
+}
+
+/// Platform user directory: YAK_USER_PATH env override, else ~/.yak
+/// (matching the project-level .yak/ convention). Resolved once per process:
+/// the env never changes mid-run (no code writes it) and the directory is
+/// created on first use, so the ~20 call sites — several per request — pay
+/// neither the env lookup nor the `create_dir_all` syscall again.
+///
+/// The rename from `llm` left the old `~/.llm` behind: when that directory
+/// exists and `~/.yak` does not, it is renamed wholesale (one `fs::rename`,
+/// contents ride along) before anything looks inside, with a stderr line
+/// naming the move — silent data relocation is the one thing a user must
+/// always be told about. An explicit YAK_USER_PATH skips the migration:
+/// it names its own root.
+pub fn user_dir() -> PathBuf {
+    static DIR: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
+        let path = match std::env::var_os("YAK_USER_PATH") {
+            Some(dir) => PathBuf::from(dir),
+            None => {
+                let home = crate::core::paths::home_dir();
+                if let Some(h) = &home {
+                    match migrate_llm_dir(h) {
+                        Ok(true) => eprintln!(
+                            "Migrated {} -> {} (one-time rename from the llm era)",
+                            h.join(".llm").display(),
+                            h.join(".yak").display()
+                        ),
+                        Err(e) => eprintln!(
+                            "Warning: found {} but cannot migrate it to {}: {e} \u{2014} \
+                             continuing with a fresh {}",
+                            h.join(".llm").display(),
+                            h.join(".yak").display(),
+                            h.join(".yak").display()
+                        ),
+                        Ok(false) => {}
+                    }
+                }
+                match home {
+                    Some(home) => home.join(".yak"),
+                    None => PathBuf::from(".yak"),
+                }
+            }
+        };
+        let _ = fs::create_dir_all(&path);
+        path
+    });
+    DIR.clone()
+}
+
+/// The one-shot `~/.llm` → `~/.yak` move. Only when the old directory
+/// exists and the new one does not (a fresh-machine install of both would
+/// be pathological, and never clobber what the new name already owns).
+/// `Ok(true)` means the rename happened on this call.
+fn migrate_llm_dir(home: &std::path::Path) -> std::io::Result<bool> {
+    let old = home.join(".llm");
+    let new = home.join(".yak");
+    if !old.is_dir() || new.exists() {
+        return Ok(false);
+    }
+    fs::rename(&old, &new)?;
+    // the memory file rode along under its old name; bring it too
+    let _ = fs::rename(new.join("LLM.md"), new.join("YAK.md"));
+    Ok(true)
+}
+
+pub fn config_path() -> PathBuf {
+    user_dir().join("config.json")
+}
+
+pub fn threads_dir() -> PathBuf {
+    user_dir().join("threads")
+}
+
+/// Expand `${VAR}` references in provider api keys, falling back to the
+/// empty string when the variable is unset.
+pub fn expand_env(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        rest = &rest[start + 2..];
+        match rest.find('}') {
+            Some(end) => {
+                let var = &rest[..end];
+                out.push_str(&std::env::var(var).unwrap_or_default());
+                rest = &rest[end + 1..];
+            }
+            None => {
+                out.push_str("${");
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+pub fn load() -> Config {
+    let root = read_root_or_die();
+    // every side table rides the same parsed root (the struct skips
+    // them): one read and one parse of the file, not a second full parse
+    // per key
+    let aliases = match root.get("aliases") {
+        None | Some(serde_json::Value::Null) => BTreeMap::new(),
+        Some(v) => serde_json::from_value(v.clone())
+            .map_err(|e| {
+                eprintln!(
+                    "Warning: cannot read aliases from {}: {e}",
+                    config_path().display()
+                )
+            })
+            .unwrap_or_default(),
+    };
+    let mut config: Config = serde_json::from_value(root.clone()).unwrap_or_else(|e| {
+        eprintln!(
+            "Error: {} does not hold a valid config: {e}",
+            config_path().display()
+        );
+        std::process::exit(1);
+    });
+    config.aliases = aliases;
+    config.apply_models_side_tables(&root);
+    config
+}
+
+impl Config {
+    /// Fill the `models` side tables (default/thinking/options) off the
+    /// same parsed root the struct came from — the second parse the file
+    /// used to pay per key, paid once instead.
+    fn apply_models_side_tables(&mut self, root: &serde_json::Value) {
+        let Some(models) = root.get("models") else {
+            return;
+        };
+        self.default_model = default_model_from(models).map(str::to_string);
+        self.default_thinking = models
+            .get("thinking")
+            .and_then(|t| t.as_str())
+            .map(str::to_string);
+        self.model_options = models
+            .get("options")
+            .map(|o| {
+                let mut out: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+                // values are strings by convention, but a bare number is a
+                // legal token count too — anything else (nested objects,
+                // arrays, null) fails loudly instead of vanishing through
+                // a from_value().ok() that would also eat a typo
+                let Some(table) = o.as_object() else {
+                    eprintln!(
+                        "Warning: models.options in {} is not an object; ignoring it",
+                        config_path().display()
+                    );
+                    return out;
+                };
+                for (model, pairs) in table {
+                    let Some(pairs) = pairs.as_object() else {
+                        eprintln!(
+                            "Warning: models.options[{model}] in {} is not an object; ignoring it",
+                            config_path().display()
+                        );
+                        continue;
+                    };
+                    let entry = out.entry(model.clone()).or_default();
+                    for (k, v) in pairs {
+                        match v {
+                            serde_json::Value::String(s) => {
+                                entry.insert(k.clone(), s.clone());
+                            }
+                            serde_json::Value::Number(n) => {
+                                entry.insert(k.clone(), n.to_string());
+                            }
+                            other => eprintln!(
+                                "Warning: models.options[{model}].{k} in {} is {} (want a string or number); ignoring it",
+                                config_path().display(),
+                                other
+                            ),
+                        }
+                    }
+                }
+                out
+            })
+            .unwrap_or_default();
+    }
+}
+
+/// Extension names from the config `extensions.disabled` list. A missing
+/// file or key is simply empty — optional tables are never fatal — but a
+/// corrupt file is loud: silently enabling disabled extensions would be a
+/// trust change nobody asked for.
+pub fn disabled_extensions() -> Vec<String> {
+    read_root_or_die()
+        .get("extensions")
+        .and_then(|e| e.get("disabled"))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Per-tool-call timeout for extension tools (config
+/// `extensions.tool_timeout`, seconds; default 120).
+pub fn extension_tool_timeout() -> Duration {
+    let secs = read_root_or_die()
+        .get("extensions")
+        .and_then(|e| e.get("tool_timeout"))
+        .and_then(|t| t.as_u64());
+    Duration::from_secs(secs.unwrap_or(120).max(1))
+}
+
+/// The one loud reader: a missing or empty file is an empty object, anything
+/// unparsable or non-object aborts the process exactly like `load()` — no
+/// reader of this file may silently degrade past a corrupt config.
+fn read_root_or_die() -> serde_json::Value {
+    match read_root() {
+        Ok(root) => root,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Read config.json as an object (single reader for every config access —
+/// typed loads, optional-table peeks and merge-preserving rewrites alike):
+/// a missing or empty file yields an empty object, anything unparsable or
+/// non-object is an error instead of a wiped or imagined config.
+fn read_root() -> std::io::Result<serde_json::Value> {
+    let path = config_path();
+    if !path.exists() {
+        return Ok(serde_json::Value::Object(Default::default()));
+    }
+    let raw = fs::read_to_string(&path).map_err(|e| {
+        std::io::Error::new(e.kind(), format!("cannot read {}: {e}", path.display()))
+    })?;
+    if raw.trim().is_empty() {
+        return Ok(serde_json::Value::Object(Default::default()));
+    }
+    let root: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not valid JSON: {e}", path.display()),
+        )
+    })?;
+    if !root.is_object() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} root is not a JSON object", path.display()),
+        ));
+    }
+    Ok(root)
+}
+
+fn write_root(root: &serde_json::Value) -> std::io::Result<()> {
+    // atomic, and 0600 from the first byte: this file holds API keys, and a
+    // crash mid-write must never leave it truncated (or world-readable)
+    crate::core::fsx::write_atomic(
+        &config_path(),
+        (jsonfmt::dumps_indent(root, 2) + "\n").as_bytes(),
+        Some(0o600),
+    )
+}
+
+// model aliases — the hand-edited "aliases" object in config.json
+
+pub fn save(config: &Config) -> std::io::Result<()> {
+    fs::create_dir_all(user_dir())?;
+    // merge into the existing file so hand-added keys ("agent" etc.) survive
+    let mut root = read_root()?;
+    let providers = serde_json::to_value(&config.providers).expect("providers serialize");
+    if let Some(map) = root.as_object_mut() {
+        map.insert("providers".to_string(), providers);
+    }
+    write_root(&root)
+}
+
+// the default model — the "models" object in config.json:
+// {"default": "provider/model", "thinking": "high"}. One default serves
+// every mode (prompt/agent); -m and YAK_MODEL override per run. Both ride
+// `Config` (resolved at `load`) so resolution never re-reads the file.
+
+/// The same read off an explicit root: the edit paths (`clear_default_for`)
+/// work on a fresh read, not on a `Config`; `load` calls it on the parsed
+/// `models` object.
+fn default_model_from(models: &serde_json::Value) -> Option<&str> {
+    models.get("default").and_then(|m| m.as_str())
+}
+
+/// Write `models.default`.
+pub fn try_set_default_model(model: &str) -> std::io::Result<()> {
+    edit_mode_default(|root| set_default_model_in(root, model))
+}
+
+fn set_default_model_in(value: &mut serde_json::Value, model: &str) {
+    let map = models_map_mut(value);
+    map.insert(
+        "default".to_string(),
+        serde_json::Value::String(model.to_string()),
+    );
+}
+
+/// Write (or remove, on None) `models.thinking`.
+pub fn try_set_default_thinking(thinking: Option<&str>) -> std::io::Result<()> {
+    edit_mode_default(|root| set_default_thinking_in(root, thinking))
+}
+
+fn set_default_thinking_in(value: &mut serde_json::Value, thinking: Option<&str>) {
+    let map = models_map_mut(value);
+    match thinking {
+        Some(t) => {
+            map.insert(
+                "thinking".to_string(),
+                serde_json::Value::String(t.to_string()),
+            );
+        }
+        None => {
+            map.remove("thinking");
+        }
+    }
+}
+
+/// Clear the default (and its thinking) when it points at `provider` —
+/// used when the provider is removed, so the dangling entry cannot block
+/// the first-provider auto-default. Returns Ok(true) when something was
+/// cleared; the write error is surfaced instead of silently dropping it.
+pub fn clear_default_for(provider: &str) -> std::io::Result<bool> {
+    let mut cleared = false;
+    edit_mode_default(|root| {
+        cleared = clear_default_for_in(root, provider);
+    })?;
+    Ok(cleared)
+}
+
+/// The pure edit: drop the default/thinking entries when they point at
+/// `provider`. Returns true when anything was removed.
+fn clear_default_for_in(root: &mut serde_json::Value, provider: &str) -> bool {
+    let prefix = format!("{provider}/");
+    let default = root
+        .get("models")
+        .and_then(|m| m.get("default"))
+        .and_then(|m| m.as_str());
+    if default.is_some_and(|m| m.starts_with(&prefix)) {
+        if let Some(models) = root.as_object_mut().and_then(|m| m.get_mut("models"))
+            && let Some(map) = models.as_object_mut()
+        {
+            map.remove("default");
+            map.remove("thinking");
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Read-modify-write the models table, preserving every other config key.
+fn edit_mode_default(edit: impl FnOnce(&mut serde_json::Value)) -> std::io::Result<()> {
+    fs::create_dir_all(user_dir())?;
+    let mut root = read_root()?;
+    edit(&mut root);
+    write_root(&root)
+}
+
+/// The mutable `models` object, created when absent.
+fn models_map_mut(
+    value: &mut serde_json::Value,
+) -> &mut serde_json::Map<String, serde_json::Value> {
+    let root = value
+        .as_object_mut()
+        .expect("read_root only yields objects");
+    let models = root
+        .entry("models".to_string())
+        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    if !models.is_object() {
+        *models = serde_json::Value::Object(Default::default());
+    }
+    models.as_object_mut().expect("just ensured an object")
+}
+
+// model settings — every mode's default
+// per-model option table, all under config.json's "models" object
+
+/// Remember a provider model seen in the wild (e.g. picked from a live
+/// /models list) so it resolves from config.json from now on.
+pub fn add_model(provider: &str, model_id: &str) {
+    let mut cfg = load();
+    if let Some(p) = cfg.providers.get_mut(provider) {
+        if p.models.iter().any(|m| m == model_id) {
+            return;
+        }
+        p.models.push(model_id.to_string());
+    } else {
+        return;
+    }
+    if let Err(e) = save(&cfg) {
+        eprintln!(
+            "Warning: failed to remember model in {}: {e}",
+            config_path().display()
+        );
+    }
+}
+
+impl Config {
+    /// Resolve a model id (either `provider/model` or a bare name/alias)
+    /// to (provider_name, provider, model_id). `Ok(None)` means the name is
+    /// not known; `Err` lists the candidates when a bare name is served by
+    /// more than one provider, instead of silently taking the first in
+    /// config order.
+    pub fn resolve_model(
+        &self,
+        query: &str,
+    ) -> Result<Option<(String, &Provider, String)>, String> {
+        let query = self.aliases.get(query).map(|s| s.as_str()).unwrap_or(query);
+        if let Some((prov, model)) = query.split_once('/')
+            && let Some(p) = self.providers.get(prov)
+        {
+            return Ok(Some((prov.to_string(), p, model.to_string())));
+        }
+        // bare model name: every provider that lists it
+        let hits: Vec<(&str, &Provider)> = self
+            .providers
+            .iter()
+            .filter(|(_, p)| p.models.iter().any(|m| m == query))
+            .map(|(n, p)| (n.as_str(), p))
+            .collect();
+        match hits.len() {
+            0 => Ok(None),
+            1 => Ok(Some((hits[0].0.to_string(), hits[0].1, query.to_string()))),
+            _ => Err(format!(
+                "'{query}' matches more than one provider: {} — qualify it as provider/model",
+                hits.iter()
+                    .map(|(n, _)| format!("{n}/{query}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
+    /// API key for a provider: its config.json api_key field, with ${VAR}
+    /// references expanded. An unset variable expands to nothing — named as a
+    /// warning here, because an empty key downstream surfaces only as a
+    /// provider 401 that never mentions the variable that was never set.
+    pub fn api_key(&self, p: &Provider) -> Option<String> {
+        let raw = p.api_key.clone()?;
+        let expanded = expand_env(&raw);
+        if expanded.is_empty() {
+            if raw.contains("${") {
+                eprintln!(
+                    "Warning: api_key {raw} expands to empty — is that environment variable set?"
+                );
+            }
+            None
+        } else {
+            Some(expanded)
+        }
+    }
+}
+
+#[cfg(test)]
+mod migrate_tests {
+    use super::*;
+
+    #[test]
+    fn an_old_llm_dir_moves_wholesale_and_renames_the_memory_file() {
+        let home = crate::core::testutil::scratch_dir("migrate-home");
+        std::fs::create_dir_all(home.join(".llm/threads")).unwrap();
+        std::fs::write(home.join(".llm/config.json"), "{\"providers\":{}}").unwrap();
+        std::fs::write(home.join(".llm/LLM.md"), "- prefers concise replies\n").unwrap();
+
+        assert!(migrate_llm_dir(&home).unwrap());
+        assert!(!home.join(".llm").exists(), "the old directory is gone");
+        assert!(home.join(".yak/config.json").is_file());
+        assert!(home.join(".yak/threads").is_dir());
+        assert!(home.join(".yak/YAK.md").is_file());
+        assert!(!home.join(".yak/LLM.md").exists());
+        // and it is one-shot: a second call has nothing to do
+        assert!(!migrate_llm_dir(&home).unwrap());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_present_yak_dir_is_never_touched() {
+        let home = crate::core::testutil::scratch_dir("migrate-fresh");
+        std::fs::create_dir_all(home.join(".llm")).unwrap();
+        std::fs::write(home.join(".llm/config.json"), "{}").unwrap();
+        std::fs::create_dir_all(home.join(".yak")).unwrap();
+        std::fs::write(home.join(".yak/config.json"), "{\"new\":true}").unwrap();
+
+        assert!(!migrate_llm_dir(&home).unwrap());
+        // both survive untouched: never clobber what the new name owns
+        assert!(home.join(".llm").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(home.join(".yak/config.json")).unwrap(),
+            "{\"new\":true}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_home_without_the_old_dir_is_a_no_op() {
+        let home = crate::core::testutil::scratch_dir("migrate-none");
+        assert!(!migrate_llm_dir(&home).unwrap());
+        assert!(!home.join(".yak").exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[cfg(test)]
+mod default_model_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn set_default_model_writes_the_default_and_keeps_siblings() {
+        let mut v = json!({
+            "providers": {"p": {"kind": "openai-compat"}},
+            "models": {"options": {}}
+        });
+        set_default_model_in(&mut v, "new/m");
+        assert_eq!(v["models"]["default"], json!("new/m"));
+        // the options table is a sibling, not the default: it stays
+        assert!(v["models"].get("options").is_some());
+        assert_eq!(v["providers"]["p"]["kind"], json!("openai-compat"));
+    }
+
+    #[test]
+    fn set_default_thinking_writes_then_removes() {
+        let mut v = json!({"models": {"default": "a/b"}});
+        set_default_thinking_in(&mut v, Some("xhigh"));
+        assert_eq!(v["models"]["thinking"], json!("xhigh"));
+        assert_eq!(v["models"]["default"], json!("a/b"));
+        set_default_thinking_in(&mut v, None);
+        assert!(v["models"].get("thinking").is_none());
+    }
+
+    #[test]
+    fn default_model_reads_the_single_default() {
+        let root = serde_json::json!({"default": "a/x", "thinking": "high"});
+        assert_eq!(default_model_from(&root), Some("a/x"));
+        assert_eq!(
+            default_model_from(&serde_json::json!({"thinking": "high"})),
+            None
+        );
+    }
+
+    #[test]
+    fn load_carries_the_models_side_tables() {
+        let root = serde_json::json!({
+            "models": {
+                "default": "a/x",
+                "thinking": "high",
+                "options": {"a/x": {"context_window": "200000"}}
+            }
+        });
+        let mut config = Config::default();
+        config.apply_models_side_tables(&root);
+        assert_eq!(config.default_model.as_deref(), Some("a/x"));
+        assert_eq!(config.default_thinking.as_deref(), Some("high"));
+        assert_eq!(
+            config
+                .model_options
+                .get("a/x")
+                .and_then(|o| o.get("context_window"))
+                .map(String::as_str),
+            Some("200000")
+        );
+        // a root without the table stays empty
+        let mut bare = Config::default();
+        bare.apply_models_side_tables(&serde_json::json!({}));
+        assert_eq!(bare.default_model, None);
+        assert!(bare.model_options.is_empty());
+    }
+
+    #[test]
+    fn a_numbered_option_value_is_carried_as_its_string() {
+        let root = serde_json::json!({
+            "models": {
+                "default": "a/x",
+                "options": {"a/x": {"context_window": 20000}}
+            }
+        });
+        let mut config = Config::default();
+        config.apply_models_side_tables(&root);
+        assert_eq!(
+            config
+                .model_options
+                .get("a/x")
+                .and_then(|o| o.get("context_window"))
+                .map(String::as_str),
+            Some("20000"),
+            "a bare token count is as legal as a quoted one"
+        );
+    }
+
+    #[test]
+    fn clear_default_for_removes_only_a_default_pointing_at_the_provider() {
+        let mut v = json!({"models": {"default": "p/m", "thinking": "high"}});
+        assert!(clear_default_for_in(&mut v, "p"));
+        assert!(v["models"].get("default").is_none());
+        assert!(v["models"].get("thinking").is_none());
+
+        // a default aimed at another provider is left alone
+        let mut other = json!({"models": {"default": "q/m", "thinking": "medium"}});
+        assert!(!clear_default_for_in(&mut other, "p"));
+        assert_eq!(other["models"]["default"], json!("q/m"));
+        assert_eq!(other["models"]["thinking"], json!("medium"));
+    }
+
+    #[test]
+    fn resolve_model_reports_ambiguity_instead_of_picking_a_provider() {
+        let mut config = Config {
+            providers: BTreeMap::new(),
+            aliases: BTreeMap::new(),
+            default_model: None,
+            default_thinking: None,
+            model_options: BTreeMap::new(),
+        };
+        config.providers.insert(
+            "alpha".to_string(),
+            Provider {
+                kind: "openai-compat".to_string(),
+                base_url: String::new(),
+                api_key: None,
+                models: vec!["claude-3".to_string()],
+            },
+        );
+        config.providers.insert(
+            "beta".to_string(),
+            Provider {
+                kind: "openai-compat".to_string(),
+                base_url: String::new(),
+                api_key: None,
+                models: vec!["claude-3".to_string(), "gpt-4".to_string()],
+            },
+        );
+
+        // a bare name served by two providers lists the candidates
+        let err = config.resolve_model("claude-3").unwrap_err();
+        assert!(err.contains("matches more than one provider"), "{err}");
+        assert!(err.contains("alpha/claude-3"), "{err}");
+        assert!(err.contains("beta/claude-3"), "{err}");
+
+        // a unique bare name resolves to its single provider
+        let (n, _, m) = config.resolve_model("gpt-4").unwrap().unwrap();
+        assert_eq!(n, "beta");
+        assert_eq!(m, "gpt-4");
+
+        // a qualified id wins even for a shared model id
+        let (n, _, _) = config.resolve_model("alpha/claude-3").unwrap().unwrap();
+        assert_eq!(n, "alpha");
+
+        assert!(config.resolve_model("nope").unwrap().is_none());
+    }
+}

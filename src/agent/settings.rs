@@ -1,0 +1,191 @@
+//! `[agent]` settings from config.json.
+
+use std::fs;
+
+use crate::agent::compact::CompactConfig;
+use crate::core::config::config_path;
+use crate::providers::CacheTtl;
+
+/// `[agent]` settings from config.json — everything optional, defaults live
+/// next to their consumers. CLI flags override whatever is set here.
+#[derive(Default)]
+pub struct AgentSettings {
+    /// the auto-compaction trigger in tokens, used only when the model's
+    /// context window is unknown (a known window anchors the trigger at
+    /// `window - reserve`, see `compact::effective_trigger`)
+    pub compact_at_tokens: Option<u64>,
+    pub keep_recent_tokens: Option<u64>,
+    /// ceiling on one serialized request body, in bytes; a gateway in front of
+    /// the model may refuse far less than the provider documents, and the
+    /// refusal that comes back names nothing usable
+    pub max_request_bytes: Option<usize>,
+    /// how long a provider should hold this conversation's prompt-cache
+    /// entries, as the file spells it (`5m` or `1h`); `cache_ttl()` is the
+    /// typed read and `load` refuses a spelling neither of them knows
+    pub cache_ttl: Option<String>,
+    pub tool_policies: std::collections::BTreeMap<String, String>,
+    /// `models.thinking` off the same bytes: `settings::load` reads this
+    /// file once, and the agent entry then never re-reads it for the
+    /// stored reasoning level
+    pub default_thinking: Option<String>,
+}
+
+impl AgentSettings {
+    /// The configured prompt-cache lifetime. Everything reaching the wire goes
+    /// through here, so the one place that knows how the file spells a
+    /// lifetime is `CacheTtl::parse` — which `load` already consulted, and
+    /// which a caller bypassing `load` cannot turn into a lifetime nobody
+    /// asked for.
+    pub fn cache_ttl(&self) -> Option<CacheTtl> {
+        self.cache_ttl.as_deref().and_then(CacheTtl::parse)
+    }
+
+    /// Compaction limits for a run. `compact_at_tokens` (`None` =
+    /// unconfigured) is only ever a tightening cap on the window-anchored
+    /// `window - reserve` trigger, never a fallback invented when the window
+    /// is unknown (the compaction module). `keep_recent_tokens` is the
+    /// dropped-prefix floor.
+    pub fn compact_config(&self) -> CompactConfig {
+        CompactConfig {
+            trigger_tokens: self.compact_at_tokens,
+            keep_recent_tokens: self.keep_recent_tokens.unwrap_or(20_000),
+        }
+    }
+}
+
+/// Load the `[agent]` section of config.json. A missing file (or a missing
+/// `agent` object) yields defaults; an unreadable or unparsable file fails
+/// loudly — the same file, the same rules as `core::config::load`.
+pub fn load() -> AgentSettings {
+    let path = config_path();
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return AgentSettings::default(),
+        Err(e) => {
+            eprintln!("Error: cannot read {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    };
+    // an empty file behaves like a missing one; anything else must parse —
+    // silently defaulting here would hide a corrupt config from the run
+    if !raw.trim().is_empty() && serde_json::from_str::<serde_json::Value>(&raw).is_err() {
+        eprintln!("Error: failed to parse {}: not valid JSON", path.display());
+        std::process::exit(1);
+    }
+    let settings = parse(&raw);
+    // a lifetime no provider knows is a typo, and the request it shapes looks
+    // exactly like one that asked for nothing: refuse it here, where the file
+    // is read, rather than quietly caching for five minutes
+    if let Some(ttl) = settings.cache_ttl.as_deref()
+        && CacheTtl::parse(ttl).is_none()
+    {
+        eprintln!("Error: agent.cache_ttl is '{ttl}' (5m or 1h)");
+        std::process::exit(1);
+    }
+    settings
+}
+
+pub fn parse(raw: &str) -> AgentSettings {
+    let mut s = AgentSettings::default();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return s;
+    };
+    let Some(agent) = value.get("agent") else {
+        return s;
+    };
+    s.compact_at_tokens = agent.get("compact_at_tokens").and_then(|v| v.as_u64());
+    s.keep_recent_tokens = agent.get("keep_recent_tokens").and_then(|v| v.as_u64());
+    s.max_request_bytes = agent
+        .get("max_request_bytes")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    s.cache_ttl = agent
+        .get("cache_ttl")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    if let Some(tools) = agent.get("tools").and_then(|v| v.as_object()) {
+        for (name, policy) in tools {
+            if let Some(p) = policy.as_str() {
+                s.tool_policies.insert(name.clone(), p.to_string());
+            }
+        }
+    }
+    s.default_thinking = value
+        .get("models")
+        .and_then(|m| m.get("thinking"))
+        .and_then(|t| t.as_str())
+        .map(str::to_string);
+    s
+}
+
+#[cfg(test)]
+mod agent_settings_tests {
+    use super::*;
+
+    /// The ceiling is a gateway property: absent unless configured.
+    #[test]
+    fn a_request_ceiling_comes_from_the_agent_section() {
+        assert_eq!(parse("{}").max_request_bytes, None);
+        let s = parse(r#"{"agent": {"max_request_bytes": 8000000}}"#);
+        assert_eq!(s.max_request_bytes, Some(8_000_000));
+    }
+
+    /// The prompt-cache lifetime is absent unless configured — the provider's
+    /// own default is then what applies, and the request says nothing about it.
+    #[test]
+    fn a_cache_ttl_comes_from_the_agent_section() {
+        assert_eq!(parse("{}").cache_ttl(), None);
+        assert_eq!(
+            parse(r#"{"agent": {"cache_ttl": "1h"}}"#).cache_ttl(),
+            Some(CacheTtl::Hour)
+        );
+        // naming the provider's own five minutes is still saying nothing
+        assert_eq!(
+            parse(r#"{"agent": {"cache_ttl": "5m"}}"#).cache_ttl(),
+            Some(CacheTtl::Default)
+        );
+        // anything else parses to nothing, which `load` refuses out loud
+        assert_eq!(
+            parse(r#"{"agent": {"cache_ttl": "60m"}}"#).cache_ttl(),
+            None
+        );
+        // only the long entry reaches the wire as a field
+        assert_eq!(CacheTtl::Hour.field(), Some("1h"));
+        assert_eq!(CacheTtl::Default.field(), None);
+    }
+
+    #[test]
+    fn parses_agent_object() {
+        let raw = r#"{
+  "providers": {
+    "mock": {
+      "kind": "openai-compat",
+      "base_url": "http://x/v1",
+      "models": ["m1"]
+    }
+  },
+  "agent": {
+    "compact_at_tokens": 250000,
+    "keep_recent_tokens": 100,
+    "tools": {"bash": "prompt"}
+  }
+}"#;
+        let s = parse(raw);
+        assert_eq!(s.compact_at_tokens, Some(250_000));
+        assert_eq!(s.keep_recent_tokens, Some(100));
+        assert_eq!(
+            s.tool_policies.get("bash").map(String::as_str),
+            Some("prompt")
+        );
+    }
+
+    #[test]
+    fn missing_or_invalid_returns_defaults() {
+        assert!(
+            parse(r#"{"providers": {"x": {"kind": "openai-compat"}}}"#)
+                .compact_at_tokens
+                .is_none()
+        );
+        assert!(parse("not json {{{").compact_at_tokens.is_none());
+    }
+}

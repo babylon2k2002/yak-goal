@@ -1,0 +1,1220 @@
+use super::manifest::{discover_in, parse_tool_manifest};
+use super::*;
+
+#[test]
+fn resident_frames_are_bounded_and_oversized_lines_are_drained() {
+    let input = format!("{}\n{{\"id\":1}}\n", "x".repeat(1024 * 1024 + 1));
+    let mut reader = std::io::BufReader::new(input.as_bytes());
+    let mut buf = Vec::new();
+    let mut lines = lossy_lines(&mut reader, &mut buf);
+    assert_eq!(
+        lines.next().as_deref(),
+        Some("[oversized extension frame discarded]")
+    );
+    assert_eq!(lines.next().as_deref(), Some("{\"id\":1}"));
+    assert!(lines.next().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_timed_out_extension_cannot_finish_its_abandoned_write() {
+    let dir = crate::core::testutil::scratch_dir("ext-timeout-write");
+    let script = dir.join("slow");
+    let marker = dir.join("written");
+    std::fs::write(&script, format!(r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *initialize*) printf '{{"id":%s,"result":{{"tools":[{{"name":"slow","parameters":{{}}}}]}}}}\n' "$id" ;;
+    *call_tool*) (sleep 0.4; echo done > "{}") & wait; printf '{{"id":%s,"result":"done"}}\n' "$id" ;;
+  esac
+done
+"#, marker.display())).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ext = connect_stub(&script);
+    let error = ext
+        .request(
+            &json!({"id": next_id(), "type": "call_tool", "name": "slow", "args": {}}),
+            Duration::from_millis(60),
+            None,
+        )
+        .unwrap_err();
+    assert!(error.contains("timed out"), "{error}");
+    std::thread::sleep(Duration::from_millis(550));
+    assert!(
+        !marker.exists(),
+        "the abandoned call must not write after timeout"
+    );
+    assert!(!ext.is_alive(), "the timed-out connection must be retired");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn parses_a_python_manifest_header() {
+    let text = "#!/usr/bin/env python3\n# --- yak-tool: wordcount\n# description: count characters\n# args: text (string) the text\n# arg-mode: argv\n# interpreter: python\nimport sys\n";
+    let spec = parse_tool_manifest(text, Path::new("/x/wordcount"), 120).expect("manifest");
+    assert_eq!(spec.name, "wordcount");
+    assert_eq!(spec.description, "count characters");
+    assert!(spec.arg_mode_argv);
+    assert_eq!(spec.interpreter.as_deref(), Some("python"));
+    assert_eq!(spec.schema["properties"]["text"]["type"], json!("string"));
+    assert_eq!(spec.schema["required"][0], json!("text"));
+}
+
+/// `extensions.disabled` must reach a script tool by its declared name,
+/// not only by the file's stem: packages ship scripts whose stem says
+/// nothing about the tool inside, and two files may declare one name.
+#[test]
+fn disabled_matches_a_script_tool_by_declared_name_too() {
+    let dir = crate::core::testutil::scratch_dir("ext-disc");
+    // one script tool named `search`, stem unrelated; one executable
+    // resident (name spelled per platform: Windows recognizes an
+    // executable by extension, unix by the exec bit) for the stem path
+    std::fs::write(
+        dir.join("helper.py"),
+        "# --- yak-tool: search\n# description: find things\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    let resident = dir.join("other");
+    #[cfg(windows)]
+    let resident = dir.join("other.bat");
+    std::fs::write(&resident, b"#!/bin/sh\n:").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&resident, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // nothing disabled: both surface
+    let found = discover_in(std::slice::from_ref(&dir), &[], 120).unwrap();
+    assert_eq!(found.script_tools.len(), 1);
+    assert_eq!(found.script_tools[0].name, "search");
+    assert_eq!(found.resident.len(), 1, "the executable resident surfaces");
+
+    // by declared tool name: the script tool is gone, the resident stays
+    let found = discover_in(std::slice::from_ref(&dir), &["search".to_string()], 120).unwrap();
+    assert!(found.script_tools.is_empty(), "declared name disables");
+    assert_eq!(found.resident.len(), 1);
+
+    // by file stem: the script tool is gone too (the old spelling)
+    let found = discover_in(std::slice::from_ref(&dir), &["helper".to_string()], 120).unwrap();
+    assert!(found.script_tools.is_empty(), "stem still disables");
+    assert_eq!(found.resident.len(), 1);
+
+    // and the resident still falls to its own stem
+    let found = discover_in(std::slice::from_ref(&dir), &["other".to_string()], 120).unwrap();
+    assert_eq!(found.script_tools.len(), 1);
+    assert!(found.resident.is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Discovery shadowing is by stem, project over user — but only a real
+/// extension entry (a manifest script tool or an executable resident)
+/// claims the stem. An inert file in a higher-priority home must not
+/// shadow a real extension of the same stem below it.
+#[test]
+fn an_inert_file_does_not_shadow_a_lower_extension() {
+    let project = crate::core::testutil::scratch_dir("ext-shadow-proj");
+    let user = crate::core::testutil::scratch_dir("ext-shadow-user");
+    // project: a plain text file named `search` — no manifest, and not an
+    // executable (unix needs the exec bit; Windows a recognized extension)
+    std::fs::write(project.join("search"), "not an extension\n").unwrap();
+    // user: a real resident with the same stem
+    #[cfg(unix)]
+    let user_ext = user.join("search");
+    #[cfg(windows)]
+    let user_ext = user.join("search.bat");
+    std::fs::write(&user_ext, b"#!/bin/sh\n:").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&user_ext, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let found = discover_in(&[project.clone(), user.clone()], &[], 120).unwrap();
+    assert_eq!(
+        found.resident.len(),
+        1,
+        "the user copy must surface: the inert project file is not an extension"
+    );
+    assert_eq!(found.resident[0], user_ext);
+    let _ = std::fs::remove_dir_all(&project);
+    let _ = std::fs::remove_dir_all(&user);
+}
+
+#[test]
+fn discovery_skips_missing_homes_but_reports_unreadable_entries() {
+    let dir = crate::core::testutil::scratch_dir("ext-homes");
+    let missing = dir.join("absent");
+    assert!(
+        discover_in(&[missing], &[], 120)
+            .unwrap()
+            .resident
+            .is_empty()
+    );
+    let not_directory = dir.join("file");
+    std::fs::write(&not_directory, "not a directory").unwrap();
+    let error = discover_in(std::slice::from_ref(&not_directory), &[], 120)
+        .err()
+        .unwrap();
+    assert!(
+        error.contains(&not_directory.display().to_string()),
+        "{error}"
+    );
+    let invalid = dir.join("broken.py");
+    std::fs::write(&invalid,
+        "# --- yak-tool: broken\n# arg-mode: argv\n# args: a (string) first\n# args: b (string) second\n")
+        .unwrap();
+    let error = discover_in(std::slice::from_ref(&dir), &[], 120)
+        .err()
+        .unwrap();
+    assert!(error.contains("argv mode requires exactly one"), "{error}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn plain_scripts_have_no_manifest() {
+    assert!(parse_tool_manifest("#!/bin/sh\necho hi\n", Path::new("/x/s"), 120).is_none());
+}
+
+#[test]
+fn manifest_tier_defaults_to_exec_and_parses_declarations() {
+    let base = "#!/bin/sh\n# --- yak-tool: t\n";
+    let plain = parse_tool_manifest(base, Path::new("/x/t"), 120).expect("manifest");
+    assert_eq!(plain.tier, Tier::Exec, "absent tier stays exec");
+    let read = parse_tool_manifest(&format!("{base}# tier: read\n"), Path::new("/x/t"), 120)
+        .expect("manifest");
+    assert_eq!(read.tier, Tier::Read);
+    let write = parse_tool_manifest(&format!("{base}# tier: Write\n"), Path::new("/x/t"), 120)
+        .expect("manifest");
+    assert_eq!(write.tier, Tier::Write, "case-insensitive");
+    let bogus = parse_tool_manifest(&format!("{base}# tier: whatever\n"), Path::new("/x/t"), 120)
+        .expect("manifest");
+    assert_eq!(
+        bogus.tier,
+        Tier::Exec,
+        "an unknown tier must not lower trust"
+    );
+}
+
+#[test]
+fn the_interrupt_notice_names_the_abandoned_call() {
+    let frame = interrupt_frame(41);
+    assert!(
+        frame.ends_with('\n'),
+        "frames are newline-terminated: {frame:?}"
+    );
+    let msg: Value = serde_json::from_str(frame.trim()).unwrap();
+    assert_eq!(msg["type"], "interrupt");
+    assert_eq!(msg["cancelled"], 41);
+    assert!(
+        msg["id"].is_u64(),
+        "the frame keeps the protocol shape: {msg}"
+    );
+}
+
+#[test]
+fn an_extension_may_ask_for_a_longer_call_budget() {
+    // no request: the host's config default rules
+    assert_eq!(parse_tool_timeout(&json!({})), None);
+    // zero, negative and non-numeric requests are ignored
+    assert_eq!(parse_tool_timeout(&json!({"tool_timeout": 0})), None);
+    assert_eq!(parse_tool_timeout(&json!({"tool_timeout": -5})), None);
+    assert_eq!(parse_tool_timeout(&json!({"tool_timeout": "900"})), None);
+    assert_eq!(
+        parse_tool_timeout(&json!({"tool_timeout": 900})),
+        Some(Duration::from_secs(900))
+    );
+    // ...and the ceiling holds, so a wedged call cannot park the turn
+    // for a day
+    assert_eq!(
+        parse_tool_timeout(&json!({"tool_timeout": 86400})),
+        Some(Duration::from_secs(3600))
+    );
+}
+
+#[test]
+fn initialize_tools_carry_their_declared_tier() {
+    let result = json!({"tools": [
+        {"name": "safe", "tier": "read", "parameters": {}},
+        {"name": "writer", "tier": "WRITE", "parameters": {}},
+        {"name": "shell", "tier": "exec", "parameters": {}},
+        {"name": "unlabeled", "parameters": {}},
+        {"name": "nonsense", "tier": "nope", "parameters": {}},
+    ]});
+    let tiers: Vec<Tier> = parse_tools(&result).iter().map(|t| t.tier).collect();
+    assert_eq!(
+        tiers,
+        vec![Tier::Read, Tier::Write, Tier::Exec, Tier::Exec, Tier::Exec]
+    );
+}
+
+#[test]
+fn colliding_tool_names_are_namespaced_not_shadowed() {
+    let mut taken: std::collections::HashSet<String> = ["read".to_string()].into_iter().collect();
+    // a built-in already holds the plain name: the extension keeps its
+    // own identity via the owner prefix
+    assert_eq!(
+        unique_tool_name("read", "websearch", &mut taken),
+        "websearch__read"
+    );
+    // a second extension with the same tool gets its own prefix too
+    assert_eq!(unique_tool_name("read", "todo", &mut taken), "todo__read");
+    // an unprefixed name is untouched
+    assert_eq!(
+        unique_tool_name("deploy", "websearch", &mut taken),
+        "deploy"
+    );
+    // ...and is then itself reserved
+    assert_eq!(
+        unique_tool_name("deploy", "todo", &mut taken),
+        "todo__deploy"
+    );
+}
+
+/// A resident extension that dies between calls must come back on the
+/// next use. The script exits right after the first `call_tool`, so the
+/// second call exercises the respawn path end to end via real stdio.
+#[cfg(unix)]
+#[test]
+fn a_dead_extension_is_respawned_on_next_use() {
+    let dir = crate::core::testutil::scratch_dir("ext-respawn");
+    let script = dir.join("flaky");
+    let counter = dir.join("count");
+    // plain shell: reply to initialize, answer the first call_tool then
+    // exit (simulating a crash), answering further calls needs a respawn
+    let body = format!(
+        r#"#!/bin/sh
+c=$(cat {counter} 2>/dev/null || echo 0)
+c=$((c+1))
+echo $c > {counter}
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *initialize*)
+      printf '{{"id":%s,"result":{{"tools":[{{"name":"ping","parameters":{{}}}}]}}}}\n' "$id"
+      ;;
+    *call_tool*)
+      printf '{{"id":%s,"result":"alive"}}\n' "$id"
+      if [ "$c" -le 1 ]; then exit 1; fi
+      ;;
+  esac
+done
+"#,
+        counter = counter.display()
+    );
+    std::fs::write(&script, body).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let ext = connect_stub(&script);
+    assert!(
+        crate::core::sync::lock(&ext.state).is_ok(),
+        "initial handshake must succeed; state says {:?}",
+        crate::core::sync::lock(&ext.state).as_ref().err()
+    );
+    assert_eq!(
+        ext.call_tool("ping", &json!({}), None, &mut |_| {})
+            .unwrap(),
+        "alive"
+    );
+    // the child exited after answering: the next call must respawn it
+    let out = ext.call_tool("ping", &json!({}), None, &mut |_| {});
+    assert_eq!(out.unwrap(), "alive", "respawned, not an error");
+    let n: u32 = std::fs::read_to_string(&counter)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(n >= 2, "the script must have run twice, saw {n}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// stderr written while a call is in flight is live progress: the tool
+/// log sees it, the model-facing result does not.
+#[cfg(unix)]
+#[test]
+fn a_working_extension_streams_stderr_to_the_tool_log() {
+    let dir = crate::core::testutil::scratch_dir("ext-progress");
+    let script = dir.join("chatty");
+    let body = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *initialize*)
+      printf '{"id":%s,"result":{"tools":[{"name":"ping","parameters":{}}]}}\n' "$id"
+      ;;
+    *call_tool*)
+      echo "step one" >&2
+      echo "step two" >&2
+      sleep 0.3
+      printf '{"id":%s,"result":"done"}\n' "$id"
+      ;;
+  esac
+done
+"#;
+    std::fs::write(&script, body).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let ext = connect_stub(&script);
+    assert!(
+        crate::core::sync::lock(&ext.state).is_ok(),
+        "initial handshake must succeed; state says {:?}",
+        crate::core::sync::lock(&ext.state).as_ref().err()
+    );
+    let mut log: Vec<String> = Vec::new();
+    let out = ext
+        .call_tool("ping", &json!({}), None, &mut |p| {
+            if let super::super::tools::ToolProgress::Line(l) = p {
+                log.push(l)
+            }
+        })
+        .unwrap();
+    assert_eq!(out, "done", "stderr is progress, never part of the result");
+    assert!(
+        log.iter().any(|l| l.contains("step one")) && log.iter().any(|l| l.contains("step two")),
+        "stderr written during the call must reach the tool log: {log:?}"
+    );
+    // and the diagnostics tail still carries them for /status
+    assert!(
+        crate::core::sync::lock(&ext.tail)
+            .iter()
+            .any(|l| l.contains("step two")),
+        "the tail must keep stderr too: {:?}",
+        *crate::core::sync::lock(&ext.tail)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Id-less `{"type":"lane",..}` frames stream as `Lane` progress (rows the
+/// view rewrites in place), never land in the diagnostics tail, and a lane
+/// frame after a call's reply does not leak into the next call.
+#[cfg(unix)]
+#[test]
+fn lane_frames_arrive_as_lane_progress_not_tail_noise() {
+    let dir = crate::core::testutil::scratch_dir("ext-lane");
+    let script = dir.join("laner");
+    let body = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *initialize*)
+      printf '{"id":%s,"result":{"tools":[{"name":"ping","parameters":{}}]}}\n' "$id"
+      ;;
+    *call_tool*)
+      printf '{"type":"lane","lane":"1/2 coder","text":"bash: cargo test"}\n'
+      printf '{"type":"lane","lane":"1/2 coder","text":"done: 3 tool calls"}\n'
+      printf '{"type":"lane","text":"missing the lane name"}\n'
+      printf '{"type":"noise"}\n'
+      sleep 0.3
+      printf '{"id":%s,"result":"done"}\n' "$id"
+      ;;
+  esac
+done
+"#;
+    std::fs::write(&script, body).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let ext = connect_stub(&script);
+    assert!(crate::core::sync::lock(&ext.state).is_ok(), "handshake");
+    let mut lanes = Vec::new();
+    let out = ext
+        .call_tool("ping", &json!({}), None, &mut |p| {
+            if let super::super::tools::ToolProgress::Lane { lane, text } = p {
+                lanes.push((lane, text));
+            }
+        })
+        .unwrap();
+    assert_eq!(out, "done", "lanes are progress, never the result");
+    assert_eq!(
+        lanes,
+        vec![
+            ("1/2 coder".to_string(), "bash: cargo test".to_string()),
+            ("1/2 coder".to_string(), "done: 3 tool calls".to_string()),
+        ],
+        "both updates arrive in order"
+    );
+    let tail = crate::core::sync::lock(&ext.tail);
+    assert!(
+        tail.iter().any(|l| l.contains("missing the lane name"))
+            && tail.iter().any(|l| l.contains("noise")),
+        "malformed lane frames and other id-less frames stay diagnostics: {tail:?}"
+    );
+    assert!(
+        !tail.iter().any(|l| l.contains("cargo test")),
+        "a well-formed lane never lands in the tail: {tail:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A line that is not valid UTF-8 is decoded lossily, not treated as the
+/// end of the stream: an extension under a legacy codepage still answers
+/// and still reports progress.
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_line_does_not_end_the_stream() {
+    let dir = crate::core::testutil::scratch_dir("ext-lossy");
+    let script = dir.join("codepage");
+    let body = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *initialize*)
+      printf '{"id":%s,"result":{"tools":[{"name":"ping","parameters":{}}]}}\n' "$id"
+      ;;
+    *call_tool*)
+      printf '\377\376 cp1252 bytes\n' >&2
+      echo "still here" >&2
+      printf 'garbage \377\376 line\n'
+      sleep 0.2
+      printf '{"id":%s,"result":"done"}\n' "$id"
+      ;;
+  esac
+done
+"#;
+    std::fs::write(&script, body).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let ext = connect_stub(&script);
+    let mut log: Vec<String> = Vec::new();
+    let out = ext.call_tool("ping", &json!({}), None, &mut |p| {
+        if let super::super::tools::ToolProgress::Line(l) = p {
+            log.push(l)
+        }
+    });
+    assert_eq!(
+        out.unwrap(),
+        "done",
+        "the reply after the garbled stdout line must still arrive"
+    );
+    assert!(
+        log.iter().any(|l| l.contains("still here")),
+        "stderr must keep flowing after an invalid byte: {log:?}"
+    );
+    assert!(
+        log.iter().any(|l| l.contains("cp1252")),
+        "the invalid line is kept, decoded lossily: {log:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Write an executable `sh` stub into a fresh temp dir and return its
+/// path. Discovery is bypassed on purpose: the test connects the script
+/// directly, so it never reads the real `~/.yak` (which would make the
+/// test non-hermetic). Plain `sh` like the respawn test above — a python
+/// stub would start far heavier under a fully parallel test run.
+#[cfg(unix)]
+fn write_stub_extension(name: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = crate::core::testutil::scratch_dir("ext-test");
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// A ready one-extension host whose resident answers every `compact` event
+/// with the given summary (plus a verdict line the agent test asserts on).
+#[cfg(unix)]
+pub(crate) fn compact_stub_host(summary: &str) -> Extensions {
+    // serde writes the escaped JSON string form, so any summary rides one
+    // protocol line regardless of newlines or quotes
+    // indent 0 still breaks lines between keys; the protocol is line-delimited
+    // and a literal newline inside a string is already the two-char \n escape,
+    // so flattening is just the pretty newlines going away
+    let compact_reply =
+        crate::jsonfmt::dumps_indent(&json!({"decision": "compact", "summary": summary}), 0)
+            .replace('\n', "");
+    let body = format!(
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *initialize*) printf '{{"id":%s,"result":{{"events":["compact"]}}}}\n' "$id" ;;
+    *compact*) printf '{{"id":%s,"result":%s}}\n' "$id" '{}' ;;
+    *) printf '{{"id":%s,"result":null}}\n' "$id" ;;
+  esac
+done
+"#,
+        compact_reply,
+    );
+    Extensions {
+        exts: vec![connect_stub(&write_stub_extension("compactor", &body))],
+        script_tools: Vec::new(),
+    }
+}
+
+/// A resident extension that answers protocol lines: it advertises
+/// `tool_result` and rewrites any result containing ORIGINAL, answering
+/// `null` (observe only) otherwise.
+#[cfg(unix)]
+const REWRITER: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *initialize*) printf '{"id":%s,"result":{"events":["tool_result"]}}\n' "$id" ;;
+    *ORIGINAL*) printf '{"id":%s,"result":{"content":"REWRITTEN log"}}\n' "$id" ;;
+    *) printf '{"id":%s,"result":null}\n' "$id" ;;
+  esac
+done
+"#;
+
+/// Connect a stub that was just written. `exec` on a file some other
+/// thread's forked child still holds the inherited write fd for fails
+/// with ETXTBSY ("Text file busy") — a real hazard only because a fully
+/// parallel test run forks constantly. The retry fires on that message
+/// alone, so a genuinely broken stub fails exactly as it would without
+/// it; the reason still rides the assertion below.
+#[cfg(unix)]
+pub(crate) fn connect_stub(path: &Path) -> Arc<Ext> {
+    let mut ext = connect_one(path);
+    for _ in 0..20 {
+        let busy = matches!(crate::core::sync::lock(&ext.state).as_ref(), Err(e) if e.contains("Text file busy"));
+        if !busy {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        ext = connect_one(path);
+    }
+    ext
+}
+
+#[test]
+#[cfg(unix)]
+fn a_tool_result_subscriber_can_replace_the_result() {
+    let host = Extensions {
+        exts: vec![connect_stub(&write_stub_extension("rewriter", REWRITER))],
+        script_tools: Vec::new(),
+    };
+    assert!(
+        host.subscribes("tool_result"),
+        "handshake advertised it; state says {:?}",
+        crate::core::sync::lock(&host.exts[0].state).as_ref().err()
+    );
+    assert!(!host.subscribes("turn_end"), "only the advertised event");
+
+    let params = json!({
+        "tool": "bash", "summary": "s", "is_error": false, "content": "ORIGINAL log"
+    });
+    assert_eq!(
+        host.rewrite_tool_result(&params).as_deref(),
+        Some("REWRITTEN log"),
+        "a content reply replaces the model-visible result"
+    );
+    // observe-only: no content in the reply leaves the tool's result alone
+    let untouched = json!({"tool": "bash", "summary": "s", "is_error": false, "content": "plain"});
+    assert_eq!(host.rewrite_tool_result(&untouched), None);
+}
+
+#[test]
+#[cfg(unix)]
+fn a_dead_extension_cannot_swallow_a_tool_result() {
+    // exits the moment an event arrives: the request fails, and the
+    // failure must leave the result untouched (fail-open)
+    let crashes = "#!/bin/sh\nwhile IFS= read -r line; do\n  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p')\n  case \"$line\" in\n    *initialize*) printf '{\"id\":%s,\"result\":{\"events\":[\"tool_result\"]}}\\n' \"$id\" ;;\n    *event*) exit 1 ;;\n  esac\ndone\n";
+    let host = Extensions {
+        exts: vec![connect_stub(&write_stub_extension("crashy", crashes))],
+        script_tools: Vec::new(),
+    };
+    let params = json!({"tool": "bash", "summary": "s", "is_error": false, "content": "x"});
+    assert_eq!(
+        host.rewrite_tool_result(&params),
+        None,
+        "a crashed extension falls back to the tool's own result"
+    );
+}
+
+/// A `compact` subscriber answers with a decision and a summary: that reply
+/// becomes the host's replacement compaction. Without a summary the reply
+/// observes only; a dead extension leaves `None` (fail-open).
+#[test]
+#[cfg(unix)]
+fn a_compact_subscriber_can_replace_the_compaction() {
+    let compact_stub = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *initialize*) printf '{"id":%s,"result":{"events":["compact"]}}\n' "$id" ;;
+    *compact*) printf '{"id":%s,"result":{"decision":"compact","summary":"replacement summary","keep_recent_tokens":4000}}\n' "$id" ;;
+    *) printf '{"id":%s,"result":null}\n' "$id" ;;
+  esac
+done
+"#;
+    let host = Extensions {
+        exts: vec![connect_stub(&write_stub_extension(
+            "compactor",
+            compact_stub,
+        ))],
+        script_tools: Vec::new(),
+    };
+    assert!(host.subscribes("compact"));
+    let params = json!({"reason": "trigger", "trigger_tokens": 64000, "keep_recent_tokens": 20000});
+    let (summary, keep) = host
+        .replace_compaction(&params)
+        .expect("a decision reply is the replacement");
+    assert_eq!(summary, "replacement summary");
+    assert_eq!(keep, Some(4000));
+
+    let observer = compact_stub.replace(
+        r#""decision":"compact","summary":"replacement summary","keep_recent_tokens":4000"#,
+        r#""note":"observed""#,
+    );
+    let host = Extensions {
+        exts: vec![connect_stub(&write_stub_extension("observer", &observer))],
+        script_tools: Vec::new(),
+    };
+    assert_eq!(host.replace_compaction(&params), None);
+}
+
+/// A compact subscriber that dies on the event falls open: the host returns
+/// no replacement and the built-in summarizer runs instead.
+#[test]
+#[cfg(unix)]
+fn a_dead_extension_cannot_swallow_a_compaction() {
+    let crashes = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *initialize*) printf '{"id":%s,"result":{"events":["compact"]}}\n' "$id" ;;
+    *compact*) exit 1 ;;
+  esac
+done
+"#;
+    let host = Extensions {
+        exts: vec![connect_stub(&write_stub_extension("crashy", crashes))],
+        script_tools: Vec::new(),
+    };
+    let params = json!({"reason": "trigger", "trigger_tokens": 64000, "keep_recent_tokens": 20000});
+    assert_eq!(
+        host.replace_compaction(&params),
+        None,
+        "a crashed extension falls back to the built-in compaction"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_failed_workspace_restore_blocks_the_tree_jump() {
+    let stub = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *initialize*) printf '{"id":%s,"result":{"events":["session_before_tree"]}}\n' "$id" ;;
+    *session_before_tree*) printf '{"id":%s,"error":"snapshot missing"}\n' "$id" ;;
+  esac
+done
+"#;
+    let host = Extensions {
+        exts: vec![connect_stub(&write_stub_extension(
+            "missing_snapshot",
+            stub,
+        ))],
+        script_tools: Vec::new(),
+    };
+    let error = host.before_tree(&json!({"dropped_turns": 1})).unwrap_err();
+    assert!(error.contains("snapshot missing"), "{error}");
+}
+
+/// A `session_before_tree` subscriber receives the turn ids about to be cut
+/// and answers null; the reply is fire-and-forget, so the host just moves on.
+#[test]
+#[cfg(unix)]
+fn session_before_tree_reaches_a_subscriber_with_the_dropped_turns() {
+    // the stub appends every event name + params it receives to a scratch
+    // file, so the test asserts on what actually crossed the wire
+    let sink = crate::core::testutil::scratch_path("ext-tree-sink");
+    let observer = format!(
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *initialize*) printf '{{"id":%s,"result":{{"events":["session_before_tree"]}}}}\n' "$id" ;;
+    *session_before_tree*) printf '%s\n' "$line" >> "{}" ;;
+    *) printf '{{"id":%s,"result":null}}\n' "$id" ;;
+  esac
+done
+"#,
+        sink.display(),
+    );
+    let host = Extensions {
+        exts: vec![connect_stub(&write_stub_extension(
+            "tree_observer",
+            &observer,
+        ))],
+        script_tools: Vec::new(),
+    };
+    assert!(host.subscribes("session_before_tree"));
+
+    host.fire(
+        "session_before_tree",
+        &json!({"thread": "t1", "kept_turns": 2, "dropped_turns": 1, "dropped_ids": ["t3"]}),
+    );
+    let seen = std::fs::read_to_string(&sink).unwrap_or_default();
+    assert!(
+        seen.contains("session_before_tree") && seen.contains("\"dropped_ids\":[\"t3\"]"),
+        "the stub should have recorded the event; got: {seen:?}"
+    );
+}
+
+/// The model's tool_call_id rides the `call_tool` frame: a stateful
+/// extension keys per-call state on it, which the concurrent read-only
+/// batch makes necessary. The id is echoed back as the result here.
+#[cfg(unix)]
+#[test]
+/// An extension result past the caps is cut like any tool output, and the
+/// cut is marked: the model must be able to tell a complete answer from a
+/// truncated one (a silent cap reads as a short answer).
+fn an_oversized_extension_result_is_cut_and_marked() {
+    let body = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *initialize*)
+      printf '{"id":%s,"result":{"tools":[{"name":"ping","parameters":{}}]}}\n' "$id"
+      ;;
+    *call_tool*)
+      printf '{"id":%s,"result":"' "$id"
+      # well past both the byte cap and the token cap
+      seq 1 200000 | sed 's/.*/x/' | tr -d '\n'
+      printf '"}\n'
+      ;;
+  esac
+done
+"#;
+    let ext = connect_stub(&write_stub_extension("flood", body));
+    let tool = ExtTool {
+        ext,
+        tool_name: "ping".into(),
+        exposed: "ping".into(),
+        description: String::new(),
+        schema: json!({"type": "object", "properties": {}}),
+        tier: Tier::Exec,
+    };
+    let out = tool.execute(&json!({}), Path::new("."), &mut |_| {});
+    assert!(!out.is_error());
+    assert!(out.content.len() < MAX_BYTES * 2, "cut to the cap");
+    assert!(
+        out.content
+            .contains("[output truncated to fit the context window]"),
+        "the cut is marked"
+    );
+}
+
+/// A result under the byte cap can still overrun the line cap: the shared
+/// caps apply whatever the raw size says, and the cut is marked.
+#[cfg(unix)]
+#[test]
+fn a_line_heavy_extension_result_is_cut_under_the_byte_cap() {
+    let body = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *initialize*)
+      printf '{"id":%s,"result":{"tools":[{"name":"ping","parameters":{}}]}}\n' "$id"
+      ;;
+    *call_tool*)
+      printf '{"id":%s,"result":"' "$id"
+      # 2500 short lines: ~5 KB raw, under the byte cap, over the line cap
+      i=0
+      while [ "$i" -lt 2500 ]; do
+        printf 'x\\n'
+        i=$((i+1))
+      done
+      printf '"}\n'
+      ;;
+  esac
+done
+"#;
+    let ext = connect_stub(&write_stub_extension("lines", body));
+    let tool = ExtTool {
+        ext,
+        tool_name: "ping".into(),
+        exposed: "ping".into(),
+        description: String::new(),
+        schema: json!({"type": "object", "properties": {}}),
+        tier: Tier::Exec,
+    };
+    let out = tool.execute(&json!({}), Path::new("."), &mut |_| {});
+    assert!(!out.is_error());
+    assert!(
+        out.content
+            .contains("[output truncated to fit the context window]"),
+        "the cut is marked: {}",
+        out.content
+    );
+    assert!(
+        out.content.lines().count() < 2500,
+        "the line cap must cut a result the byte cap alone would keep"
+    );
+}
+
+/// The model's tool_call_id rides the `call_tool` frame: a stateful
+/// extension keys per-call state on it, which the concurrent read-only
+/// batch makes necessary. The id is echoed back as the result here.
+#[cfg(unix)]
+#[test]
+fn a_tool_call_carries_the_models_call_id() {
+    let body = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *initialize*)
+      printf '{"id":%s,"result":{"tools":[{"name":"ping","parameters":{}}]}}\n' "$id"
+      ;;
+    *call_tool*)
+      cid=$(printf '%s' "$line" | sed -n 's/.*"tool_call_id":"\([^"]*\)".*/\1/p')
+      printf '{"id":%s,"result":"cid=%s"}\n' "$id" "$cid"
+      ;;
+  esac
+done
+"#;
+    let ext = connect_stub(&write_stub_extension("callid", body));
+    assert!(
+        crate::core::sync::lock(&ext.state).is_ok(),
+        "handshake must succeed"
+    );
+    let tool = ExtTool {
+        ext,
+        tool_name: "ping".into(),
+        exposed: "ping".into(),
+        description: String::new(),
+        schema: json!({"type": "object", "properties": {}}),
+        tier: Tier::Exec,
+    };
+    let out = tool.execute_call(
+        &crate::providers::ToolCall {
+            id: "call_7f3".into(),
+            name: "ping".into(),
+            arguments: json!({}),
+        },
+        Path::new("."),
+        &mut |_| {},
+    );
+    assert!(!out.is_error(), "{}", out.content);
+    assert_eq!(out.content, "cid=call_7f3");
+}
+
+/// A reply carrying neither `result` nor `error` broke the protocol — the
+/// strict reply contract says so instead of handing back an empty success
+/// the caller cannot distinguish from a real empty result.
+#[test]
+#[cfg(unix)]
+fn a_reply_without_a_result_is_an_error() {
+    // answers every request with a bare {"ok": true}: no result, no error
+    let mute = "#!/bin/sh\nwhile IFS= read -r line; do\n  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p')\n  case \"$line\" in\n    *initialize*) printf '{\"id\":%s,\"result\":{\"tools\":[{\"name\":\"ping\",\"parameters\":{}}]}}\n' \"$id\" ;;\n    *) printf '{\"id\":%s,\"ok\":true}\n' \"$id\" ;;\n  esac\ndone\n";
+    let ext = connect_stub(&write_stub_extension("mute", mute));
+    assert!(crate::core::sync::lock(&ext.state).is_ok());
+    let err = ext
+        .call_tool("ping", &json!({}), None, &mut |_| {})
+        .expect_err("a reply without result must fail");
+    assert!(err.contains("replied without a result"), "{err}");
+    let err = ext
+        .run_command("web", "query")
+        .expect_err("same contract on run_command");
+    assert!(err.contains("replied without a result"), "{err}");
+}
+
+/// An initialize reply may contribute a system-prompt section and a skill
+/// list: the host hands both to the agent surfaces (the system prompt embeds
+/// the section, the REPL lists the skills).
+#[test]
+#[cfg(unix)]
+fn initialize_reply_contributes_a_system_section_and_skills() {
+    let dir = crate::core::testutil::scratch_dir("ext-contrib");
+    let py = "#!/usr/bin/env python3\nimport json, sys\nfor line in sys.stdin:\n  msg = json.loads(line)\n  if msg.get('type') == 'initialize':\n    print(json.dumps({\n      'id': msg['id'], 'result': {\n        'commands': ['run'],\n        'system': 'some section',\n        'skills': [\n          {'name': 'pdf', 'description': 'extract tables',\n           'model_invocation': False},\n          {'name': 'gitflow', 'description': 'release flow'},\n          {'description': 'no name: dropped'},\n        ],\n      },\n    }), flush=True)\n".to_string();
+    let path = write_stub_extension("contrib", &py);
+    let ext = connect_stub(&path);
+    assert!(crate::core::sync::lock(&ext.state).is_ok());
+    assert_eq!(ext.system_section(), Some("some section".to_string()));
+    let skills = ext.skills();
+    assert_eq!(skills.len(), 2);
+    assert_eq!(skills[0].name, "pdf");
+    assert!(!skills[0].model_invocation);
+    assert_eq!(skills[1].name, "gitflow");
+    assert!(skills[1].model_invocation);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `Ext::system_section` and `Ext::skills` expose one connection's own
+/// contribution (the `Extensions` aggregators compose them).
+#[test]
+#[cfg(unix)]
+fn one_extension_exposes_its_own_section_and_skills() {
+    let dir = crate::core::testutil::scratch_dir("ext-one");
+    let py = "#!/usr/bin/env python3\nimport json, sys\nfor line in sys.stdin:\n  msg = json.loads(line)\n  if msg.get('type') == 'initialize':\n    print(json.dumps({'id': msg['id'], 'result': {\n      'system': 'sec', 'skills': [{'name': 'a', 'description': 'd'}]}}), flush=True)\n";
+    let path = write_stub_extension("one", py);
+    let ext = connect_stub(&path);
+    assert_eq!(ext.system_section(), Some("sec".to_string()));
+    assert_eq!(ext.skills().len(), 1);
+    assert_eq!(ext.skills()[0].name, "a");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// argv mode must pick the value of the *declared* argument, not whatever
+/// key the model happened to put first or an extra key it invented: the
+/// script receives exactly what its manifest asked for.
+#[test]
+fn argv_mode_picks_the_declared_argument_by_name() {
+    let text = "# --- yak-tool: shout\n# description: shout a word\n# args: word (string) the word\n# arg-mode: argv\nimport sys\nprint(sys.argv[1])\n";
+    let spec = parse_tool_manifest(text, Path::new("/x/shout"), 120).expect("manifest");
+    let tool = ScriptTool {
+        spec,
+        description: String::new(),
+        exposed: "shout".to_string(),
+    };
+    // model sent the keys out of order and added one the manifest never
+    // declared: only `word` may ride argv[1]
+    let args = json!({"extra": "WRONG", "word": "RIGHT"});
+    let mut command = std::process::Command::new("printf");
+    command.arg("%s");
+    // mirror the execute() argv assembly without spawning the script
+    let value = tool
+        .spec
+        .schema
+        .pointer("/properties")
+        .and_then(Value::as_object)
+        .and_then(|props| props.keys().next())
+        .and_then(|name| args.get(name))
+        .map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => crate::jsonfmt::dumps_indent(other, 0),
+        })
+        .unwrap_or_default();
+    command.arg(value);
+    let out = command.output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "RIGHT");
+}
+
+#[test]
+fn segment_results_get_pi_segmented_separators() {
+    use super::format_segments;
+    use serde_json::json;
+    // one text: no header, the text alone
+    assert_eq!(format_segments(&[json!("only")]), "only");
+    // several texts: each headed N/M
+    assert_eq!(
+        format_segments(&[json!("one"), json!("two\nlines")]),
+        "==> text 1/2 <==\none\n==> text 2/2 <==\ntwo\nlines"
+    );
+    // console lines follow in one block
+    assert_eq!(
+        format_segments(&[json!("out"), json!({"text": "log", "console": true})]),
+        "out\n<console_output>\nlog\n</console_output>"
+    );
+    // console-only output: just the block
+    assert_eq!(
+        format_segments(&[
+            json!({"text": "a", "console": true}),
+            json!({"text": "b", "console": true})
+        ]),
+        "<console_output>\na\nb\n</console_output>"
+    );
+    // non-string text values serialize; non-segment items (numbers) are skipped
+    assert_eq!(
+        format_segments(&[json!({"text": 42}), json!("tail")]),
+        "==> text 1/2 <==\n42\n==> text 2/2 <==\ntail"
+    );
+    // nothing textual at all: falls back to pretty JSON of the list
+    let fell_back = format_segments(&[json!(1), json!(2)]);
+    assert!(
+        fell_back.contains("\"1\"") || fell_back.contains("1,"),
+        "{fell_back}"
+    );
+}
+
+#[test]
+fn an_empty_segment_list_is_pretty_json() {
+    use super::format_segments;
+    assert_eq!(format_segments(&[]), "[]");
+}
+
+// Rust script tools: the source compiles once into the content-hash cache
+// and the binary is what runs — these need a real rustc, so they skip on
+// machines without one rather than failing the suite.
+
+fn rustc_available() -> bool {
+    std::process::Command::new("rustc")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// A manifest-carrying Rust source: stdin JSON in, one line out.
+const RUST_SRC: &str = r#"// --- yak-tool: rshout
+// description: shout a word
+// args: word (string) the word
+fn main() {
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).ok();
+    let word = serde_hook(&line);
+    println!("{word}!");
+}
+fn serde_hook(line: &str) -> String {
+    // pull the value of "word" without a parser: find "word":"...". up to "
+    let key = "\"word\":\"";
+    if let Some(i) = line.find(key) {
+        let rest = &line[i + key.len()..];
+        if let Some(j) = rest.find('"') {
+            return rest[..j].to_string();
+        }
+    }
+    String::new()
+}
+"#;
+
+fn rust_tool_dir(tag: &str) -> std::path::PathBuf {
+    let dir = crate::core::testutil::scratch_dir(tag);
+    std::fs::write(dir.join("rshout.rs"), RUST_SRC).unwrap();
+    dir
+}
+
+fn mount_rust(dir: &Path) -> ScriptTool {
+    let spec = parse_tool_manifest(RUST_SRC, &dir.join("rshout.rs"), 120).expect("manifest");
+    ScriptTool {
+        spec,
+        description: String::new(),
+        exposed: "rshout".to_string(),
+    }
+}
+
+#[test]
+fn a_rust_source_compiles_runs_and_caches() {
+    if !rustc_available() {
+        return;
+    }
+    let dir = rust_tool_dir("rs-ext");
+    let tool = mount_rust(&dir);
+    let mut lines = Vec::new();
+    let out = tool.execute(&json!({"word": "hi"}), &dir, &mut |p| {
+        if let crate::agent::tools::ToolProgress::Line(l) = p {
+            lines.push(l);
+        }
+    });
+    let text = &out.content;
+    assert!(
+        text.contains("hi!"),
+        "expected the compiled tool's output, got: {text}"
+    );
+    // the cache holds exactly one published binary for this source —
+    // scoped by stem, so unrelated cached tools cannot fail this test
+    let cache_dir = crate::core::config::user_dir().join("tmp").join("rs-cache");
+    let entries: Vec<String> = std::fs::read_dir(&cache_dir)
+        .expect("cache dir")
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with("rshout-"))
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "one cache entry per source, got {entries:?}"
+    );
+}
+
+#[test]
+fn a_cache_hit_skips_the_compile() {
+    if !rustc_available() {
+        return;
+    }
+    let dir = rust_tool_dir("rs-ext-cache");
+    let tool = mount_rust(&dir);
+    let mut noop = |_p: crate::agent::tools::ToolProgress| {};
+    // first call compiles
+    tool.execute(&json!({"word": "a"}), &dir, &mut noop);
+    // second call must not log "compiling" — the cache hit runs silent
+    let mut lines = Vec::new();
+    let out = tool.execute(&json!({"word": "b"}), &dir, &mut |p| {
+        if let crate::agent::tools::ToolProgress::Line(l) = p {
+            lines.push(l);
+        }
+    });
+    let _ = out.content;
+    assert!(
+        !lines.iter().any(|l| l.contains("compiling")),
+        "second call reused the cache but logged: {lines:?}"
+    );
+}
+
+#[test]
+fn a_rust_source_error_names_the_tool_and_shows_rustc_diagnostics() {
+    if !rustc_available() {
+        return;
+    }
+    let dir = crate::core::testutil::scratch_dir("rs-ext-err");
+    let bad = RUST_SRC.replace("fn main() {", "fn main() { this is not rust");
+    std::fs::write(dir.join("rshout.rs"), &bad).unwrap();
+    let spec = parse_tool_manifest(&bad, &dir.join("rshout.rs"), 120).expect("manifest");
+    let tool = ScriptTool {
+        spec,
+        description: String::new(),
+        exposed: "rshout".to_string(),
+    };
+    let mut noop = |_p: crate::agent::tools::ToolProgress| {};
+    let out = tool.execute(&json!({"word": "x"}), &dir, &mut noop);
+    let text = &out.content;
+    assert!(
+        text.contains("rustc failed") && text.contains("rshout.rs"),
+        "compile failure must name the tool and carry diagnostics, got: {text}"
+    );
+}
+
+/// The listings lead with the newest plugin file, not the directory's
+/// arbitrary order: the banner row and `/status` read as "what landed
+/// lately", so a freshly added plugin is first, not buried at `+N more`.
+#[cfg(unix)]
+#[test]
+fn plugin_listings_lead_with_the_newest_file() {
+    fn spec_at(name: &str, age_secs: u64) -> ExecToolSpec {
+        let dir = crate::core::testutil::scratch_dir("ext-order");
+        let path = dir.join(format!("{name}.sh"));
+        std::fs::write(&path, "#!/bin/sh\necho ok\n").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        ExecToolSpec {
+            path,
+            name: name.to_string(),
+            description: String::new(),
+            schema: serde_json::json!({}),
+            arg_mode_argv: false,
+            interpreter: None,
+            timeout: 120,
+            tier: crate::agent::approval::Tier::Read,
+        }
+    }
+    let host = Extensions {
+        exts: vec![
+            failed("veteran", "never connected".to_string()),
+            failed("middling", "never connected".to_string()),
+        ],
+        script_tools: vec![spec_at("brand-new", 0), spec_at("older-tool", 3600)],
+    };
+    // newest mtime leads: the just-written tool first, then the hour-old
+    // one; the two path-less residents sink in registry order
+    assert_eq!(
+        host.plugin_names(),
+        vec![
+            "brand-new",
+            "older-tool",
+            "veteran (failed)",
+            "middling (failed)"
+        ]
+    );
+    let rows = host.rows();
+    assert_eq!(rows.len(), 2, "the script tools have no /status row");
+    // both residents failed their handshake: the reason column carries it
+    assert_eq!(rows[0].0, "veteran");
+    assert!(rows[0].4.contains("never connected"));
+}

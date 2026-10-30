@@ -1,0 +1,593 @@
+//! Cross-platform terminal, shell and desktop primitives.
+//!
+//! The public entry point is this module. Linux, macOS and Windows each
+//! provide a complete implementation behind the same surface; there is no
+//! platform fallback that silently weakens a feature.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod unix;
+#[cfg(target_os = "windows")]
+mod windows;
+
+/// The cooperative interrupt flag: SIGINT and ctrl+c handlers set it, the
+/// long-running loops poll it. Lives here so the SIGINT handlers in the
+/// platform leaves can set it without reaching up into `core::http`; core
+/// re-exports the same three functions so existing callers stay put.
+pub mod interrupt {
+    use super::AtomicBool;
+
+    static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+    pub fn request() {
+        INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn clear() {
+        INTERRUPTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn checked() -> bool {
+        INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn flag() -> &'static AtomicBool {
+        &INTERRUPTED
+    }
+}
+
+#[cfg(target_os = "linux")]
+use linux::configure_shell_command;
+#[cfg(target_os = "macos")]
+use macos::configure_shell_command;
+#[cfg(target_os = "windows")]
+use windows::configure_shell_command;
+
+#[cfg(target_os = "linux")]
+pub use linux::*;
+#[cfg(target_os = "macos")]
+pub use macos::*;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use unix::*;
+#[cfg(target_os = "windows")]
+pub use windows::*;
+
+/// Keep a resident extension and its child processes in a separate group so
+/// a timed-out call can stop the whole tree, not only the protocol parent.
+pub fn configure_extension_command(command: &mut Command) {
+    configure_shell_command(command);
+}
+
+/// Like run_shell, but complete stdout lines stream to the callback live.
+/// (Lives here because it has no platform content — each backend only picks
+/// the shell spec and process-group details.)
+pub fn run_shell_stream(
+    cmd: &str,
+    cwd: &Path,
+    timeout: u64,
+    interrupt: &AtomicBool,
+    on_stdout_line: &mut dyn FnMut(&str),
+) -> ShellOutcome {
+    let spec = shell_spec();
+    run_shell_prepared(&spec, cmd, cwd, None, timeout, interrupt, on_stdout_line)
+}
+
+/// Run a shell command interactively with inherited stdio.
+pub fn run_shell_interactive(cmd: &str, cwd: &Path) -> std::io::Result<std::process::ExitStatus> {
+    build_shell_command(&shell_spec(), cmd, cwd).status()
+}
+
+/// Open a URL in the user's browser, best-effort: the platform opener,
+/// detached, its output swallowed. A failure is not fatal — the caller
+/// prints the URL, so the user can always open it by hand.
+pub fn open_url(url: &str) {
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        "cmd"
+    } else {
+        "xdg-open"
+    };
+    let args: Vec<&str> = if cfg!(target_os = "windows") {
+        vec!["/C", "start", "", url]
+    } else {
+        vec![url]
+    };
+    let _ = std::process::Command::new(program)
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+compile_error!("yak supports Linux, macOS and Windows only");
+
+/// One raw byte from the terminal, or a poll timeout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawByte {
+    Key(u8),
+    Timeout,
+}
+
+impl RawByte {
+    /// The keystroke, if this read produced one.
+    pub fn key(self) -> Option<u8> {
+        match self {
+            RawByte::Key(b) => Some(b),
+            RawByte::Timeout => None,
+        }
+    }
+}
+
+/// What a clipboard image paste produced: the image itself (the caller sniffs
+/// it and writes it to a temp file) or the path of a copied image file — a
+/// file manager's copy carries a `text/uri-list`, not pixels.
+pub enum Clip {
+    Bytes(Vec<u8>),
+    File(PathBuf),
+}
+
+/// Terminal dimensions in cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TermSize {
+    pub cols: usize,
+    pub rows: usize,
+}
+
+/// The shell used for agent commands and REPL passthrough.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellSpec {
+    pub program: String,
+    pub prefix_args: Vec<String>,
+    pub powershell: bool,
+}
+
+impl ShellSpec {
+    pub fn platform_default() -> ShellSpec {
+        #[cfg(target_os = "windows")]
+        {
+            ShellSpec {
+                program: "powershell.exe".into(),
+                prefix_args: vec!["-NoProfile".into(), "-Command".into()],
+                powershell: true,
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            ShellSpec {
+                program: "sh".into(),
+                prefix_args: vec!["-c".into()],
+                powershell: false,
+            }
+        }
+    }
+
+    /// Parse `YAK_SHELL`.
+    ///
+    /// The basename decides the argument style; names that are not known shell
+    /// programs use the POSIX `-c` convention. This is an explicit user
+    /// override, so unknown programs are kept verbatim rather than replaced.
+    pub fn from_name(name: &str) -> ShellSpec {
+        let program = name.trim().to_string();
+        let base = std::path::Path::new(&program)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&program)
+            .to_ascii_lowercase();
+        match base.as_str() {
+            "cmd" | "cmd.exe" => ShellSpec {
+                program,
+                prefix_args: vec!["/C".into()],
+                powershell: false,
+            },
+            "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => ShellSpec {
+                program,
+                prefix_args: vec!["-NoProfile".into(), "-Command".into()],
+                powershell: true,
+            },
+            _ => ShellSpec {
+                program,
+                prefix_args: vec!["-c".into()],
+                powershell: false,
+            },
+        }
+    }
+}
+
+/// Raw result of a non-interactive shell command. `BashTool` maps this to the
+/// agent-visible `ToolOutput`; the platform layer never depends on `agent`.
+pub struct ShellOutcome {
+    pub code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub interrupted: bool,
+    pub timed_out: bool,
+}
+
+/// YAK_SHELL is a configuration knob, not a fallback: only an explicit value
+/// changes the shell, and it is honored identically on every platform.
+pub fn shell_spec() -> ShellSpec {
+    match std::env::var_os("YAK_SHELL") {
+        Some(v) => ShellSpec::from_name(&v.into_string().unwrap_or_default()),
+        None => ShellSpec::platform_default(),
+    }
+}
+
+/// Like run_shell, but complete stdout lines are handed to `on_stdout_line`
+/// live while the command runs (the agent streams long command output).
+fn run_shell_prepared(
+    spec: &ShellSpec,
+    cmd: &str,
+    cwd: &Path,
+    stdin_data: Option<&str>,
+    timeout: u64,
+    interrupt: &AtomicBool,
+    on_stdout_line: &mut dyn FnMut(&str),
+) -> ShellOutcome {
+    let mut command = build_shell_command(spec, cmd, cwd);
+    configure_shell_command(&mut command);
+    command
+        .stdin(if stdin_data.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    run_with_progress(command, stdin_data, timeout, interrupt, on_stdout_line)
+}
+
+pub(crate) fn build_shell_command(spec: &ShellSpec, cmd: &str, cwd: &Path) -> Command {
+    let mut command = Command::new(&spec.program);
+    command.args(&spec.prefix_args);
+    if spec.powershell {
+        // PowerShell only propagates a native command's exit code when it is
+        // the last statement. Appending the explicit exit makes nonzero codes
+        // visible to the agent error branch; `$LASTEXITCODE` is initially 0.
+        //
+        // The encoding line comes first: Windows PowerShell encodes its own
+        // output for the console it inherited (an OEM code page), and through
+        // our UTF-8 pipe a non-ASCII listing arrives as replacement
+        // characters. Setting it is the documented fix, and `-NoProfile`
+        // keeps a profile from putting it back.
+        let mut full = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;\n".to_string();
+        full.push_str(cmd);
+        if cmd.is_empty() {
+            full.push_str("exit $LASTEXITCODE");
+        } else {
+            // a newline, not a semicolon: a trailing `# comment` would
+            // swallow the `; exit ...` on the same physical line
+            full.push_str("\nexit $LASTEXITCODE");
+        }
+        command.arg(full);
+    } else {
+        command.arg(cmd);
+    }
+    command.current_dir(cwd);
+    command
+}
+
+/// Run a prepared command to completion: `stdin_data` (if any) is written
+/// once and stdin closed, complete stdout lines stream to the callback.
+/// Used by script tools, whose commands arrive pre-built rather than as a
+/// shell line. The caller supplies the interrupt flag to honor ctrl+c.
+pub(crate) fn run_with_progress(
+    mut child_command: Command,
+    stdin_data: Option<&str>,
+    timeout: u64,
+    interrupt: &AtomicBool,
+    on_stdout_line: &mut dyn FnMut(&str),
+) -> ShellOutcome {
+    let mut child = match child_command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return ShellOutcome {
+                code: -1,
+                stdout: Vec::new(),
+                stderr: format!("cannot spawn command: {e}").into_bytes(),
+                interrupted: false,
+                timed_out: false,
+            };
+        }
+    };
+
+    let mut pipes = Pipes::new(child.stdout.take(), child.stderr.take());
+    // write the payload only after the reader threads exist, so a child
+    // that answers before consuming stdin cannot deadlock on a full pipe
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        if let Some(data) = stdin_data {
+            let _ = stdin.write_all(data.as_bytes());
+            let _ = stdin.flush();
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(timeout);
+
+    let status = loop {
+        pipes.drain(on_stdout_line);
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                // 0 means no timeout (bash's default): only enforce the
+                // deadline when the caller asked for one
+                let timed_out = timeout > 0 && Instant::now() >= deadline;
+                if interrupt.load(Ordering::Relaxed) || timed_out {
+                    let interrupted = interrupt.load(Ordering::Relaxed);
+                    kill_process_tree(child.id());
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    pipes.finish_with_deadline(on_stdout_line, PIPE_EOF_GRACE, || {
+                        kill_process_tree(child.id())
+                    });
+                    let Pipes { stdout, stderr, .. } = pipes;
+                    return ShellOutcome {
+                        code: -1,
+                        stdout,
+                        stderr,
+                        interrupted,
+                        timed_out: !interrupted,
+                    };
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                kill_process_tree(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                pipes.finish_with_deadline(on_stdout_line, PIPE_EOF_GRACE, || {
+                    kill_process_tree(child.id())
+                });
+                let Pipes {
+                    stdout, mut stderr, ..
+                } = pipes;
+                stderr.extend_from_slice(format!("wait failed: {e}").as_bytes());
+                return ShellOutcome {
+                    code: -1,
+                    stdout,
+                    stderr,
+                    interrupted: false,
+                    timed_out: false,
+                };
+            }
+        }
+    };
+
+    // the child has exited, but a backgrounded grandchild can still hold
+    // the pipe open — bound the wait so the call cannot hang on it
+    pipes.finish_with_deadline(on_stdout_line, PIPE_EOF_GRACE, || {
+        kill_process_tree(child.id())
+    });
+    let Pipes { stdout, stderr, .. } = pipes;
+    ShellOutcome {
+        code: status.code().unwrap_or(-1),
+        stdout,
+        stderr,
+        interrupted: false,
+        timed_out: false,
+    }
+}
+
+/// Captured-output ceiling: buffers keep only the last `PIPE_TAIL_CAP` bytes.
+/// Every consumer truncates to the tail anyway, and an unbounded capture
+/// would let a chatty command eat all memory.
+const PIPE_TAIL_CAP: usize = 512 * 1024;
+
+/// How long to wait for pipe EOF after the child exited before killing its
+/// process group (a backgrounded grandchild still holds the write end).
+const PIPE_EOF_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The child's two output pipes: reader threads forward chunks through
+/// channels; the main loop drains them into buffers and hands complete
+/// stdout lines to the progress callback as they arrive.
+struct Pipes {
+    out_rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
+    err_rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    /// trailing partial stdout line, flushed when its newline arrives; kept
+    /// as bytes so a multibyte char split across pipe chunks stays intact
+    residue: Vec<u8>,
+}
+
+/// Keep at most the last `cap` bytes of `buf`.
+fn tail_cap(buf: &mut Vec<u8>, cap: usize) {
+    if buf.len() > cap {
+        let drop = buf.len() - cap;
+        buf.drain(..drop);
+    }
+}
+
+impl Pipes {
+    fn new(
+        stdout: Option<std::process::ChildStdout>,
+        stderr: Option<std::process::ChildStderr>,
+    ) -> Pipes {
+        use std::sync::mpsc;
+        let (out_tx, out_rx) = mpsc::channel();
+        let (err_tx, err_rx) = mpsc::channel();
+        let handles = vec![
+            stdout.map(|r| spawn_pipe_sender(r, out_tx)),
+            stderr.map(|r| spawn_pipe_sender(r, err_tx)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        Pipes {
+            out_rx: Some(out_rx),
+            err_rx: Some(err_rx),
+            handles,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            residue: Vec::new(),
+        }
+    }
+
+    fn drain(&mut self, on_stdout_line: &mut dyn FnMut(&str)) {
+        if let Some(rx) = &self.out_rx {
+            for chunk in rx.try_iter() {
+                tail_cap(&mut self.stdout, PIPE_TAIL_CAP);
+                self.stdout.extend_from_slice(&chunk);
+                self.residue.extend_from_slice(&chunk);
+                // a child flooding output without a newline must not grow the
+                // partial-line buffer without bound
+                tail_cap(&mut self.residue, PIPE_TAIL_CAP);
+                while let Some(nl) = self.residue.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = self.residue.drain(..=nl).collect();
+                    let text = String::from_utf8_lossy(&line);
+                    on_stdout_line(text.trim_end_matches(['\n', '\r']));
+                }
+            }
+        }
+        if let Some(rx) = &self.err_rx {
+            for chunk in rx.try_iter() {
+                tail_cap(&mut self.stderr, PIPE_TAIL_CAP);
+                self.stderr.extend_from_slice(&chunk);
+            }
+        }
+    }
+
+    /// Join the reader threads with a way out of a blocked join: after the
+    /// direct child has
+    /// exited, a grandchild that inherited the pipe (`cmd &`, daemonizing
+    /// installers) keeps its write end open, so the readers never see EOF and
+    /// a plain join hangs the whole call. Wait `grace` for a natural EOF,
+    /// then fire `kill` (the child's process group) to close the inherited
+    /// fds, then wait one more `grace`; a grandchild still holding the pipe
+    /// past that (it re-sessioned itself out of the group) is abandoned —
+    /// the call returns with what it collected instead of hanging.
+    fn finish_with_deadline(
+        &mut self,
+        on_stdout_line: &mut dyn FnMut(&str),
+        grace: std::time::Duration,
+        kill: impl FnOnce(),
+    ) {
+        let t0 = std::time::Instant::now();
+        let mut kill = Some(kill);
+        while !self.handles.iter().all(|h| h.is_finished()) {
+            self.drain(on_stdout_line);
+            let elapsed = t0.elapsed();
+            if elapsed >= grace
+                && let Some(k) = kill.take()
+            {
+                k();
+            }
+            if kill.is_none() && elapsed >= grace * 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // join what finished; abandoned handles detach when dropped
+        for h in self.handles.drain(..) {
+            if h.is_finished() {
+                let _ = h.join();
+            }
+        }
+        self.drain(on_stdout_line);
+        if !self.residue.is_empty() {
+            let text = String::from_utf8_lossy(&self.residue);
+            on_stdout_line(text.trim_end_matches(['\n', '\r']));
+            self.residue.clear();
+        }
+    }
+}
+
+/// Pipe reader thread: forwards each chunk through the channel; the channel
+/// closing (receiver dropped) ends the read early.
+fn spawn_pipe_sender<R: std::io::Read + Send + 'static>(
+    mut r: R,
+    tx: std::sync::mpsc::Sender<Vec<u8>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_spec_recognizes_builtin_names() {
+        assert_eq!(
+            ShellSpec::from_name("/usr/bin/bash"),
+            ShellSpec {
+                program: "/usr/bin/bash".into(),
+                prefix_args: vec!["-c".into()],
+                powershell: false,
+            }
+        );
+        assert_eq!(
+            ShellSpec::from_name("powershell.exe"),
+            ShellSpec {
+                program: "powershell.exe".into(),
+                prefix_args: vec!["-NoProfile".into(), "-Command".into()],
+                powershell: true,
+            }
+        );
+        assert_eq!(
+            ShellSpec::from_name("cmd"),
+            ShellSpec {
+                program: "cmd".into(),
+                prefix_args: vec!["/C".into()],
+                powershell: false,
+            }
+        );
+        assert_eq!(
+            ShellSpec::from_name("python3"),
+            ShellSpec {
+                program: "python3".into(),
+                prefix_args: vec!["-c".into()],
+                powershell: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_powershell_payload_forces_utf8_output_and_keeps_the_exit_last() {
+        let cmd = build_shell_command(&ShellSpec::from_name("pwsh"), "echo hi", Path::new("."));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args[0], "-NoProfile");
+        let payload = args.last().unwrap();
+        assert!(
+            payload.starts_with("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;"),
+            "{payload}"
+        );
+        assert!(
+            payload.ends_with("echo hi\nexit $LASTEXITCODE"),
+            "{payload}"
+        );
+    }
+
+    #[test]
+    fn a_posix_payload_is_passed_through_untouched() {
+        let cmd = build_shell_command(&ShellSpec::from_name("sh"), "echo hi", Path::new("."));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.last().unwrap(), "echo hi");
+    }
+}

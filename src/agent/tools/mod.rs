@@ -1,0 +1,621 @@
+//! Built-in agent tools: declaration schemas, argument validation, execution.
+//!
+//! This file is the registry and everything the tools share (the `Tool`
+//! trait, `ToolOutput`, schema validation, the truncation and process-output
+//! helpers); each tool's declaration, execution and private helpers live in
+//! its own child module, with the tests in `tests.rs`.
+
+use std::path::{Path, PathBuf};
+
+use serde_json::{Value, json};
+
+use super::approval::Tier;
+use crate::providers::ToolError;
+use bash::BashTool;
+use edit::EditTool;
+use read::ReadTool;
+use write::WriteTool;
+
+/// Shared truncation constants.
+pub(crate) const MAX_LINES: usize = 2000;
+pub(crate) const MAX_BYTES: usize = 50 * 1024;
+/// Token-estimate cap on one tool result, applied after the byte cut. The
+/// byte cap alone is not a bound on cost: 50KB of ASCII is ~12k tokens, but
+/// 50KB of Chinese is ~17k (see `compact::text_tokens`, which counts CJK at
+/// ~1 token/char), and that result is re-sent every subsequent round. The
+/// cut takes from the front so the tail — where a command's failure lands —
+/// survives.
+pub(crate) const MAX_TOKENS: u64 = 12_000;
+
+pub struct ToolOutput {
+    pub content: String,
+    /// the failure class, `None` on success
+    pub error: Option<ToolError>,
+    /// attachments (e.g. an image the read tool decoded) fed back to the
+    /// model as vision input on the next round
+    pub attachments: Vec<crate::providers::Attachment>,
+}
+
+impl ToolOutput {
+    pub fn ok(content: impl Into<String>) -> ToolOutput {
+        ToolOutput {
+            content: content.into(),
+            error: None,
+            attachments: Vec::new(),
+        }
+    }
+
+    /// The tool ran and reported failure.
+    pub fn err(content: impl Into<String>) -> ToolOutput {
+        ToolOutput::err_kind(ToolError::Failed, content)
+    }
+
+    /// A failure of a specific class: a refused call is not a broken tool.
+    pub fn err_kind(kind: ToolError, content: impl Into<String>) -> ToolOutput {
+        ToolOutput {
+            content: content.into(),
+            error: Some(kind),
+            attachments: Vec::new(),
+        }
+    }
+
+    pub fn is_error(&self) -> bool {
+        self.error.is_some()
+    }
+}
+
+/// Cap on previewed diff rows; the block folds beyond this.
+const DIFF_MAX_LINES: usize = 30;
+
+/// Print a diff block from `change_hunks` under a `$` action line: wrapped
+/// to the terminal: additions green, deletions red, hunk headers and
+/// context gray.
+pub(crate) fn print_diff_block(diff: &str) {
+    let width = crate::term::columns().max(20);
+    let p = crate::theme::err();
+    for line in diff.split('\n') {
+        let wrapped = crate::core::render_md::wrap_block(line, width, 2);
+        let styled = match line.chars().next() {
+            // the legacy chrome look: additions default, deletions gray,
+            // hunk headers and context dim
+            Some('+') => format!("  {wrapped}"),
+            Some('-') => format!("{}  {wrapped}{}", p.diff_del, p.reset),
+            _ => format!("{}  {wrapped}{}", p.diff_ctx, p.reset),
+        };
+        eprintln!("{styled}");
+    }
+}
+
+pub trait Tool: Send + Sync {
+    fn name(&self) -> &str;
+    fn tier(&self) -> Tier;
+    fn description(&self) -> &str;
+    /// JSON schema for the arguments object
+    fn parameters(&self) -> Value;
+    /// one-line human summary shown in the approval prompt
+    fn preview(&self, args: &Value) -> String;
+    /// Optional change preview (unified-diff style) printed under the `$`
+    /// action line before the approval prompt; file-mutating tools override.
+    fn diff(&self, _args: &Value, _cwd: &Path) -> Option<String> {
+        None
+    }
+    /// Salvage malformed argument shapes before validation, which the loop
+    /// runs ahead of the schema check: a tool may normalize what the model
+    /// sent. Must be idempotent.
+    fn prepare_arguments(&self, args: &Value) -> Value {
+        args.clone()
+    }
+    /// `log` receives live progress while the tool runs: plain output lines
+    /// (bash streams its stdout) or lane updates (an extension's parallel
+    /// progress rows); tools without progress simply ignore it
+    fn execute(&self, args: &Value, cwd: &Path, log: &mut dyn FnMut(ToolProgress)) -> ToolOutput;
+
+    /// Execute with the full call in hand. The default drops the call (a
+    /// tool's arguments are all it needs); extension tools override it so
+    /// their script sees the model's `tool_call_id` and can key state on it
+    /// across the concurrent read-only batch.
+    fn execute_call(
+        &self,
+        call: &crate::providers::ToolCall,
+        cwd: &Path,
+        log: &mut dyn FnMut(ToolProgress),
+    ) -> ToolOutput {
+        self.execute(&call.arguments, cwd, log)
+    }
+}
+
+/// What a running tool reports to the live view. `Line` is stream output
+/// (the classic bash stdout path); `Lane` is a named one-line status row an
+/// extension rewrites as its work moves (parallel subagents each own one).
+/// Neither ever enters the transcript — only the final `ToolOutput` does.
+pub enum ToolProgress {
+    Line(String),
+    Lane { lane: String, text: String },
+}
+
+impl ToolProgress {
+    /// The line form, for call sites that only stream text (platform
+    /// shell plumbing hands back plain lines).
+    pub fn line(text: impl Into<String>) -> ToolProgress {
+        ToolProgress::Line(text.into())
+    }
+}
+
+/// The built-in tool registry: the handwritten tools.
+pub fn builtin_tools() -> Vec<Box<dyn Tool>> {
+    vec![
+        Box::new(ReadTool),
+        Box::new(WriteTool),
+        Box::new(EditTool),
+        Box::new(BashTool),
+    ]
+}
+
+/// Validate tool arguments against the schema, coercing in place first
+/// (a `Value::Convert` + normalize step): numeric/boolean strings
+/// become their declared types, and `null` on an optional property is
+/// dropped — models routinely send `"offset": "50"` or null optional fields,
+/// and a wasted round over a type spelling is the worst outcome. Unknown
+/// properties pass through untouched; enough to bounce malformed calls back
+/// to the model.
+pub fn validate(schema: &Value, args: &mut Value) -> Result<(), String> {
+    let Some(obj) = args.as_object_mut() else {
+        return Err("arguments must be a JSON object".to_string());
+    };
+    let props = schema["properties"].as_object();
+    let required = schema["required"].as_array().cloned().unwrap_or_default();
+    if let Some(props) = props {
+        let keys: Vec<String> = obj.keys().cloned().collect();
+        for key in keys {
+            let Some(spec) = props.get(&key) else {
+                continue;
+            };
+            let is_required = required.iter().any(|r| r.as_str() == Some(key.as_str()));
+            let value = obj.get_mut(&key).expect("key from own keys");
+            if value.is_null() && !is_required {
+                obj.shift_remove(&key);
+                continue;
+            }
+            coerce_value(value, spec);
+        }
+    }
+    for name in &required {
+        let missing = name.as_str().map(|n| !obj.contains_key(n)).unwrap_or(true);
+        if missing {
+            return Err(format!(
+                "missing required argument '{}'",
+                name.as_str().unwrap_or("?")
+            ));
+        }
+    }
+    for (name, spec) in props.into_iter().flatten() {
+        if let (Some(value), Some(ty)) = (obj.get(name), spec["type"].as_str()) {
+            let ok = match ty {
+                "string" => value.is_string(),
+                "integer" => value.is_i64() || value.is_u64(),
+                "number" => value.is_number(),
+                "boolean" => value.is_boolean(),
+                "array" => value.is_array(),
+                "object" => value.is_object(),
+                _ => true,
+            };
+            if !ok {
+                return Err(format!("argument '{name}' must be of type {ty}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Coerce one value toward its schema type, recursing into arrays and
+/// objects. A value that cannot coerce is left alone — the type check below
+/// reports it with the argument name.
+fn coerce_value(value: &mut Value, spec: &Value) {
+    match spec["type"].as_str() {
+        Some("number") | Some("integer") => {
+            if let Some(text) = value.as_str()
+                && let Ok(n) = text.parse::<f64>()
+                && n.is_finite()
+            {
+                if spec["type"] == "integer" && n.fract() == 0.0 && n.abs() <= 9.0e15 {
+                    *value = json!(n as i64);
+                } else {
+                    *value = json!(n);
+                }
+            }
+        }
+        Some("boolean") => {
+            if let Some(text) = value.as_str() {
+                match text {
+                    "true" => *value = json!(true),
+                    "false" => *value = json!(false),
+                    _ => {}
+                }
+            }
+        }
+        Some("array") => {
+            if let (Some(items), Some(arr)) = (spec.get("items"), value.as_array_mut()) {
+                for item in arr {
+                    coerce_value(item, items);
+                }
+            }
+        }
+        Some("object") if spec.get("properties").is_some() => {
+            coerce_object(spec, value);
+        }
+        _ => {}
+    }
+}
+
+/// Coerce an object's declared properties in place (the recursion
+/// `coerce_value` and `validate` share).
+fn coerce_object(schema: &Value, args: &mut Value) {
+    let Some(props) = schema["properties"].as_object() else {
+        return;
+    };
+    let Some(obj) = args.as_object_mut() else {
+        return;
+    };
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    for key in obj.keys().cloned().collect::<Vec<_>>() {
+        let Some(spec) = props.get(&key) else {
+            continue;
+        };
+        let is_required = required.contains(&key.as_str());
+        let value = obj.get_mut(&key).expect("key from own keys");
+        if value.is_null() && !is_required {
+            obj.shift_remove(&key);
+            continue;
+        }
+        coerce_value(value, spec);
+    }
+}
+
+/// Keep the last `max_lines` lines / `max_bytes` bytes.
+/// The `$ <verb> <preview>` chrome line with its green preview, wrapped to
+/// the terminal, plus the optional diff block. Shared by the approval
+/// prompt and the session's ToolStart echo so the two render identically.
+pub(crate) fn print_action_line(verb: &str, preview: &str, diff: Option<&str>) {
+    let width = crate::term::columns().max(20);
+    let vis = 2 + verb.chars().count() + 1;
+    let wrapped = crate::core::render_md::wrap_plain(preview, width.saturating_sub(vis), 2);
+    // same shape as the tool activity line: bold $, the command in green
+    let p = crate::theme::err();
+    eprintln!(
+        "{}${} {verb} {}{}{}{}",
+        p.bold, p.reset, p.bold, p.green, wrapped, p.reset
+    );
+    if let Some(diff) = diff {
+        print_diff_block(diff);
+    }
+}
+
+/// Print one tool-output block to stderr: each line wrapped to the terminal
+/// at a 2-cell margin, painted in the chrome gray. The plain-`ToolEnd`
+/// summary and the live `ToolLog` head both print here, so a result looks the
+/// same whether it streamed as it ran or arrived in one piece.
+pub(crate) fn print_output_block(text: &str) {
+    let width = crate::term::columns().max(20);
+    let p = crate::theme::err();
+    for line in text.lines() {
+        let wrapped = crate::core::render_md::wrap_block(line, width, 2);
+        eprintln!("{}{wrapped}{}", p.gray, p.reset);
+    }
+}
+
+pub(crate) fn truncate_tail(
+    text: &str,
+    max_lines: usize,
+    max_bytes: usize,
+    max_tokens: u64,
+) -> (String, bool) {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = lines[lines.len().saturating_sub(max_lines)..].join("\n");
+    let mut truncated = lines.len() > max_lines;
+    // the byte cap counts the JSON-escaped form: the result rides the wire
+    // as a string value, where a newline costs 2 bytes and a control char
+    // 6, so a raw-size cap can ship nearly double the budget (the
+    // "count JSON overhead when truncating" fix). Shrink the raw budget
+    // until the escaped tail fits — one pass per factor-of-two of slack,
+    // bounded because every step cuts at least a byte of raw text.
+    let mut budget = max_bytes;
+    loop {
+        if out.len() > budget {
+            let start = crate::core::text::ceil_boundary(&out, out.len() - budget);
+            out = out[start..].to_string();
+            truncated = true;
+        }
+        if json_escaped_len(&out) <= max_bytes || budget == 0 {
+            break;
+        }
+        budget = (budget / 2).max(1).min(budget.saturating_sub(1));
+    }
+    // the byte cap is not a token cap: a CJK dump of the same size costs
+    // 3-4x more, so enforce the estimate too (binary search over char
+    // boundaries keeps this cheap and never splits a codepoint)
+    let tokens = crate::agent::compact::text_tokens;
+    if tokens(&out) > max_tokens {
+        let bounds: Vec<usize> = out.char_indices().map(|(i, _)| i).collect();
+        let (mut lo, mut hi) = (0usize, bounds.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if tokens(&out[bounds[mid]..]) <= max_tokens {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        if lo < bounds.len() && lo > 0 {
+            out = out[bounds[lo]..].to_string();
+            truncated = true;
+        }
+    }
+    (out, truncated)
+}
+
+/// Tail-truncate and mark, the shared ending for process-shaped tool output.
+pub(crate) fn truncate_marked(text: &str, max_lines: usize, max_bytes: usize) -> String {
+    let (mut out, truncated) = truncate_tail(text, max_lines, max_bytes, MAX_TOKENS);
+    if truncated {
+        out.push_str("\n[output truncated]\n");
+    }
+    out
+}
+
+/// Marked truncation with the caller's own token budget. Extension tools
+/// (MCP bridges included) route here: their results come from another
+/// process built with no opinion about this context window, so the host
+/// enforces the shared caps — and says so, because a silently cut answer
+/// reads as a complete one.
+pub(crate) fn truncate_marked_budgeted(
+    text: &str,
+    max_lines: usize,
+    max_bytes: usize,
+    max_tokens: u64,
+) -> String {
+    let (mut out, truncated) = truncate_tail(text, max_lines, max_bytes, max_tokens);
+    if truncated {
+        out.push_str("\n[output truncated to fit the context window]\n");
+    }
+    out
+}
+
+/// The length this text takes as a JSON string value (the wire form of a
+/// tool result): quotes and backslashes double, common control characters
+/// become two-byte `\\n`-style escapes, and the rest of C0/C1 becomes a
+/// six-byte `\\u00XX`. What the model is billed is the escaped form, so
+/// the truncation budgets are enforced against this, not the raw len.
+pub(crate) fn json_escaped_len(s: &str) -> usize {
+    let mut n = 2usize; // the surrounding quotes
+    for c in s.chars() {
+        n += match c {
+            '"' | '\\' => 2,
+            '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
+            c if (c as u32) < 0x20 => 6,
+            c => c.len_utf8(),
+        };
+    }
+    n
+}
+
+/// Merge captured process output into one stream: stderr rides under
+/// stdout, and ANSI escape sequences are stripped — escape bytes are tokens
+/// about terminal state, not the command's answer, so the merged result is
+/// model context first, and the live head renders through wrap paths that
+/// count them as zero cells, so a `--color=always` row would both cost
+/// tokens and mis-wrap. Shared by the bash tool's normal and timed-out
+/// endings.
+fn merge_process_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut out = crate::core::text::strip_ansi(&String::from_utf8_lossy(stdout));
+    let err_text = crate::core::text::strip_ansi(&String::from_utf8_lossy(stderr));
+    if !err_text.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&err_text);
+    }
+    out
+}
+
+/// Tail-truncate process output and, when anything was cut, spill the full
+/// text to the user tmp dir and name the file in the note (the shape:
+/// `[Showing lines X-Y of N. Full output: path]`). The model can read the
+/// rest on demand instead of re-running the command.
+pub(crate) fn truncate_with_spill(text: &str) -> String {
+    truncate_with_spill_in(&crate::core::config::user_dir().join("tmp"), text)
+}
+
+/// [`truncate_with_spill`] against an explicit scratch dir (the test seam).
+pub(crate) fn truncate_with_spill_in(dir: &Path, text: &str) -> String {
+    let (out, truncated) = truncate_tail(text, MAX_LINES, MAX_BYTES, MAX_TOKENS);
+    if !truncated {
+        return out;
+    }
+    match spill_full_output(dir, text) {
+        Some(path) => {
+            let total = text.lines().count();
+            let kept = out.lines().count().max(1);
+            let start = total.saturating_sub(kept) + 1;
+            let mut out = out;
+            out.push_str(&format!(
+                "\n\n[Showing lines {start}-{total} of {total}. Full output: {path}]"
+            ));
+            out
+        }
+        None => {
+            let mut out = out;
+            out.push_str("\n[output truncated]\n");
+            out
+        }
+    }
+}
+
+/// Save the full output of a truncated command to the scratch dir (the
+/// weekly sweep ages it out like every other scratch file there); the
+/// truncation note names the file, the spill. `None` when the write fails —
+/// the caller falls back to the plain truncation mark rather than losing the
+/// output twice.
+fn spill_full_output(dir: &Path, text: &str) -> Option<String> {
+    std::fs::create_dir_all(dir).ok()?;
+    let path = dir.join(format!("bash-{}.log", crate::core::db::ulid()));
+    std::fs::write(&path, text).ok()?;
+    Some(path.display().to_string())
+}
+
+/// Finish a spawned-command result: merge stderr under stdout, note the
+/// exit code, truncate and mark. Shared by the bash and script tools.
+pub(crate) fn finish_process_output(stdout: Vec<u8>, stderr: Vec<u8>, code: i32) -> ToolOutput {
+    let mut out = merge_process_output(&stdout, &stderr);
+    if code != 0 {
+        out.push_str(&format!("\nCommand exited with code {code}"));
+    }
+    let out = truncate_with_spill(&out);
+    if code == 0 {
+        ToolOutput::ok(out)
+    } else {
+        ToolOutput::err(out)
+    }
+}
+
+/// Truncate to 60 chars with the single ellipsis glyph (the plugin preview
+/// shape, now shared by script/MCP tool chrome).
+pub(crate) fn short(s: &str) -> String {
+    crate::core::text::truncate_chars(s, 60)
+}
+
+/// `{prefix} {args-as-json-truncated}` — the preview line for plugin tools.
+pub(crate) fn args_preview(prefix: &str, args: &Value) -> String {
+    format!(
+        "{prefix} {}",
+        short(&serde_json::to_string(args).unwrap_or_default())
+    )
+}
+
+/// `--tools` selection: a list of plain names and `*`
+/// patterns keeps the matching tools (replacing the default set); a list of
+/// only `+name`/`-name` entries instead edits the default set in order, and
+/// patterns are exact there. Mixing the two forms is an error, the same one
+/// reports, because the meaning of a plain name would depend on position.
+pub fn select_tools(available: &[String], wanted: &[String]) -> Result<Vec<String>, String> {
+    let is_modifier = |e: &str| e.starts_with('+') || e.starts_with('-');
+    let modifiers = wanted.iter().filter(|e| is_modifier(e)).count();
+    if modifiers > 0 {
+        if modifiers < wanted.len() {
+            return Err("tool names cannot be mixed with +name or -name entries".to_string());
+        }
+        if let Some(p) = wanted.iter().find(|e| e.contains('*')) {
+            return Err(format!(
+                "+name and -name entries take exact tool names, not patterns: {p}"
+            ));
+        }
+        // edit the full registry in order: +name adds what exists, -name
+        // removes what is there
+        let mut tools: Vec<String> = available.to_vec();
+        for entry in wanted {
+            let name = &entry[1..];
+            if let Some(pos) = tools.iter().position(|t| t == name) {
+                if entry.starts_with('-') {
+                    tools.remove(pos);
+                }
+            } else if entry.starts_with('+')
+                && !name.is_empty()
+                && available.iter().any(|a| a == name)
+            {
+                tools.push(name.to_string());
+            }
+        }
+        if tools.is_empty() {
+            return Err("--tools selected nothing".to_string());
+        }
+        return Ok(tools);
+    }
+    // plain names/patterns: an allowlist. Every entry must match something
+    // (a typo is louder than an empty toolbox); `*` matches any run of
+    // characters (a `*`-glob, no other metacharacters).
+    let unknown: Vec<&String> = wanted
+        .iter()
+        .filter(|w| !w.contains('*') && !available.iter().any(|a| a.as_str() == w.as_str()))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "unknown tool '{}' (available: {})",
+            unknown[0],
+            available.join(", ")
+        ));
+    }
+    let matched: Vec<String> = available
+        .iter()
+        .filter(|a| wanted.iter().any(|w| tool_pattern_match(w, a)))
+        .cloned()
+        .collect();
+    if matched.is_empty() {
+        return Err("--tools selected nothing".to_string());
+    }
+    Ok(matched)
+}
+
+/// One allowlist entry against one tool name: exact, or `*` runs (the
+/// `createToolNameMatcher`, without the regex — a two-cursor scan is enough
+/// for a leading/trailing/inner pattern).
+fn tool_pattern_match(pattern: &str, name: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == name;
+    }
+    let mut rest = name;
+    for (i, part) in pattern.split('*').enumerate() {
+        if i == 0 {
+            // a leading literal must prefix the name
+            if !rest.starts_with(part) {
+                return false;
+            }
+            rest = &rest[part.len()..];
+        } else if part.is_empty() {
+            continue;
+        } else {
+            let Some(pos) = rest.find(part) else {
+                return false;
+            };
+            rest = &rest[pos + part.len()..];
+        }
+    }
+    // a pattern with no trailing `*` must consume the whole name
+    pattern.ends_with('*') || rest.is_empty()
+}
+
+/// Display verb for the `$` chrome line: tool ids read as actions.
+pub fn display_verb(name: &str) -> &str {
+    match name {
+        "bash" => "run",
+        other => other,
+    }
+}
+
+/// Resolve a tool path argument against cwd with `~` expansion.
+pub(crate) fn resolve_path(cwd: &Path, arg: &str) -> PathBuf {
+    let expanded = if let Some(rest) = arg.strip_prefix("~/") {
+        let Some(home) = crate::core::paths::home_dir() else {
+            return PathBuf::from(arg);
+        };
+        return home.join(rest);
+    } else {
+        arg
+    };
+    let p = Path::new(expanded);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    }
+}
+
+mod bash;
+mod edit;
+mod jq;
+mod read;
+mod write;
+
+#[cfg(test)]
+mod tests;
