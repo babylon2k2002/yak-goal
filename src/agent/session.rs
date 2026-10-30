@@ -118,6 +118,41 @@ pub struct Session {
     pub bigctx_round: u64,
 }
 
+/// Project a history through the reversible-compression pipeline.
+///
+/// Free rather than a method because the two call sites sit inside methods
+/// where `&self.cwd`, `&self.system` and the update closure's `&mut self` are
+/// already live; a method would ask for a mutable borrow those hold.
+///
+/// Returns the view plus the state to store back. A session that has never
+/// compressed gets its history back unchanged and pays nothing — not one token
+/// estimate, not one ref assignment.
+pub fn bigctx_view(
+    seed: &[Msg],
+    state: Option<&crate::agent::bigctx::CompressionState>,
+    round: u64,
+    window: Option<u64>,
+) -> (Vec<Msg>, Option<crate::agent::bigctx::CompressionState>) {
+    let folded = state.is_some_and(|s| s.blocks.iter().any(|b| b.active));
+    if !folded || seed.is_empty() {
+        return (seed.to_vec(), state.cloned());
+    }
+
+    let scheme = crate::agent::bigctx::IdScheme {
+        round: round.max(1),
+        first_slot: 0,
+    };
+    let projection = crate::agent::bigctx::project(seed, scheme);
+    let config = crate::agent::bigctx::default_config(window.unwrap_or(200_000));
+    let current = state
+        .cloned()
+        .unwrap_or_else(crate::agent::bigctx::create_initial_state);
+
+    let turn = crate::agent::bigctx::process_turn(&projection.messages, &current, &config);
+    let view = crate::agent::bigctx::render(&turn.messages, &projection);
+    (view, Some(turn.state))
+}
+
 impl Session {
     /// A resumed thread can already be over the window. Project its
     /// oversized tool results down before the first request — the very cut
@@ -138,45 +173,6 @@ impl Session {
         if crate::agent::compact::should_compact(estimate, trigger) {
             crate::agent::compact::prune_tool_results(&mut self.seed);
         }
-    }
-
-    /// Project the seed through the reversible-compression pipeline.
-    ///
-    /// Returns the view the model should be sent, leaving `self.seed` as the
-    /// full history. A fold never destroys anything here: the blocks remember
-    /// which messages they cover, so a later turn can restore them.
-    ///
-    /// The projection is skipped entirely while no block exists. A session that
-    /// has never compressed pays nothing — not one token estimate, not one
-    /// ref assignment — because the view would be the history verbatim.
-    pub fn bigctx_view(&mut self) -> Vec<Msg> {
-        let folded = self
-            .bigctx
-            .as_ref()
-            .is_some_and(|state| state.blocks.iter().any(|b| b.active));
-        if !folded || self.seed.is_empty() {
-            return self.seed.clone();
-        }
-
-        let scheme = crate::agent::bigctx::IdScheme {
-            round: self.bigctx_round.max(1),
-            first_slot: 0,
-        };
-        let projection = crate::agent::bigctx::project(&self.seed, scheme);
-        let config = crate::agent::bigctx::default_config(
-            self.model
-                .as_ref()
-                .and_then(|m| m.context_window)
-                .unwrap_or(200_000),
-        );
-        let state = self
-            .bigctx
-            .clone()
-            .unwrap_or_else(crate::agent::bigctx::create_initial_state);
-
-        let turn = crate::agent::bigctx::process_turn(&projection.messages, &state, &config);
-        self.bigctx = Some(turn.state);
-        crate::agent::bigctx::render(&turn.messages, &projection)
     }
 
     /// How much of the carried history the previous request in this
@@ -357,7 +353,12 @@ impl Session {
         // Projected here, after `identity` has taken its shared borrows and
         // before the closures take `&mut self`: `bigctx_view` needs `&mut self`
         // (it advances the state), and a borrow held across it would conflict.
-        let mut view_seed = self.bigctx_view();
+        let (mut view_seed, bigctx_state) = bigctx_view(
+            &self.seed,
+            self.bigctx.as_ref(),
+            self.bigctx_round,
+            self.model.as_ref().and_then(|m| m.context_window),
+        );
         let mut on_update = |u: AgentUpdate| {
             match u {
                 AgentUpdate::Delta(text) => {
@@ -561,6 +562,9 @@ impl Session {
             // keystrokes have no meaning while the watcher runs, so stopping
             // it just hands the terminal back to the approval prompt
             watcher.stop();
+        // keep the compression state the pass produced: its block ids and refs
+        // are what let a later turn restore what this one folded
+        self.bigctx = bigctx_state;
             // silence the spinner and close the thinking trace so the
             // banner lands on a clean line
             view.borrow_mut().pause();
@@ -696,7 +700,12 @@ impl Session {
         // Projected here, after `identity` has taken its shared borrows and
         // before the closures take `&mut self`: `bigctx_view` needs `&mut self`
         // (it advances the state), and a borrow held across it would conflict.
-        let mut view_seed = self.bigctx_view();
+        let (mut view_seed, bigctx_state) = bigctx_view(
+            &self.seed,
+            self.bigctx.as_ref(),
+            self.bigctx_round,
+            self.model.as_ref().and_then(|m| m.context_window),
+        );
         let mut on_update = |u: AgentUpdate| match u {
             AgentUpdate::Compacting => {
                 view.borrow_mut().relabel("compacting context");
@@ -860,6 +869,8 @@ impl Session {
             },
         );
         crate::core::http::clear_interrupt();
+        // keep the compression state the pass produced (see the interactive path)
+        self.bigctx = bigctx_state;
         self.usage.add(total);
         self.last_usage = last_usage;
         match result {
