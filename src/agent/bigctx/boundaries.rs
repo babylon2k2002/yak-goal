@@ -247,6 +247,22 @@ fn resolve_anchor(
             });
         }
 
+        // No ancestor owns it — but a block may have compressed it DIRECTLY.
+        // Snapping there would turn a message-range retry into a duplicate
+        // same-tier block, so name the block and let the model cite it.
+        if let Some(owner) = direct_owner_block(state, &raw_id) {
+            return Err(BoundaryError {
+                kind: BoundaryErrorKind::Consumed,
+                endpoint,
+                message: format!(
+                    "{label}=\"{}\" is already compressed into block {owner} — cite that \
+                     block instead (e.g. startId=\"{owner}\", endId=\"{owner}\") to rewrite or \
+                     merge it, or run acp_status to see what is still compressible.",
+                    boundary.raw
+                ),
+            });
+        }
+
         return Err(BoundaryError {
             kind: BoundaryErrorKind::Consumed,
             endpoint,
@@ -327,6 +343,18 @@ fn active_owner_anchor(
         }
     }
     best
+}
+
+/// The active block that compressed `raw_id` directly, if any.
+fn direct_owner_block(state: &CompressionState, raw_id: &str) -> Option<String> {
+    let base = crate::agent::bigctx::types::base_id_of(raw_id);
+    active_blocks(state)
+        .find(|b| {
+            b.direct_message_ids
+                .iter()
+                .any(|id| crate::agent::bigctx::types::base_id_of(id) == base)
+        })
+        .map(|b| b.block_id.clone())
 }
 
 /// Content a block INHERITED by consuming other blocks: the union of its
@@ -498,10 +526,11 @@ mod tests {
     }
 
     #[test]
-    fn a_folded_message_snaps_to_its_block() {
+    fn a_directly_compressed_message_tells_the_model_to_cite_the_block() {
+        // Snapping here would turn a message-range retry into a duplicate
+        // same-tier block, so the resolver names the block instead.
         let mut state = state_with_refs(&["t1.1", "t1.2", "t1.3"]);
         state.blocks.push(block("b1", &["t1.2"]));
-        // t1.2 is gone from the view; its block's summary sits at index 1
         let msgs = vec![
             user("t1.1"),
             CoreMessage::new(
@@ -512,10 +541,39 @@ mod tests {
             .with_text("s"),
             user("t1.3"),
         ];
+        let err = resolve_boundaries("m00002", "m00003", &msgs, &state).unwrap_err();
+        assert_eq!(err.kind, BoundaryErrorKind::Consumed);
+        assert!(
+            err.message.contains("b1") && err.message.contains("cite that block"),
+            "the model must be told to cite b1: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn a_message_consumed_by_a_higher_tier_block_snaps_to_it() {
+        let mut state = state_with_refs(&["t1.1", "t1.2", "t1.3"]);
+        // b1 compressed t1.2; b2 distilled b1, so t1.2 is INHERITED by b2
+        state.blocks.push(block("b1", &["t1.2"]));
+        let mut b2 = block("b2", &[]);
+        b2.direct_block_ids = vec!["b1".to_string()];
+        b2.effective_message_ids = vec!["t1.2".to_string()];
+        state.blocks.push(b2);
+
+        let msgs = vec![
+            user("t1.1"),
+            CoreMessage::new(
+                summary_message_id("b2"),
+                MessageRole::System,
+                MessageContentType::Text,
+            )
+            .with_text("s2"),
+            user("t1.3"),
+        ];
         let range = resolve_boundaries("m00002", "m00003", &msgs, &state).unwrap();
         assert!(
             range.notes.iter().any(|n| n.contains("already compressed")),
-            "the snap must be reported: {:?}",
+            "the ancestor snap must be reported: {:?}",
             range.notes
         );
     }
