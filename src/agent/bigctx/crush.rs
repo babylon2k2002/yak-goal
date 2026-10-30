@@ -565,7 +565,14 @@ fn flush_elided(out: &mut Vec<String>, elided: &mut usize, marker: &str) {
     *elided = 0;
 }
 
-fn finalize(original: &str, emitted: &[String]) -> Option<String> {
+fn finalize(original: &str, emitted: &[String], elided: usize) -> Option<String> {
+    // Nothing was actually elided: the shorter output is only `lines()` having
+    // dropped a trailing newline, which is not a crush. Returning it would
+    // rewrite a comment-free file for no gain and cost the provider prefix
+    // cache on every turn.
+    if elided == 0 {
+        return None;
+    }
     let out = emitted.join("\n");
     (!out.is_empty() && out.len() < original.len()).then_some(out)
 }
