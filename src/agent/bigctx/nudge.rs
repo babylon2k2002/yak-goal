@@ -139,7 +139,7 @@ pub fn decide_nudge(
 
     // Growth gate: has the context grown enough since the last nudge (or since
     // the session started) to be worth another one?
-    let growth = adaptive_growth(window, config);
+    let growth = adaptive_growth(Some(window), config);
     let reference = growth_reference(&state.nudge, token_count);
     let grown = token_count.saturating_sub(reference);
 
@@ -273,7 +273,7 @@ mod tests {
     fn adaptive_growth_has_a_floor() {
         let c = cfg(1_000);
         let step = adaptive_growth(Some(1_000), &c);
-        assert!(step >= c.nudge.growth_floor, "got {step}");
+        assert!(step >= c.nudge.min_growth_floor, "got {step}");
     }
 
     #[test]
