@@ -249,14 +249,29 @@ mod tests {
 
     #[test]
     fn adaptive_growth_scales_with_the_window() {
-        let small = cfg(32_000);
-        let large = cfg(1_000_000);
-        let small_step = adaptive_growth(Some(32_000), &small);
-        let large_step = adaptive_growth(Some(1_000_000), &large);
-        assert!(
-            large_step > small_step,
-            "a bigger window must tolerate a bigger step: {small_step} vs {large_step}"
-        );
+        // The floor dominates at both ends of the default config (20K), so the
+        // scaling only shows once the floor is lowered — which is what a small
+        // window needs. Assert the shape with a floor that lets it show.
+        let mut c = cfg(200_000);
+        c.nudge.min_growth_floor = 1_000;
+        c.nudge.growth_cap = 1_000_000;
+
+        let small = adaptive_growth(Some(50_000), &c);
+        let large = adaptive_growth(Some(500_000), &c);
+        assert_eq!(small, 1_000, "50K * 2% = 1000, at the floor");
+        assert_eq!(large, 10_000, "500K * 2% = 10000");
+        assert!(large > small, "a bigger window tolerates a bigger step");
+    }
+
+    #[test]
+    fn the_default_floor_dominates_below_two_megabytes() {
+        // Stated as a test because it surprised me: with the shipped defaults
+        // the step is a constant 20K for every window under ~1M, and the cap
+        // binds only above 2M.
+        let c = cfg(200_000);
+        assert_eq!(adaptive_growth(Some(32_000), &c), 20_000);
+        assert_eq!(adaptive_growth(Some(1_000_000), &c), 20_000);
+        assert_eq!(adaptive_growth(Some(2_000_000), &c), 40_000);
     }
 
     #[test]
