@@ -94,7 +94,7 @@ pub fn classify(text: &str) -> CrushKind {
     {
         return CrushKind::Json;
     }
-    if looks_like_code(text) {
+    if detect_language(text).is_some() {
         return CrushKind::Code;
     }
     CrushKind::Log
