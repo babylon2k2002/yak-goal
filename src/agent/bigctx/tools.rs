@@ -653,8 +653,16 @@ mod tests {
         config.preserve_recent_messages = 0;
         config.preserve_recent_tokens = 0;
         config.compress.min_range_tokens = 0;
+        // Refs must exist before a range can be cited: `resolve_boundaries`
+        // looks a raw id up through the ref map, so an unassigned session has
+        // no mNNNNN to resolve and every call would report "does not exist".
+        let mut state = create_initial_state();
+        let mut next = 1u64;
+        crate::agent::bigctx::assign_refs(messages.as_slice(), &mut state.message_refs, &mut next, |_| false)
+            .expect("refs");
+        state.next_ref_index = next;
         BigctxSession {
-            state: create_initial_state(),
+            state,
             messages,
             config,
         }
@@ -754,9 +762,12 @@ mod tests {
 
     #[test]
     fn prose_is_not_mistaken_for_a_header() {
+        // No header means no range. The parser reports that as an empty list;
+        // the caller decides whether "nothing parsed" is an error, and the
+        // tool does (a compress call with no range is meaningless).
         let content = json!("this is just a summary with no header");
-        let ranges = parse_compress_content(&content).unwrap();
-        assert!(ranges.is_empty(), "no header means no range");
+        let error = parse_compress_content(&content).unwrap_err();
+        assert!(error.contains("no ranges"), "got: {error}");
     }
 
     #[test]
