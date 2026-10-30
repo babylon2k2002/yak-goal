@@ -245,7 +245,8 @@ fn call_shape(tier: Option<Tier>, ranges: &ContextRanges) -> String {
     {
         return format!(
             "Call it as: compress({{\"content\": [{{\"startId\": \"b1\", \"endId\": \"bN\", \
-             \"summary\": \"...\"}}]}}) — a tier-{} fold cites block ids."
+             \"summary\": \"...\"}}]}}) — a tier-{} fold cites block ids.",
+            tier.number()
         );
     }
     match ranges.compressible.first() {
