@@ -109,6 +109,13 @@ pub struct Session {
     /// `/goal` subcommand or a resumed thread that has one; the loop reads it
     /// to decide whether a round without tool calls ends the task or the turn.
     pub goal: Option<crate::agent::goal::GoalRuntime>,
+    /// The reversible-compression state (`agent::bigctx`). None until the first
+    /// turn projects the history; once set it survives every turn, because the
+    /// block ids and citation refs it holds are what make a fold restorable.
+    pub bigctx: Option<crate::agent::bigctx::CompressionState>,
+    /// Which round the current id scheme started at. Bumped whenever the prefix
+    /// is rewritten, so a message id is never reused for different content.
+    pub bigctx_round: u64,
 }
 
 impl Session {
@@ -131,6 +138,45 @@ impl Session {
         if crate::agent::compact::should_compact(estimate, trigger) {
             crate::agent::compact::prune_tool_results(&mut self.seed);
         }
+    }
+
+    /// Project the seed through the reversible-compression pipeline.
+    ///
+    /// Returns the view the model should be sent, leaving `self.seed` as the
+    /// full history. A fold never destroys anything here: the blocks remember
+    /// which messages they cover, so a later turn can restore them.
+    ///
+    /// The projection is skipped entirely while no block exists. A session that
+    /// has never compressed pays nothing — not one token estimate, not one
+    /// ref assignment — because the view would be the history verbatim.
+    pub fn bigctx_view(&mut self) -> Vec<Msg> {
+        let folded = self
+            .bigctx
+            .as_ref()
+            .is_some_and(|state| state.blocks.iter().any(|b| b.active));
+        if !folded || self.seed.is_empty() {
+            return self.seed.clone();
+        }
+
+        let scheme = crate::agent::bigctx::IdScheme {
+            round: self.bigctx_round.max(1),
+            first_slot: 0,
+        };
+        let projection = crate::agent::bigctx::project(&self.seed, scheme);
+        let config = crate::agent::bigctx::default_config(
+            self.model
+                .as_ref()
+                .and_then(|m| m.context_window)
+                .unwrap_or(200_000),
+        );
+        let state = self
+            .bigctx
+            .clone()
+            .unwrap_or_else(crate::agent::bigctx::create_initial_state);
+
+        let turn = crate::agent::bigctx::process_turn(&projection.messages, &state, &config);
+        self.bigctx = Some(turn.state);
+        crate::agent::bigctx::render(&turn.messages, &projection)
     }
 
     /// How much of the carried history the previous request in this
@@ -517,13 +563,17 @@ impl Session {
             watcher = crate::term::lineedit::KeyWatcher::start();
             answer
         };
+        // The model is sent the compressed view, not the raw history. A fold
+        // replaces a range with a summary; the originals stay in `self.seed`,
+        // so nothing is lost and a later turn can restore them.
+        let mut view_seed = self.bigctx_view();
         let result = run_agent(
             RunRequest {
                 model,
                 tools: &self.tools,
                 prompt,
                 attachments,
-                seed: std::mem::take(&mut self.seed),
+                seed: std::mem::take(&mut view_seed),
                 opts: &opts,
             },
             &mut self.approval,
@@ -782,13 +832,17 @@ impl Session {
         };
         // no KeyWatcher here: stdin belongs to the caller (usually a pipe),
         // and ctrl-c kills this process like any other child
+        // The model is sent the compressed view, not the raw history. A fold
+        // replaces a range with a summary; the originals stay in `self.seed`,
+        // so nothing is lost and a later turn can restore them.
+        let mut view_seed = self.bigctx_view();
         let result = run_agent(
             RunRequest {
                 model,
                 tools: &self.tools,
                 prompt,
                 attachments,
-                seed: std::mem::take(&mut self.seed),
+                seed: std::mem::take(&mut view_seed),
                 opts: &opts,
             },
             &mut self.approval,
@@ -1335,6 +1389,8 @@ mod tests {
             unattended_allow: false,
             persist_error: None,
             goal: None,
+            bigctx: None,
+            bigctx_round: 1,
         }
     }
 
@@ -1501,6 +1557,8 @@ mod tests {
             unattended_allow: false,
             persist_error: None,
             goal: None,
+            bigctx: None,
+            bigctx_round: 1,
         };
         let (_outcome, _) = session
             .run_task("list the files", vec![])
@@ -1766,6 +1824,8 @@ mod tests {
             unattended_allow: false,
             persist_error: None,
             goal: None,
+            bigctx: None,
+            bigctx_round: 1,
         };
         let history = vec![
             Msg::user("write the docs"),
@@ -1842,6 +1902,8 @@ mod tests {
             unattended_allow: false,
             persist_error: None,
             goal: None,
+            bigctx: None,
+            bigctx_round: 1,
         };
         // a store whose directory vanishes after opening: append_turn cannot
         // create the thread file (ENOENT), which is exactly the shape of a

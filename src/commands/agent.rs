@@ -380,6 +380,10 @@ fn execute_mode(args: &ParsedArgs) -> Result<i32, String> {
         goal: Some(crate::agent::goal::GoalRuntime::for_thread(
             conversation_key.as_deref().unwrap_or(cwd_key.as_str()),
         )),
+        // a resumed thread starts a fresh compression state: its block ids and
+        // refs belonged to the previous process and are not on disk
+        bigctx: None,
+        bigctx_round: 1,
     };
 
     // a continued thread may already exceed its window: project it down
