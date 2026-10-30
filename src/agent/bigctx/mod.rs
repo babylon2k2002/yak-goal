@@ -46,7 +46,7 @@ pub use config::{BigctxConfig, default_config};
 pub use hide_consumed::{HideResult, hide_consumed_compress_calls};
 pub use host::{IdScheme, Projection, project, render};
 pub use nudge::{NudgeDecision, decide_nudge, reset_after_compression, stamp_nudge};
-pub use pipeline::{TurnResult, process_turn};
+pub use pipeline::{TurnResult, process_turn, process_turn_at};
 pub use protected::{Protection, compute_protection};
 pub use prune::{PruneOptions, prune, summary_message_id};
 pub use recommend::{ContextRanges, CompressibleRange, ProtectedRange, build_context_ranges, screen};

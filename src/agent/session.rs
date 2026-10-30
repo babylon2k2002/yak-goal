@@ -152,7 +152,12 @@ pub fn bigctx_view(
         .cloned()
         .unwrap_or_else(crate::agent::bigctx::create_initial_state);
 
-    let turn = crate::agent::bigctx::process_turn(&projection.messages, &current, &config);
+    // The nudge needs the real size to judge pressure. Priced the same way the
+    // rest of the agent prices a history, so the number in a nudge matches what
+    // /status shows.
+    let token_count = crate::agent::compact::estimate_tokens(seed, None);
+    let turn =
+        crate::agent::bigctx::process_turn_at(&projection.messages, &current, &config, token_count);
     let view = crate::agent::bigctx::render(&turn.messages, &projection);
     (view, Some(turn.state))
 }

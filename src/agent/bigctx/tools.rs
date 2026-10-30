@@ -407,6 +407,22 @@ fn apply_ranges(
         ));
     }
 
+    if !folded.is_empty() {
+        // The model acted on the last nudge, so that nudge is spent: measure
+        // the next one from the new size, not the size that prompted this.
+        // Without this the session stays "already nudged" and goes quiet while
+        // the context refills.
+        let remaining = crate::agent::bigctx::screen(
+            &session.messages,
+            &session.state,
+            &session.config,
+        );
+        crate::agent::bigctx::reset_after_compression(
+            &mut session.state,
+            remaining.compressible_tokens(),
+        );
+    }
+
     let mut out = String::new();
     if !folded.is_empty() {
         out.push_str("Compressed:\n");

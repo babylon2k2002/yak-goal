@@ -44,6 +44,8 @@ pub struct TurnResult {
     pub deactivated: Vec<String>,
     /// Ids a requested fold could not take without splitting a turn or pair.
     pub withdrawals: Withdrawals,
+    /// Whether to tell the model that compressing would help, and why.
+    pub nudge: crate::agent::bigctx::NudgeDecision,
 }
 
 /// Run one pass over `messages`.
@@ -55,6 +57,18 @@ pub fn process_turn(
     messages: &[CoreMessage],
     state: &CompressionState,
     config: &BigctxConfig,
+) -> TurnResult {
+    process_turn_at(messages, state, config, 0)
+}
+
+/// As [`process_turn`], with the current token count so the nudge can judge
+/// pressure. A caller that does not know the size passes 0 and gets no nudge
+/// rather than a wrong one.
+pub fn process_turn_at(
+    messages: &[CoreMessage],
+    state: &CompressionState,
+    config: &BigctxConfig,
+    token_count: u64,
 ) -> TurnResult {
     // 1. assign-refs. Protection is computed from the same rules the gate uses
     //    later, so a message blocked here is blocked consistently.
@@ -89,12 +103,27 @@ pub fn process_turn(
     let requested = collect_fold_candidates(&view, &next, &protection);
     let gate = withdrawals(messages, &requested);
 
+    // 6. nudge: does the model need telling? The pending mass is measured from
+    //    the same screening the status tool reports, so the number in the nudge
+    //    and the number in `acp_status` cannot disagree.
+    let ranges = crate::agent::bigctx::screen(&view, &next, config);
+    let tier1_pending = ranges.compressible_tokens();
+    let mut next = next;
+    let nudge = crate::agent::bigctx::decide_nudge(
+        &next,
+        config,
+        token_count,
+        [tier1_pending, 0, 0],
+    );
+    crate::agent::bigctx::stamp_nudge(&mut next, &nudge, token_count);
+
     TurnResult {
         messages: view,
         state: next,
         protection,
         deactivated: sync_result.deactivated,
         withdrawals: gate,
+        nudge,
     }
 }
 
