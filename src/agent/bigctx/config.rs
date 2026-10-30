@@ -111,6 +111,19 @@ pub struct BigctxConfig {
     pub preserve_recent_tokens: u64,
     /// Passes a block must survive before it counts as `Old` (tier-2 signal).
     pub promotion_threshold: u32,
+    pub crush: CrushConfig,
+}
+
+/// Deterministic compression of oversized tool results.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CrushConfig {
+    /// Off by default: the JSON strategy reserves a key in the payload, so a
+    /// tool result that legitimately contains it cannot be told apart from
+    /// crushed output.
+    pub enabled: bool,
+    /// Fraction of tokens that must be saved for a crush to be used. A crush
+    /// that saves almost nothing costs a prefix-cache miss for no gain.
+    pub min_reduction: f64,
 }
 
 /// Defaults, with the window supplied by the caller.
@@ -159,6 +172,10 @@ pub fn default_config(model_context_limit: u64) -> BigctxConfig {
         preserve_recent_messages: 3,
         preserve_recent_tokens: 5_000,
         promotion_threshold: 5,
+        crush: CrushConfig {
+            enabled: false,
+            min_reduction: 0.1,
+        },
     }
 }
 

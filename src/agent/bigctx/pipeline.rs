@@ -46,6 +46,8 @@ pub struct TurnResult {
     pub withdrawals: Withdrawals,
     /// Whether to tell the model that compressing would help, and why.
     pub nudge: crate::agent::bigctx::NudgeDecision,
+    /// How many tool results were mechanically crushed this pass.
+    pub crushed: usize,
 }
 
 /// Run one pass over `messages`.
@@ -70,6 +72,17 @@ pub fn process_turn_at(
     config: &BigctxConfig,
     token_count: u64,
 ) -> TurnResult {
+    // 0. Crush oversized tool results first. It has to happen before pruning:
+    //    once a result is folded into a summary its text is gone, and a crush
+    //    that only sees the summary saves nothing. Deterministic, so the same
+    //    bytes come out on every turn a result is re-sent.
+    let crushed = if config.crush.enabled {
+        crate::agent::bigctx::crush_tool_results(messages, config.crush.min_reduction)
+    } else {
+        crate::agent::bigctx::CrushResult::unchanged(messages)
+    };
+    let messages = &crushed.messages[..];
+
     // 1. assign-refs. Protection is computed from the same rules the gate uses
     //    later, so a message blocked here is blocked consistently.
     let mut next = state.clone();
@@ -124,6 +137,7 @@ pub fn process_turn_at(
         deactivated: sync_result.deactivated,
         withdrawals: gate,
         nudge,
+        crushed: crushed.crushed,
     }
 }
 

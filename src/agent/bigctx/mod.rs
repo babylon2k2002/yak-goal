@@ -44,7 +44,9 @@ pub mod types;
 pub use boundaries::{ResolvedRange, parse_boundary, resolve_boundaries};
 pub use compress::{CompressError, CompressOutcome, apply_compression, decompress_block};
 pub use config::{BigctxConfig, default_config};
-pub use crush::{CrushKind, CrushOutput, CrushStrategy, crush, crush_json};
+pub use crush::{
+    CrushKind, CrushOutput, CrushResult, CrushStrategy, crush, crush_json, crush_tool_results,
+};
 pub use hide_consumed::{HideResult, hide_consumed_compress_calls};
 pub use host::{IdScheme, Projection, project, render};
 pub use nudge::{NudgeDecision, decide_nudge, reset_after_compression, stamp_nudge};

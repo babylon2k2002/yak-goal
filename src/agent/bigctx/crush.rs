@@ -1065,3 +1065,154 @@ mod tests {
         assert!(out.lossy);
     }
 }
+
+// ─── applying it to a message list ───────────────────────────────────────────
+
+/// What crushing a message list changed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CrushResult {
+    pub messages: Vec<CoreMessage>,
+    /// How many tool results were crushed.
+    pub crushed: usize,
+    /// Strategies used, for reporting.
+    pub strategies: Vec<CrushStrategy>,
+}
+
+impl CrushResult {
+    /// The unchanged case, so the caller can use one shape either way.
+    pub fn unchanged(messages: &[CoreMessage]) -> CrushResult {
+        CrushResult {
+            messages: messages.to_vec(),
+            crushed: 0,
+            strategies: Vec::new(),
+        }
+    }
+}
+
+/// Crush every oversized tool result in the list.
+///
+/// Only tool results are touched: a user message is the model's instructions
+/// and an assistant message is its own output — shrinking either would be
+/// rewriting the conversation rather than compressing a payload. Summaries this
+/// module rendered are skipped for the same reason.
+pub fn crush_tool_results(messages: &[CoreMessage], min_reduction: f64) -> CrushResult {
+    let mut out: Vec<CoreMessage> = Vec::with_capacity(messages.len());
+    let mut result = CrushResult::default();
+
+    for message in messages {
+        if message.content_type != crate::agent::bigctx::types::MessageContentType::ToolResult {
+            out.push(message.clone());
+            continue;
+        }
+        let text = message.text_or_empty();
+        match crush(text, min_reduction) {
+            Some(output) => {
+                result.crushed += 1;
+                if !result.strategies.contains(&output.strategy) {
+                    result.strategies.push(output.strategy);
+                }
+                out.push(CoreMessage {
+                    text: Some(output.text),
+                    ..message.clone()
+                });
+            }
+            None => out.push(message.clone()),
+        }
+    }
+
+    result.messages = out;
+    result
+}
+
+#[cfg(test)]
+mod apply_tests {
+    use super::*;
+    use crate::agent::bigctx::types::{MessageContentType, MessageRole};
+
+    fn result(id: &str, text: &str) -> CoreMessage {
+        CoreMessage::new(id, MessageRole::Tool, MessageContentType::ToolResult)
+            .with_text(text)
+            .with_tool("bash", "c1")
+    }
+
+    fn user(id: &str, text: &str) -> CoreMessage {
+        CoreMessage::new(id, MessageRole::User, MessageContentType::Text).with_text(text)
+    }
+
+    #[test]
+    fn a_crushable_tool_result_shrinks() {
+        let mut rows = Vec::new();
+        for i in 0..30 {
+            rows.push(format!("{{\"level\":\"info\",\"message\":\"a repeated log line\",\"i\":{i}}}"));
+        }
+        let text = format!("[{}]", rows.join(","));
+        let msgs = vec![user("t1.0", "go"), result("t1.1", &text)];
+        let out = crush_tool_results(&msgs, 0.1);
+        assert_eq!(out.crushed, 1);
+        assert!(out.messages[1].text_or_empty().len() < text.len());
+    }
+
+    #[test]
+    fn a_user_message_is_never_touched() {
+        // Rewriting the user's instructions would be changing the conversation,
+        // not compressing a payload.
+        let mut rows = Vec::new();
+        for i in 0..30 {
+            rows.push(format!("{{\"level\":\"info\",\"i\":{i}}}"));
+        }
+        let text = format!("[{}]", rows.join(","));
+        let msgs = vec![user("t1.0", &text)];
+        let out = crush_tool_results(&msgs, 0.1);
+        assert_eq!(out.crushed, 0);
+        assert_eq!(out.messages[0].text_or_empty(), text);
+    }
+
+    #[test]
+    fn an_assistant_message_is_never_touched() {
+        let mut rows = Vec::new();
+        for i in 0..30 {
+            rows.push(format!("{{\"level\":\"info\",\"i\":{i}}}"));
+        }
+        let text = format!("[{}]", rows.join(","));
+        let msgs = vec![CoreMessage::new(
+            "t1.0",
+            MessageRole::Assistant,
+            MessageContentType::Text,
+        )
+        .with_text(&text)];
+        let out = crush_tool_results(&msgs, 0.1);
+        assert_eq!(out.crushed, 0);
+    }
+
+    #[test]
+    fn a_short_result_is_left_alone() {
+        let msgs = vec![result("t1.0", "ok")];
+        let out = crush_tool_results(&msgs, 0.1);
+        assert_eq!(out.crushed, 0);
+        assert_eq!(out.messages[0].text_or_empty(), "ok");
+    }
+
+    #[test]
+    fn unchanged_is_the_identity() {
+        let msgs = vec![user("t1.0", "a"), result("t1.1", "b")];
+        let out = CrushResult::unchanged(&msgs);
+        assert_eq!(out.messages, msgs);
+        assert_eq!(out.crushed, 0);
+    }
+
+    #[test]
+    fn the_result_carries_its_identity() {
+        // The call id and tool name must survive a crush, or the exchange is
+        // left unpaired on the wire.
+        let mut rows = Vec::new();
+        for i in 0..30 {
+            rows.push(format!("{{\"level\":\"info\",\"i\":{i}}}"));
+        }
+        let text = format!("[{}]", rows.join(","));
+        let msgs = vec![result("t1.1", &text)];
+        let out = crush_tool_results(&msgs, 0.1);
+        assert_eq!(out.messages[0].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(out.messages[0].tool_name.as_deref(), Some("bash"));
+        assert_eq!(out.messages[0].id, "t1.1");
+    }
+}
