@@ -716,7 +716,7 @@ mod tests {
         // when it matters, and feeds back: every call would be a new oversized
         // result.
         for tool in NEVER_STORE_TOOLS {
-            let messages = vec![user("go"), result("t1.1", &bulk(20_000), tool)];
+            let messages = vec![user("go"), result("t1.1", &bulk(20_000), *tool)];
             let mut state = state_for(&messages);
             let mut store = ContentStore::new();
             let out = project(&messages, &mut state, &mut store, 4_000);
