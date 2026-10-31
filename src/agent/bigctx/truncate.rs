@@ -494,3 +494,38 @@ mod tests {
         assert_eq!(out.messages[1].tool_name.as_deref(), Some("bash"));
     }
 }
+
+#[cfg(test)]
+mod diag {
+    use super::*;
+    use crate::agent::bigctx::config::default_config;
+
+    #[test]
+    fn diag_path() {
+        let mut c = default_config(100_000);
+        c.model_context_limit = 100_000;
+        let messages = vec![
+            CoreMessage::new("t1.0", MessageRole::User, MessageContentType::Text)
+                .with_text("go"),
+            CoreMessage::new("t1.1", MessageRole::Tool, MessageContentType::ToolResult)
+                .with_text("x".repeat(200_000))
+                .with_tool("bash", "c1"),
+            CoreMessage::new("t1.2", MessageRole::User, MessageContentType::Text)
+                .with_text("and now?"),
+        ];
+        let opts = TruncateOptions::default();
+        let protect = opts.protect_recent_messages.min(messages.len().saturating_sub(1));
+        let protected_from = messages.len() - protect;
+        let threshold = (c.truncate.threshold * c.model_context_limit as f64) as u64;
+        let tokens = default_count_tokens(&messages[1].text_or_empty());
+        let cands = collect_candidates(&messages, protected_from, &opts, |m| {
+            m.content_type == MessageContentType::ToolResult
+        });
+        panic!(
+            "protect={protect} protected_from={protected_from} threshold={threshold} \
+             payload_tokens={tokens} min_out={} candidates={}",
+            opts.min_output_tokens,
+            cands.len()
+        );
+    }
+}
