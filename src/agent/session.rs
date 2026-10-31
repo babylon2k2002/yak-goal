@@ -2928,7 +2928,7 @@ mod tests {
         assert!(
             view.iter()
                 .any(|m| matches!(m, Msg::User { text, .. } if text == "the task")),
-            "the pinned first user message must stay visible"
+            "the pinned first user message must stay visible; view={view:?}"
         );
     }
 
