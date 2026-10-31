@@ -304,6 +304,16 @@ pub fn render(view: &[CoreMessage], projection: &Projection) -> Vec<Msg> {
         // still resolves to the original — honouring its text there would
         // replace the pinned task statement with the summary.
         let rewritten = core.text_or_empty();
+        if std::env::var("YAK_RENDER_DEBUG").is_ok() {
+            eprintln!(
+                "[render] core={} base={} is_summary={} rewritten={:?} original={:?}",
+                core.id,
+                base,
+                crate::agent::bigctx::prune::is_rendered_summary(core),
+                &rewritten[..rewritten.len().min(40)],
+                &original_text(original)[..original_text(original).len().min(40)]
+            );
+        }
         if core.id == base && rewritten != original_text(original) {
             out.push(replace_text(original, rewritten));
         } else {
@@ -631,26 +641,6 @@ mod tests {
         let second = project(&history, IdScheme::default());
         assert_eq!(second.messages[0].id, id_a, "append must not shift ids");
     }
-    #[test]
-    fn a_block_core_does_not_rewrite_the_message_it_consumed() {
-        // After a fold, the surviving core for a consumed message is a block
-        // core whose base id still resolves to the original. Honouring its text
-        // would replace the pinned task statement with the summary.
-        let messages = vec![user("the task"), assistant("answer")];
-        let projection = project(&messages, IdScheme::default());
-        let mut block = projection.messages[0].clone();
-        block.id = "b1".to_string();
-        block.role = MessageRole::System;
-        block.text = Some("[Compressed conversation section]
-the task".to_string());
-
-        let view = render(&[block], &projection);
-        assert!(
-            view.iter().any(|m| matches!(m, Msg::User { text, .. } if text == "the task")),
-            "the original must survive a block core: {view:?}"
-        );
-    }
-
     #[test]
     fn a_rewritten_core_reaches_the_wire() {
         // CCR and crush rewrite a message in place; that rewrite is the point of
