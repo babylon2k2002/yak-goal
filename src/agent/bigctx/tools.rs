@@ -17,7 +17,6 @@ use serde_json::{Value, json};
 use crate::agent::bigctx::compress::{CompressError, apply_compression_with_refs};
 use crate::agent::bigctx::config::BigctxConfig;
 use crate::agent::bigctx::protected::compute_protection;
-use crate::agent::bigctx::state::covered_message_ids;
 use crate::agent::bigctx::types::{CompressionState, CoreMessage};
 use crate::agent::tools::{Tool, ToolOutput, ToolProgress};
 use crate::agent::approval::Tier;
@@ -566,83 +565,22 @@ impl Tool for StatusTool {
 }
 
 fn render_status(session: &mut BigctxSession) -> String {
-    let covered = covered_message_ids(&session.state);
-    let visible = session
-        .messages
-        .iter()
-        .filter(|m| !covered.contains(crate::agent::bigctx::types::base_id_of(&m.id)))
-        .count();
-    let active: Vec<&crate::agent::bigctx::types::CompressionBlock> =
-        session.state.blocks.iter().filter(|b| b.active).collect();
-
-    let mut out = String::new();
-    out.push_str(&format!(
-        "context: {} message(s) visible, {} folded into {} active block(s)\n",
-        visible,
-        session.messages.len().saturating_sub(visible),
-        active.len()
-    ));
-    out.push_str(&format!(
-        "tokens saved: {} across {} compression(s)\n",
-        session.state.stats.tokens_compressed, session.state.stats.compression_count
-    ));
-
-    if active.is_empty() {
-        out.push_str("\nNo blocks yet — nothing has been compressed this session.\n");
-    } else {
-        out.push_str("\nblocks:\n");
-        for block in &active {
-            out.push_str(&format!(
-                "  {} (tier {}) {} message(s){}: {}\n",
-                block.block_id,
-                block.tier.number(),
-                block.effective_message_ids.len(),
-                block
-                    .topic
-                    .as_deref()
-                    .map(|t| format!(" — {t}"))
-                    .unwrap_or_default(),
-                first_line(&block.summary)
-            ));
-        }
-    }
-
-    // What the model may fold right now, with the refs to cite.
-    let ranges = crate::agent::bigctx::screen(
+    // The report owns the rendering. Duplicating it here would give the model
+    // and the user two descriptions of the same state that can disagree.
+    let report = crate::agent::bigctx::build_report(
+        &session.messages,
         &session.messages,
         &session.state,
         &session.config,
     );
-    if ranges.compressible.is_empty() {
-        out.push_str(
-            "\ncompressible: none — everything left is either protected (the recent working set) \
-             or too small to be worth a summary.\n",
-        );
-    } else {
-        out.push_str(&format!(
-            "\ncompressible ({} tokens total):\n",
-            ranges.compressible_tokens()
-        ));
-        for range in &ranges.compressible {
-            out.push_str(&format!(
-                "  {}..{} — {} message(s), {} tokens, {}% tool\n",
-                range.start_ref, range.end_ref, range.count, range.tokens, range.tool_pct
-            ));
-        }
-        out.push_str("\nCite a range as startId/endId when you call compress.\n");
-    }
+    let mut text = crate::agent::bigctx::render_report(&report);
+    if !report.compressible.compressible.is_empty() {
+        text.push_str("
 
-    out.trim_end().to_string()
-}
-
-fn first_line(text: &str) -> String {
-    let line = text.lines().next().unwrap_or("").trim();
-    if line.chars().count() > 80 {
-        let head: String = line.chars().take(77).collect();
-        format!("{head}…")
-    } else {
-        line.to_string()
+Cite a range as startId/endId when you call compress.
+");
     }
+    text
 }
 
 /// Every bigctx tool, bound to one handle.
