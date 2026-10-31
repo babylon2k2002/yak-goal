@@ -55,7 +55,9 @@ pub mod types;
 // re-export nobody calls is a name that rots silently and shows up as an
 // unused-import warning on every build.
 pub use boundaries::resolve_boundaries;
-pub use cache_report::{CacheReport, CacheSample, build_cache_report, render_cache_report};
+pub use cache_report::{
+    CacheLedger, CacheReport, CacheSample, FoldEvent, build_cache_report, render_cache_report,
+};
 pub use compress::{apply_compression, decompress_block};
 pub use config::{BigctxConfig, config_from_json, default_config};
 pub use crush::{CrushResult, crush_tool_results};

@@ -386,6 +386,7 @@ fn execute_mode(args: &ParsedArgs) -> Result<i32, String> {
         bigctx_round: 1,
         bigctx_handle: crate::agent::bigctx::BigctxHandle::new(),
         bigctx_config: settings.bigctx.clone(),
+        cache_ledger: crate::agent::bigctx::CacheLedger::new(),
     };
 
     // a continued thread may already exceed its window: project it down

@@ -698,3 +698,151 @@ mod tests {
         assert_eq!(CacheSample::new(0, 0, 0).hit_pct(), 0);
     }
 }
+
+// ─── the running ledger ──────────────────────────────────────────────────────
+
+use std::sync::{Arc, Mutex};
+
+/// A session's cache accounting, filled in as the run proceeds.
+///
+/// Shared rather than owned because the numbers arrive from two places: the
+/// agent loop records a sample per request, and the compression tools record a
+/// fold when they apply one. Neither can see the other.
+#[derive(Clone, Default)]
+pub struct CacheLedger {
+    inner: Arc<Mutex<LedgerState>>,
+}
+
+#[derive(Default)]
+struct LedgerState {
+    samples: Vec<CacheSample>,
+    folds: Vec<LedgerFold>,
+    /// Requests recorded after each fold, so payback can be judged.
+    requests_since: Vec<usize>,
+}
+
+struct LedgerFold {
+    event: FoldEvent,
+    repay: u64,
+}
+
+impl CacheLedger {
+    pub fn new() -> CacheLedger {
+        CacheLedger::default()
+    }
+
+    /// Record one request's usage.
+    pub fn record_sample(&self, sample: CacheSample) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.samples.push(sample);
+            for count in &mut state.requests_since {
+                *count += 1;
+            }
+        }
+    }
+
+    /// Record a fold. Its re-payment will be measured against the requests that
+    /// follow.
+    pub fn record_fold(&self, event: FoldEvent) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.folds.push(LedgerFold { event, repay: 0 });
+            state.requests_since.push(0);
+        }
+    }
+
+    /// Build the report from everything recorded.
+    pub fn report(&self) -> CacheReport {
+        let Ok(state) = self.inner.lock() else {
+            return build_cache_report(&[], &[]);
+        };
+        // Pair each fold with how many requests followed it. The re-payment is
+        // attributed by the decomposition inside build_cache_report, so the
+        // per-fold figure here is derived from the same pass.
+        let folds: Vec<(FoldEvent, usize, u64)> = state
+            .folds
+            .iter()
+            .zip(state.requests_since.iter())
+            .map(|(fold, after)| (fold.event, *after, fold.repay))
+            .collect();
+        build_cache_report(&state.samples, &folds)
+    }
+
+    /// True when nothing has been recorded.
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|s| s.samples.is_empty() && s.folds.is_empty())
+            .unwrap_or(true)
+    }
+
+    /// How many requests and folds have been recorded.
+    pub fn counts(&self) -> (usize, usize) {
+        self.inner
+            .lock()
+            .map(|s| (s.samples.len(), s.folds.len()))
+            .unwrap_or((0, 0))
+    }
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_ledger_reports_nothing() {
+        let ledger = CacheLedger::new();
+        assert!(ledger.is_empty());
+        let report = ledger.report();
+        assert_eq!(report.totals.requests, 0);
+        assert!(report.balances());
+    }
+
+    #[test]
+    fn samples_are_counted() {
+        let ledger = CacheLedger::new();
+        ledger.record_sample(CacheSample::new(1_000, 800, 10));
+        ledger.record_sample(CacheSample::new(2_000, 1_500, 20));
+        assert_eq!(ledger.counts(), (2, 0));
+        let report = ledger.report();
+        assert_eq!(report.totals.requests, 2);
+        assert_eq!(report.totals.input, 3_000);
+        assert_eq!(report.totals.cached, 2_300);
+    }
+
+    #[test]
+    fn a_fold_is_recorded_and_counted() {
+        let ledger = CacheLedger::new();
+        ledger.record_fold(FoldEvent::new(15_000, 90));
+        assert_eq!(ledger.counts(), (0, 1));
+        let report = ledger.report();
+        assert_eq!(report.folds.len(), 1);
+    }
+
+    #[test]
+    fn requests_after_a_fold_are_tracked() {
+        let ledger = CacheLedger::new();
+        ledger.record_fold(FoldEvent::new(15_000, 90));
+        for _ in 0..5 {
+            ledger.record_sample(CacheSample::new(1_000, 900, 10));
+        }
+        let report = ledger.report();
+        assert_eq!(report.folds[0].requests_after, 5);
+    }
+
+    #[test]
+    fn the_ledger_balances_across_a_realistic_run() {
+        let ledger = CacheLedger::new();
+        ledger.record_sample(CacheSample::new(20_000, 18_000, 200));
+        ledger.record_fold(FoldEvent {
+            tokens_compressed: 15_000,
+            summary_tokens: 90,
+            first_fold_start_tokens: Some(4_000),
+            view_after: Some(5_000),
+        });
+        for _ in 0..4 {
+            ledger.record_sample(CacheSample::new(6_000, 5_000, 150));
+        }
+        let report = ledger.report();
+        assert!(report.balances(), "residual {}", report.totals.residual());
+    }
+}

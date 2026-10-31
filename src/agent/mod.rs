@@ -139,6 +139,9 @@ pub struct AgentOptions<'a> {
     /// The id round the caller's view was projected with. The tools must use
     /// the same one, or they mint ids for messages the view named differently.
     pub bigctx_round: u64,
+    /// Where to record each round's usage and each fold, when the caller wants
+    /// a cache report. None means the accounting is not collected.
+    pub cache_ledger: Option<crate::agent::bigctx::CacheLedger>,
     /// opaque id sent with every request so a multi-replica gateway routes
     /// one conversation to the same backend; automatic prefix caching is
     /// per-replica, so without it a round-robin hop re-bills the whole
@@ -612,6 +615,16 @@ pub fn run_agent(
         // pushed, so the report covers the whole history: everything the next
         // round appends is the only part left to price at chars/4
         usage_marker = usage.map(|u| (history.len(), u));
+        // Record this request's cache numbers for the report. `cached` is a
+        // subset of `input` on every provider yak speaks, so the miss is
+        // `input - cached` without further normalisation.
+        if let Some(ledger) = opts.cache_ledger.as_ref()
+            && let Some(u) = usage
+        {
+            ledger.record_sample(crate::agent::bigctx::CacheSample::new(
+                u.input, u.cached, u.output,
+            ));
+        }
         // the round is complete: this request's whole conversation is what
         // the next one will extend, so it is the next request's cache anchor
         cache_stable = Some(history.len());

@@ -39,6 +39,9 @@ pub struct BigctxSession {
     /// The full resent history, projected to cores.
     pub messages: Vec<CoreMessage>,
     pub config: BigctxConfig,
+    /// Where a fold records itself for the cache accounting. None when the
+    /// caller did not ask for a report.
+    pub ledger: Option<crate::agent::bigctx::CacheLedger>,
 }
 
 impl BigctxHandle {
@@ -385,6 +388,25 @@ fn apply_ranges(
                 {
                     block.topic = Some(topic.clone());
                 }
+                // Record the fold so the cache report can charge it for the
+                // re-payment it forces. The divergence point is where the fold
+                // starts in the post-fold view; without it the report cannot
+                // tell a fold's cost from ordinary cache expiry.
+                if let Some(ledger) = session.ledger.as_ref() {
+                    let view_after = crate::agent::bigctx::tokenize::count_messages_tokens(
+                        &session.messages,
+                    );
+                    ledger.record_fold(crate::agent::bigctx::FoldEvent {
+                        tokens_compressed: outcome.compressed_tokens,
+                        summary_tokens: crate::agent::bigctx::tokenize::default_count_tokens(
+                            &range.summary,
+                        ),
+                        first_fold_start_tokens: Some(
+                            view_after.saturating_sub(outcome.compressed_tokens),
+                        ),
+                        view_after: Some(view_after),
+                    });
+                }
                 folded.push(format!(
                     "{}..{} → {} (tier {}, {} messages, {} tokens)",
                     range.start,
@@ -579,6 +601,20 @@ fn render_status(session: &mut BigctxSession) -> String {
 
 Cite a range as startId/endId when you call compress.
 ");
+    }
+
+    // The cache accounting, when the caller asked for it. This is the part that
+    // says whether folding is actually cheaper — a fold that breaks the prompt
+    // cache can cost more than the tokens it removed.
+    if let Some(ledger) = session.ledger.as_ref()
+        && !ledger.is_empty()
+    {
+        let cache = ledger.report();
+        text.push_str("
+
+cache:
+");
+        text.push_str(&crate::agent::bigctx::render_cache_report(&cache));
     }
     text
 }

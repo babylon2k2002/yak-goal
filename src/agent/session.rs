@@ -33,6 +33,7 @@ fn agent_opts<'a>(
     bigctx: crate::agent::bigctx::BigctxHandle,
     bigctx_config: Option<serde_json::Value>,
     bigctx_round: u64,
+    cache_ledger: crate::agent::bigctx::CacheLedger,
 ) -> AgentOptions<'a> {
     AgentOptions {
         max_request_bytes,
@@ -49,6 +50,7 @@ fn agent_opts<'a>(
         bigctx: Some(bigctx),
         bigctx_config,
         bigctx_round,
+        cache_ledger: Some(cache_ledger),
     }
 }
 
@@ -129,6 +131,9 @@ pub struct Session {
     /// `agent.bigctx` from config.json: the compression tunables. None means
     /// the built-in defaults, which are sized for a 128k–200k window.
     pub bigctx_config: Option<serde_json::Value>,
+    /// Cache accounting for the session, so `/status` can say what the folds
+    /// actually cost. Shared with the loop and the tools.
+    pub cache_ledger: crate::agent::bigctx::CacheLedger,
 }
 
 /// Project a history through the reversible-compression pipeline.
@@ -259,6 +264,7 @@ pub fn bigctx_turn(
     round: u64,
     window: Option<u64>,
     overrides: Option<&serde_json::Value>,
+    ledger: Option<&crate::agent::bigctx::CacheLedger>,
 ) -> crate::agent::bigctx::BigctxSession {
     let scheme = crate::agent::bigctx::IdScheme {
         round: round.max(1),
@@ -287,6 +293,7 @@ pub fn bigctx_turn(
         state,
         messages: projection.messages,
         config: crate::agent::bigctx::config_from_json(window.unwrap_or(200_000), overrides),
+        ledger: ledger.cloned(),
     }
 }
 
@@ -395,6 +402,7 @@ impl Session {
             self.bigctx_handle.clone(),
             self.bigctx_config.clone(),
             self.bigctx_round,
+            self.cache_ledger.clone(),
         );
         let model_id = model.model_id.clone();
         // the shared TaskView owns the answer stream, spinner, thinking
@@ -843,6 +851,7 @@ impl Session {
             self.bigctx_handle.clone(),
             self.bigctx_config.clone(),
             self.bigctx_round,
+            self.cache_ledger.clone(),
         );
         let model_id = model.model_id.clone();
         let view = std::cell::RefCell::new(crate::term::render::TaskView::new(2, &model_id, true));
@@ -941,6 +950,7 @@ impl Session {
             self.bigctx_handle.clone(),
             self.bigctx_config.clone(),
             self.bigctx_round,
+            self.cache_ledger.clone(),
         );
         // the terminal path renders the reasoning trace through TaskView;
         // here it is only carried into the stored turn
@@ -1584,6 +1594,7 @@ mod tests {
             bigctx_round: 1,
             bigctx_handle: crate::agent::bigctx::BigctxHandle::new(),
             bigctx_config: None,
+            cache_ledger: crate::agent::bigctx::CacheLedger::new(),
         }
     }
 
@@ -1754,6 +1765,7 @@ mod tests {
             bigctx_round: 1,
             bigctx_handle: crate::agent::bigctx::BigctxHandle::new(),
             bigctx_config: None,
+            cache_ledger: crate::agent::bigctx::CacheLedger::new(),
         };
         let (_outcome, _) = session
             .run_task("list the files", vec![])
@@ -2023,6 +2035,7 @@ mod tests {
             bigctx_round: 1,
             bigctx_handle: crate::agent::bigctx::BigctxHandle::new(),
             bigctx_config: None,
+            cache_ledger: crate::agent::bigctx::CacheLedger::new(),
         };
         let history = vec![
             Msg::user("write the docs"),
@@ -2103,6 +2116,7 @@ mod tests {
             bigctx_round: 1,
             bigctx_handle: crate::agent::bigctx::BigctxHandle::new(),
             bigctx_config: None,
+            cache_ledger: crate::agent::bigctx::CacheLedger::new(),
         };
         // a store whose directory vanishes after opening: append_turn cannot
         // create the thread file (ENOENT), which is exactly the shape of a
