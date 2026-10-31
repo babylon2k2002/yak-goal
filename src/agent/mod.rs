@@ -323,15 +323,17 @@ pub fn run_agent(
         // a handle filled before the loop would show the tools the previous
         // task's history — nothing at all on a session's first task.
         if let Some(handle) = opts.bigctx.as_ref() {
-            if std::env::var("YAK_BIGCTX_DEBUG").is_ok() {
-                eprintln!(
-                    "[bigctx] round {turn}: history={} msgs, prompt_pending={}",
-                    history.len(),
-                    pending.is_some()
-                );
+            // The prompt of the current round is still in `pending` — it joins
+            // `history` only when the round's answer is pushed. A tool call
+            // happens INSIDE this round, so a view built from `history` alone
+            // would be missing the very message the model is working on, and on
+            // round 1 would be empty.
+            let mut round_view = history.clone();
+            if let Some(user) = pending.as_ref() {
+                round_view.push(user.clone());
             }
             handle.set(crate::agent::session::bigctx_turn(
-                &history,
+                &round_view,
                 handle.with(|s| s.state.clone()).as_ref(),
                 turn as u64,
                 model.context_window,
