@@ -89,42 +89,12 @@ pub fn process_turn_with_store(
     };
     let messages = &crushed.messages[..];
 
-    // 1. assign-refs. Protection is computed from the same rules the gate uses
-    //    later, so a message blocked here is blocked consistently.
-    let mut next = state.clone();
-    let protection = compute_protection(messages, &next, config);
-    sync_refs(&mut next, messages, &protection);
-
-    // 2. sync-blocks, then age. Ageing before the fold decision means a block
-    //    that has survived long enough is already eligible for distillation.
-    let (synced, sync_result) = sync_blocks(messages, &next);
-    next = synced;
-    advance_survival(&mut next, config.promotion_threshold);
-
-    // 3. prune. Summaries are injected so the model can see what it folded.
-    let view = prune(
-        messages,
-        &next,
-        &PruneOptions {
-            inject_summaries: true,
-            ..Default::default()
-        },
-    );
-
-    // 3a-bis. Content-cached retrieval: keep oversized tool results out of the
-    //     context without losing them. Runs before prune so the placeholder is
-    //     what gets folded or carried, and at arrival so the bytes are frozen
-    //     the first time — a placeholder that changed per turn would move the
-    //     prefix and invalidate the cache it exists to protect.
-    if std::env::var("YAK_BIGCTX_DEBUG").is_ok() {
-        eprintln!(
-            "[bigctx] ccr: enabled={} min_tokens={} store_present={} msgs={}",
-            config.ccr.enabled,
-            config.ccr.min_tool_tokens,
-            store.is_some(),
-            messages.len()
-        );
-    }
+    // 0b. Content-cached retrieval: keep oversized tool results out of the
+    //     context without losing them. It MUST run before prune: once a result
+    //     is folded into a summary its text is gone and there is nothing left to
+    //     store. It also runs at arrival, so the bytes are frozen the first time
+    //     — a placeholder that changed per turn would move the prefix and
+    //     invalidate the cache it exists to protect.
     let ccr = if config.ccr.enabled
         && let Some(store) = store
     {
@@ -148,6 +118,29 @@ pub fn process_turn_with_store(
         );
     }
     let messages = &ccr.messages[..];
+
+    // 1. assign-refs. Protection is computed from the same rules the gate uses
+    //    later, so a message blocked here is blocked consistently.
+    let mut next = state.clone();
+    let protection = compute_protection(messages, &next, config);
+    sync_refs(&mut next, messages, &protection);
+
+    // 2. sync-blocks, then age. Ageing before the fold decision means a block
+    //    that has survived long enough is already eligible for distillation.
+    let (synced, sync_result) = sync_blocks(messages, &next);
+    next = synced;
+    advance_survival(&mut next, config.promotion_threshold);
+
+    // 3. prune. Summaries are injected so the model can see what it folded.
+    let view = prune(
+        messages,
+        &next,
+        &PruneOptions {
+            inject_summaries: true,
+            ..Default::default()
+        },
+    );
+
 
     // 3b. Hide compress calls whose blocks are gone, and stub the summaries a
     //     live call repeats. A long session otherwise pays for the receipts:
