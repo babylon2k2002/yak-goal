@@ -323,6 +323,13 @@ pub fn run_agent(
         // a handle filled before the loop would show the tools the previous
         // task's history — nothing at all on a session's first task.
         if let Some(handle) = opts.bigctx.as_ref() {
+            if std::env::var("YAK_BIGCTX_DEBUG").is_ok() {
+                eprintln!(
+                    "[bigctx] round {turn}: history={} msgs, prompt_pending={}",
+                    history.len(),
+                    pending.is_some()
+                );
+            }
             handle.set(crate::agent::session::bigctx_turn(
                 &history,
                 handle.with(|s| s.state.clone()).as_ref(),
