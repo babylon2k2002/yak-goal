@@ -326,6 +326,9 @@ pub fn project(
             continue;
         }
         let Some(reference) = state.message_refs.ref_for(&message.id) else {
+            if std::env::var("YAK_BIGCTX_DEBUG").is_ok() {
+                eprintln!("[ccr] skip {}: no ref", message.id);
+            }
             result.messages.push(message.clone());
             continue;
         };
@@ -349,6 +352,9 @@ pub fn project(
         }
 
         let tokens = count_message_tokens(message);
+        if std::env::var("YAK_BIGCTX_DEBUG").is_ok() {
+            eprintln!("[ccr] {} ref={} tokens={}", message.id, reference, tokens);
+        }
         if tokens < min_tokens {
             result.messages.push(message.clone());
             continue;
