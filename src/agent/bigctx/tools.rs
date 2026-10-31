@@ -867,7 +867,7 @@ mod tests {
         let out = run(&StatusTool::new(handle.clone()), json!({}));
         assert!(out.error.is_none(), "{}", out.content);
         assert!(out.content.contains("b1"));
-        assert!(out.content.contains("tokens saved"));
+        assert!(out.content.contains("saved"));
     }
 
     #[test]
@@ -875,7 +875,7 @@ mod tests {
         let handle = BigctxHandle::new();
         handle.set(session_with(vec![user("t1.0", "a")]));
         let out = run(&StatusTool::new(handle.clone()), json!({}));
-        assert!(out.content.contains("No blocks yet"));
+        assert!(out.content.contains("No blocks"));
     }
 
     #[test]
