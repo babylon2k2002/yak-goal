@@ -419,7 +419,17 @@ mod tests {
             result("t1.2", &bulk(200_000)),
             user("t1.3", "and now?"),
         ];
-        let out = truncate_large_outputs(&messages, 99_000, &cfg(100_000), &TruncateOptions::default());
+        // A one-message window, so both payloads are eligible and the ORDER is
+        // what the test observes.
+        let out = truncate_large_outputs(
+            &messages,
+            99_000,
+            &cfg(100_000),
+            &TruncateOptions {
+                protect_recent_messages: 1,
+                ..Default::default()
+            },
+        );
         assert!(out.truncated_count >= 1);
         assert!(
             out.messages[2].text_or_empty().len() < 200_000,
