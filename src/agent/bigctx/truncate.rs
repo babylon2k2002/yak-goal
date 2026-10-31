@@ -107,7 +107,16 @@ pub fn truncate_large_outputs(
     }
 
     // Everything at or after this index is the working set and stays intact.
-    let protected_from = messages.len().saturating_sub(options.protect_recent_messages);
+    //
+    // The window is capped so it never swallows the whole list: a session with
+    // fewer messages than the protect-window would otherwise have every
+    // candidate excluded, and the valve would silently do nothing in exactly
+    // the short, bloated sessions that need it most. At least the newest
+    // message is always protected.
+    let protect = options
+        .protect_recent_messages
+        .min(messages.len().saturating_sub(1));
+    let protected_from = messages.len() - protect;
 
     let tool_results = collect_candidates(
         messages,
