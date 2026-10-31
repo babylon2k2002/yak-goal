@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn below_the_threshold_nothing_happens() {
-        let messages = vec![result("t1.0", &bulk(100_000))];
+        let messages = vec![result("t1.0", &bulk(100_000)), user("t1.1", "go")];
         let out = truncate_large_outputs(&messages, 10_000, &cfg(100_000), &TruncateOptions::default());
         assert_eq!(out.truncated_count, 0);
         assert_eq!(out.messages[0].text_or_empty().len(), 100_000);
@@ -281,7 +281,11 @@ mod tests {
 
     #[test]
     fn above_the_threshold_the_largest_payload_is_cut() {
-        let messages = vec![user("t1.0", "go"), result("t1.1", &bulk(200_000))];
+        let messages = vec![
+            user("t1.0", "go"),
+            result("t1.1", &bulk(200_000)),
+            user("t1.2", "and now?"),
+        ];
         let out = truncate_large_outputs(&messages, 99_000, &cfg(100_000), &TruncateOptions::default());
         assert_eq!(out.truncated_count, 1);
         assert!(out.saved_tokens > 0);
@@ -304,7 +308,11 @@ mod tests {
 
     #[test]
     fn a_cut_payload_reports_the_original_size() {
-        let messages = vec![user("t1.0", "go"), result("t1.1", &bulk(200_000))];
+        let messages = vec![
+            user("t1.0", "go"),
+            result("t1.1", &bulk(200_000)),
+            user("t1.2", "and now?"),
+        ];
         let out = truncate_large_outputs(&messages, 99_000, &cfg(100_000), &TruncateOptions::default());
         assert!(
             out.messages[1].text_or_empty().contains("original ~"),
@@ -314,13 +322,27 @@ mod tests {
 
     #[test]
     fn the_recent_window_is_never_cut() {
-        let mut messages = vec![result("t1.0", &bulk(200_000))];
-        messages.push(result("t1.1", &bulk(200_000))); // this one is recent
+        // Three messages, protect-window 3 -> the window is capped to 2, so
+        // index 0 is a candidate and indices 1..2 are the working set.
+        let messages = vec![
+            result("t1.0", &bulk(200_000)),
+            result("t1.1", &bulk(200_000)),
+            result("t1.2", &bulk(200_000)),
+        ];
         let out = truncate_large_outputs(&messages, 99_000, &cfg(100_000), &TruncateOptions::default());
+        assert_eq!(
+            out.messages[2].text_or_empty().len(),
+            200_000,
+            "the newest message is never cut"
+        );
         assert_eq!(
             out.messages[1].text_or_empty().len(),
             200_000,
-            "the working set stays intact"
+            "nor the one before it"
+        );
+        assert!(
+            out.messages[0].text_or_empty().len() < 200_000,
+            "the oldest is the one that goes"
         );
     }
 
@@ -350,7 +372,11 @@ mod tests {
 
     #[test]
     fn a_small_payload_is_left_alone() {
-        let messages = vec![user("t1.0", "go"), result("t1.1", "a short result")];
+        let messages = vec![
+            user("t1.0", "go"),
+            result("t1.1", "a short result"),
+            user("t1.2", "and now?"),
+        ];
         let out = truncate_large_outputs(&messages, 99_000, &cfg(100_000), &TruncateOptions::default());
         assert_eq!(out.truncated_count, 0);
         assert_eq!(out.messages[1].text_or_empty(), "a short result");
@@ -361,6 +387,7 @@ mod tests {
         let messages = vec![
             user("t1.0", "go"),
             result("t1.1", &format!("{TRUNCATION_MARKER}{}", bulk(200_000))),
+            user("t1.2", "and now?"),
         ];
         let out = truncate_large_outputs(&messages, 99_000, &cfg(100_000), &TruncateOptions::default());
         assert_eq!(out.truncated_count, 0, "a second cut would lose the stub");
@@ -374,6 +401,7 @@ mod tests {
             user("t1.0", "go"),
             result("t1.1", &bulk(20_000)),
             result("t1.2", &bulk(200_000)),
+            user("t1.3", "and now?"),
         ];
         let out = truncate_large_outputs(&messages, 99_000, &cfg(100_000), &TruncateOptions::default());
         assert_eq!(out.truncated_count, 1);
@@ -386,7 +414,7 @@ mod tests {
 
     #[test]
     fn text_messages_are_only_cut_when_asked_for() {
-        let messages = vec![user("t1.0", &bulk(200_000))];
+        let messages = vec![user("t1.0", &bulk(200_000)), user("t1.1", "and now?")];
         let by_default = truncate_large_outputs(&messages, 99_000, &cfg(100_000), &TruncateOptions::default());
         assert_eq!(by_default.truncated_count, 0, "the user's instructions stay");
 
@@ -405,7 +433,7 @@ mod tests {
 
     #[test]
     fn a_zero_window_disables_truncation() {
-        let messages = vec![result("t1.0", &bulk(200_000))];
+        let messages = vec![result("t1.0", &bulk(200_000)), user("t1.1", "go")];
         let out = truncate_large_outputs(&messages, 999_000, &cfg(0), &TruncateOptions::default());
         assert_eq!(out.truncated_count, 0);
     }
@@ -425,7 +453,11 @@ mod tests {
         // guard has no analogue here — but a byte-slicing bug would still
         // panic, so pin that cutting CJK and emoji is safe.
         let body = "汉字".repeat(50_000) + "🎉🎉🎉";
-        let messages = vec![user("t1.0", "go"), result("t1.1", &body)];
+        let messages = vec![
+            user("t1.0", "go"),
+            result("t1.1", &body),
+            user("t1.2", "and now?"),
+        ];
         let out = truncate_large_outputs(&messages, 99_000, &cfg(100_000), &TruncateOptions::default());
         assert_eq!(out.truncated_count, 1);
         let text = out.messages[1].text_or_empty();
@@ -442,6 +474,7 @@ mod tests {
             user("t1.0", "go"),
             result("t1.1", &bulk(400_000)),
             result("t1.2", &bulk(400_000)),
+            user("t1.3", "and now?"),
         ];
         let out = truncate_large_outputs(&messages, 99_000, &cfg(100_000), &TruncateOptions::default());
         assert!(out.saved_tokens > 0);
@@ -450,7 +483,11 @@ mod tests {
 
     #[test]
     fn identity_and_tool_name_survive_a_cut() {
-        let messages = vec![user("t1.0", "go"), result("t1.1", &bulk(200_000))];
+        let messages = vec![
+            user("t1.0", "go"),
+            result("t1.1", &bulk(200_000)),
+            user("t1.2", "and now?"),
+        ];
         let out = truncate_large_outputs(&messages, 99_000, &cfg(100_000), &TruncateOptions::default());
         assert_eq!(out.messages[1].id, "t1.1");
         assert_eq!(out.messages[1].tool_call_id.as_deref(), Some("c1"));
