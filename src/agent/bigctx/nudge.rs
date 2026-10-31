@@ -205,7 +205,12 @@ pub fn decide_nudge(
 /// Minimum reclaimable mass for a pressure-band nudge to be worth injecting.
 fn min_pressure_benefit(window: u64, config: &BigctxConfig) -> u64 {
     let scaled = (window as f64 * config.nudge.min_pressure_benefit_ratio).round() as u64;
-    scaled.max(5_000)
+    // The 5000 floor is right for a large window but wrong for a small one: a
+    // 12K window cannot offer 5K of reclaimable mass without folding most of
+    // itself, so the floor turned every small-window pressure nudge into a
+    // permanent refusal. Cap the floor at a fraction of the window instead.
+    let ceiling = (window / 4).max(1);
+    scaled.max(5_000).min(ceiling).max(1)
 }
 
 /// What "growth" is measured against.

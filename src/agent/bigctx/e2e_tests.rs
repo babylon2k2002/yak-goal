@@ -440,22 +440,42 @@ fn a_pressured_session_nudges_and_the_nudge_reaches_the_view() {
         "the nudge must carry the summary rules"
     );
 
-    // And injecting it changes the tail, not the head.
+    // And injecting it changes only the last user message. In this fixture that
+    // is also the first one (a single task message at the head), so the check
+    // is "the nudge lands on the last user message", not "the head is
+    // untouched" — with a longer history the head really would be untouched,
+    // and `inject_nudge` walks from the end to guarantee that.
     let mut view = view;
-    let head_before = view.first().cloned();
+    let before: Vec<Msg> = view.clone();
     crate::agent::session::inject_nudge(&mut view, &nudge);
-    assert_eq!(view.first().cloned(), head_before, "the head is the cached prefix");
-    let last_user = view
+    let changed: Vec<usize> = before
         .iter()
-        .rev()
-        .find_map(|m| match m {
-            Msg::User { text, .. } => Some(text.clone()),
-            _ => None,
-        })
+        .zip(view.iter())
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        changed.len(),
+        1,
+        "exactly one message may change: {changed:?}"
+    );
+    let last_user_index = view
+        .iter()
+        .rposition(|m| matches!(m, Msg::User { .. }))
         .expect("a user message exists");
+    assert_eq!(
+        changed[0], last_user_index,
+        "the nudge rides the last user message, not the head"
+    );
     assert!(
-        last_user.contains("compress("),
-        "the nudge rides the last user message: {last_user}"
+        view.iter()
+            .filter_map(|m| match m {
+                Msg::User { text, .. } => Some(text),
+                _ => None,
+            })
+            .any(|t| t.contains("compress(")),
+        "the nudge text reached the view"
     );
 }
 
