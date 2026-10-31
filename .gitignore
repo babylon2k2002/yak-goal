@@ -30,3 +30,4 @@ Thumbs.db
 
 # local scratch the tools above are allowed to make
 /tmp/
+dist-download/
