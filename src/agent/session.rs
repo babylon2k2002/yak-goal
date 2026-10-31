@@ -30,6 +30,7 @@ fn agent_opts<'a>(
     cache_anchor: Option<usize>,
     cache_ttl: Option<crate::providers::CacheTtl>,
     goal: Option<&crate::agent::goal::GoalRuntime>,
+    bigctx: crate::agent::bigctx::BigctxHandle,
 ) -> AgentOptions<'a> {
     AgentOptions {
         max_request_bytes,
@@ -43,6 +44,7 @@ fn agent_opts<'a>(
         cache_anchor,
         cache_ttl,
         goal: goal.cloned(),
+        bigctx: Some(bigctx),
     }
 }
 

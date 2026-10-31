@@ -136,7 +136,7 @@ pub fn hide_consumed_compress_calls(
     let mut hidden = 0usize;
     let mut hidden_orphan_refs: Vec<String> = Vec::new();
 
-    let mut remember = |message: &CoreMessage, hidden_orphan_refs: &mut Vec<String>| {
+    let remember = |message: &CoreMessage, hidden_orphan_refs: &mut Vec<String>| {
         let fate = message
             .tool_call_id
             .as_deref()

@@ -134,7 +134,7 @@ fn ref_number(reference: &str) -> Option<u64> {
 pub fn build_context_ranges(
     messages: &[CoreMessage],
     state: &CompressionState,
-    config: &BigctxConfig,
+    _config: &BigctxConfig,
     protection: &Protection,
 ) -> ContextRanges {
     let covered = covered_message_ids(state);
