@@ -180,7 +180,10 @@ pub fn bigctx_view_with_nudge(
     // Render the nudge the decision asked for. This runs even with no block
     // yet: a session that has never compressed still needs to be told it
     // *could*, or it never starts.
-    let ranges = crate::agent::bigctx::screen(&turn.messages, &turn.state, &config);
+    // Same array class the pipeline screened: the projection, not the pruned
+    // view. Rendering a nudge from a view would list refs the model cannot see
+    // and omit the ones it can.
+    let ranges = crate::agent::bigctx::screen(&projection.messages, &turn.state, &config);
     let nudge = crate::agent::bigctx::render_nudge(&turn.nudge, &ranges, &turn.state, &config)
         .map(|rendered| rendered.text);
 

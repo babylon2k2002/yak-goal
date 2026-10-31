@@ -119,7 +119,12 @@ pub fn process_turn_at(
     // 6. nudge: does the model need telling? The pending mass is measured from
     //    the same screening the status tool reports, so the number in the nudge
     //    and the number in `acp_status` cannot disagree.
-    let ranges = crate::agent::bigctx::screen(&view, &next, config);
+    // Screened against the FULL array, not the pruned view. A folded message is
+    // gone from the view but still present here, and `screen` is what decides
+    // what may be folded next — running it on the view would only ever see what
+    // survived, so a session whose whole visible tail is protected reports
+    // "nothing compressible" even when most of the history is foldable.
+    let ranges = crate::agent::bigctx::screen(messages, &next, config);
     let tier1_pending = ranges.compressible_tokens();
     let mut next = next;
     let nudge = crate::agent::bigctx::decide_nudge(
