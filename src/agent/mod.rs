@@ -379,26 +379,43 @@ pub fn run_agent(
             // same payload and store it again — the placeholder would never
             // stabilise and the refs the model was told about would drift.
             //
-            // Only placeholders are written back. Folding and pruning stay
-            // view-only: they decide what to send, not what was said.
-            for message in &view {
-                let crate::agent::Msg::ToolResult {
-                    call_id, content, ..
-                } = message
-                else {
-                    continue;
-                };
-                if !content.contains(crate::agent::bigctx::ccr::STORED_PLACEHOLDER_MARKER) {
-                    continue;
-                }
-                if let Some(stored) = history.iter_mut().find(|m| {
-                    matches!(
-                        m,
-                        crate::agent::Msg::ToolResult { call_id: id, .. } if id == call_id
-                    )
-                }) && let crate::agent::Msg::ToolResult { content: slot, .. } = stored
-                {
-                    *slot = content.clone();
+            // The match is on CONTENT, not on call id: two tool calls in one
+            // round can carry the same id, and `find` would then write one
+            // message's placeholder over another's. Writing back only when the
+            // slot still holds the exact text the store recorded makes that
+            // corruption impossible.
+            if let Some(store) = opts.ccr_store.as_ref()
+                && let Ok(store) = store.lock()
+            {
+                for message in &view {
+                    let crate::agent::Msg::ToolResult {
+                        call_id, content, ..
+                    } = message
+                    else {
+                        continue;
+                    };
+                    let Some(parsed) =
+                        crate::agent::bigctx::parse_placeholder(content)
+                    else {
+                        continue;
+                    };
+                    let Some(original) = store.original(&parsed.reference) else {
+                        continue;
+                    };
+                    for slot in history.iter_mut() {
+                        let crate::agent::Msg::ToolResult {
+                            call_id: id,
+                            content: text,
+                            ..
+                        } = slot
+                        else {
+                            continue;
+                        };
+                        if id == call_id && text == original {
+                            *text = content.clone();
+                            break;
+                        }
+                    }
                 }
             }
 
