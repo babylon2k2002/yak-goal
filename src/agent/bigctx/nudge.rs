@@ -482,17 +482,37 @@ mod first_sight_tests {
         assert!(!decision.inject);
     }
 
+    /// The growth gate governs the band between `min` and `max` usage. Above
+    /// `max` the pressure path deliberately skips it: waiting for growth when
+    /// the context is already at its ceiling is waiting for a refusal.
     #[test]
-    fn the_growth_gate_still_applies_after_a_nudge() {
-        let mut config = default_config(12_000);
-        config.model_context_limit = 12_000;
+    fn the_growth_gate_applies_inside_the_band() {
+        let mut config = default_config(100_000);
+        config.model_context_limit = 100_000;
         let mut state = create_initial_state();
-        let first = decide_nudge(&state, &config, 9_000, [3_237, 0, 0]);
-        assert!(first.inject);
-        stamp_nudge(&mut state, &first, 9_000);
 
-        // same size, no growth: silent
-        let again = decide_nudge(&state, &config, 9_000, [3_237, 0, 0]);
+        // 50% used: inside the band (45%–75%)
+        let first = decide_nudge(&state, &config, 50_000, [10_000, 0, 0]);
+        assert!(first.inject, "reason: {}", first.reason);
+        stamp_nudge(&mut state, &first, 50_000);
+
+        let again = decide_nudge(&state, &config, 50_000, [10_000, 0, 0]);
         assert!(!again.inject, "an unthrottled nudge is paid every round");
+    }
+
+    #[test]
+    fn the_pressure_path_ignores_growth_on_purpose() {
+        // At 90% the context is at its ceiling; waiting for another 20K of
+        // growth before speaking would mean speaking only after the provider
+        // has already refused.
+        let mut config = default_config(100_000);
+        config.model_context_limit = 100_000;
+        let mut state = create_initial_state();
+        let first = decide_nudge(&state, &config, 90_000, [10_000, 0, 0]);
+        assert!(first.inject);
+        stamp_nudge(&mut state, &first, 90_000);
+
+        let again = decide_nudge(&state, &config, 90_000, [10_000, 0, 0]);
+        assert!(again.inject, "pressure outranks the growth cadence");
     }
 }
