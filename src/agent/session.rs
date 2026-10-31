@@ -364,9 +364,7 @@ pub fn bigctx_round_view(
 }
 
 impl Session {
-
-
-/// A resumed thread can already be over the window. Project its
+    /// A resumed thread can already be over the window. Project its
     /// oversized tool results down before the first request — the very cut
     /// the loop's own prune would make at the first turn end, only silent, so
     /// resuming a big thread does not repeat that notice turn after turn. A
