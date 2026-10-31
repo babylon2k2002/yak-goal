@@ -17,8 +17,7 @@ use crate::agent::bigctx::recommend::ContextRanges;
 use crate::agent::bigctx::state::covered_message_ids;
 use crate::agent::bigctx::tokenize::{count_message_tokens, default_count_tokens};
 use crate::agent::bigctx::types::{
-    CompressionBlock, CompressionState, CoreMessage, MessageContentType, MessageRole, Tier,
-    base_id_of,
+    CompressionState, CoreMessage, MessageContentType, MessageRole, Tier, base_id_of,
 };
 
 /// `1500` → `1.5K`. A report that itself costs tokens is a poor trade.

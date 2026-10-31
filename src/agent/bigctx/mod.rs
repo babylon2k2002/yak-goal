@@ -54,7 +54,7 @@ pub mod types;
 // unused-import warning on every build.
 pub use boundaries::resolve_boundaries;
 pub use compress::{apply_compression, decompress_block};
-pub use config::{BigctxConfig, default_config};
+pub use config::{BigctxConfig, config_from_json, default_config};
 pub use crush::{CrushResult, crush_tool_results};
 pub use hide_consumed::hide_consumed_compress_calls;
 pub use host::{IdScheme, project, render};
