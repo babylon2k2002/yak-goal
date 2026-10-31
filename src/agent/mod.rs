@@ -335,13 +335,6 @@ pub fn run_agent(
             if let Some(user) = pending.as_ref() {
                 round_view.push(user.clone());
             }
-            if std::env::var("YAK_BIGCTX_DEBUG").is_ok() {
-                eprintln!(
-                    "[bigctx] round {turn}: view={} msgs, overrides={}",
-                    round_view.len(),
-                    opts.bigctx_config.is_some()
-                );
-            }
             handle.set(crate::agent::session::bigctx_turn(
                 &round_view,
                 handle.with(|s| s.state.clone()).as_ref(),

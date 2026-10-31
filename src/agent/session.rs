@@ -234,10 +234,26 @@ pub fn bigctx_turn(
         first_slot: 0,
     };
     let projection = crate::agent::bigctx::project(seed, scheme);
+
+    // Refs are what a range is cited BY, and `screen` skips every message
+    // without one — so a state that never assigned refs reports "nothing
+    // compressible" no matter how much foldable history there is. The pipeline
+    // assigns them on its own pass; the tools need the same map, and a tool
+    // call happens before that pass runs.
+    let mut state = state
+        .cloned()
+        .unwrap_or_else(crate::agent::bigctx::create_initial_state);
+    let mut next_index = state.next_ref_index;
+    let _ = crate::agent::bigctx::assign_refs(
+        &projection.messages,
+        &mut state.message_refs,
+        &mut next_index,
+        |_| false,
+    );
+    state.next_ref_index = next_index;
+
     crate::agent::bigctx::BigctxSession {
-        state: state
-            .cloned()
-            .unwrap_or_else(crate::agent::bigctx::create_initial_state),
+        state,
         messages: projection.messages,
         config: crate::agent::bigctx::config_from_json(window.unwrap_or(200_000), overrides),
     }
