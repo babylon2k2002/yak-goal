@@ -443,7 +443,9 @@ mod budget_tests {
     fn a_budget_that_fits_several_messages_protects_several() {
         let mut config = default_config(200_000);
         config.preserve_recent_messages = 0;
-        config.preserve_recent_tokens = 2_500;
+        // Each message is 250 tokens, so a 600-token budget covers three of
+        // them — a partial window over six.
+        config.preserve_recent_tokens = 600;
 
         // Plain user messages, not tool results: pair symmetry would pull a
         // result's matching call in and protect the whole run, which is a
