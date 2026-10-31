@@ -58,6 +58,24 @@ pub const RETRIEVE_INLINE_TOKENS: u64 = 4_000;
 /// How much of the payload's opening survives into the placeholder.
 pub const MAX_HEAD_CHARS: usize = 96;
 
+/// Tools whose output must never be stored.
+///
+/// The compression tools report on the compression itself. Storing their output
+/// makes the report unreadable exactly when it matters — `acp_status` answers
+/// "what is in the context?" and would then answer with a placeholder. It also
+/// feeds back: every status call would be a new oversized result.
+pub const NEVER_STORE_TOOLS: [&str; 4] = ["acp_status", "compress", "decompress", "acp_retrieve"];
+
+/// True when a tool's output is exempt from storing.
+pub fn is_never_stored(tool_name: Option<&str>) -> bool {
+    let Some(name) = tool_name else {
+        return false;
+    };
+    NEVER_STORE_TOOLS
+        .iter()
+        .any(|t| name.eq_ignore_ascii_case(t))
+}
+
 /// What kind of output a tool produces, for the placeholder's label.
 pub fn classify_kind(tool_name: Option<&str>) -> String {
     let Some(name) = tool_name else {
@@ -334,6 +352,10 @@ pub fn project(
 
     for message in messages {
         if message.content_type != MessageContentType::ToolResult {
+            result.messages.push(message.clone());
+            continue;
+        }
+        if is_never_stored(message.tool_name.as_deref()) {
             result.messages.push(message.clone());
             continue;
         }
@@ -686,6 +708,21 @@ mod tests {
             placeholder,
             "the same bytes, or the prefix cache breaks"
         );
+    }
+
+    #[test]
+    fn a_compression_tool_result_is_never_stored() {
+        // Storing acp_status' own output makes the report unreadable exactly
+        // when it matters, and feeds back: every call would be a new oversized
+        // result.
+        for tool in NEVER_STORE_TOOLS {
+            let messages = vec![user("go"), result("t1.1", &bulk(20_000), tool)];
+            let mut state = state_for(&messages);
+            let mut store = ContentStore::new();
+            let out = project(&messages, &mut state, &mut store, 4_000);
+            assert_eq!(out.stored, 0, "{tool} must not be stored");
+            assert!(store.is_empty());
+        }
     }
 
     #[test]
