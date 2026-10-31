@@ -2925,9 +2925,12 @@ mod tests {
             session.bigctx_round,
             None,
         );
+        // The text carries a citation prefix by the time it reaches the wire
+        // (`<acp ...>m00001</acp>`), so match on the body rather than on equality:
+        // what matters is that the task statement survived the fold.
         assert!(
             view.iter()
-                .any(|m| matches!(m, Msg::User { text, .. } if text == "the task")),
+                .any(|m| matches!(m, Msg::User { text, .. } if text.contains("the task"))),
             "the pinned first user message must stay visible; view={view:?}"
         );
     }

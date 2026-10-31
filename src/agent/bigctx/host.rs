@@ -304,16 +304,6 @@ pub fn render(view: &[CoreMessage], projection: &Projection) -> Vec<Msg> {
         // still resolves to the original — honouring its text there would
         // replace the pinned task statement with the summary.
         let rewritten = core.text_or_empty();
-        if std::env::var("YAK_RENDER_DEBUG").is_ok() {
-            eprintln!(
-                "[render] core={} base={} is_summary={} rewritten={:?} original={:?}",
-                core.id,
-                base,
-                crate::agent::bigctx::prune::is_rendered_summary(core),
-                &rewritten[..rewritten.len().min(40)],
-                &original_text(original)[..original_text(original).len().min(40)]
-            );
-        }
         if core.id == base && rewritten != original_text(original) {
             out.push(replace_text(original, rewritten));
         } else {
