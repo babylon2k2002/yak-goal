@@ -416,7 +416,9 @@ fn the_tools_refuse_to_run_without_a_session() {
 #[test]
 fn a_pressured_session_nudges_and_the_nudge_reaches_the_view() {
     let history = history_with_bulk();
-    let window = 20_000u64; // small, so the fixture is genuinely over the band
+    // The fixture is ~8.6K tokens, so the window has to be well under it for
+    // the session to be over the band (nudges start at 45% by default).
+    let window = 12_000u64;
 
     let (view, _state) = crate::agent::session::bigctx_view_with_nudge(
         &history,
