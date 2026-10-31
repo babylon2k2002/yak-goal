@@ -132,6 +132,79 @@ pub struct CrushConfig {
 /// truncate at 95%. `model_context_limit` is the only argument because every
 /// other value is a fraction of it or an absolute token count that does not
 /// scale with the model.
+/// Apply `agent.bigctx` overrides onto the defaults.
+///
+/// Every key is optional and unknown keys are ignored, so a partial object is
+/// always safe. The defaults are sized for a 128k–200k window; a smaller window
+/// or a test session needs its own numbers, and without this there was no way
+/// to give it any — the config was hardcoded at every call site.
+pub fn config_from_json(
+    model_context_limit: u64,
+    overrides: Option<&serde_json::Value>,
+) -> BigctxConfig {
+    let mut config = default_config(model_context_limit);
+    let Some(object) = overrides.and_then(|v| v.as_object()) else {
+        return config;
+    };
+
+    let u64_at = |key: &str| object.get(key).and_then(serde_json::Value::as_u64);
+    let f64_at = |key: &str| object.get(key).and_then(serde_json::Value::as_f64);
+    let bool_at = |key: &str| object.get(key).and_then(serde_json::Value::as_bool);
+
+    if let Some(n) = u64_at("preserve_recent_messages") {
+        config.preserve_recent_messages = n as usize;
+    }
+    if let Some(n) = u64_at("preserve_recent_tokens") {
+        config.preserve_recent_tokens = n;
+    }
+    if let Some(n) = u64_at("promotion_threshold") {
+        config.promotion_threshold = n as u32;
+    }
+    if let Some(n) = u64_at("min_range_tokens") {
+        config.compress.min_range_tokens = n;
+    }
+    if let Some(n) = u64_at("min_summary_tokens") {
+        config.compress.min_summary_tokens = n;
+    }
+    if let Some(n) = u64_at("max_summary_tokens") {
+        config.compress.max_summary_tokens = n;
+    }
+    if let Some(on) = bool_at("tiers_enabled") {
+        config.tiers.enabled = on;
+    }
+    if let Some(on) = bool_at("crush_enabled") {
+        config.crush.enabled = on;
+    }
+    if let Some(r) = f64_at("crush_min_reduction") {
+        config.crush.min_reduction = r;
+    }
+    if let Some(r) = f64_at("truncate_threshold") {
+        config.truncate.threshold = r;
+    }
+    if let Some(on) = bool_at("nudge_enabled") {
+        config.nudge.enabled = on;
+    }
+    if let Some(r) = f64_at("nudge_min_pct") {
+        config.nudge.min_context_limit_pct = r;
+    }
+    if let Some(r) = f64_at("nudge_max_pct") {
+        config.nudge.max_context_limit_pct = r;
+    }
+    if let Some(n) = u64_at("nudge_growth_floor") {
+        config.nudge.min_growth_floor = n;
+    }
+    if let Some(n) = u64_at("nudge_growth_cap") {
+        config.nudge.growth_cap = n;
+    }
+    if let Some(list) = object.get("protected_tools").and_then(|v| v.as_array()) {
+        config.protected_tools = list
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+    }
+    config
+}
+
 pub fn default_config(model_context_limit: u64) -> BigctxConfig {
     BigctxConfig {
         model_context_limit,

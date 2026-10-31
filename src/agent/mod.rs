@@ -133,6 +133,9 @@ pub struct AgentOptions<'a> {
     /// would show the tools the previous task's history — on the first task of
     /// a session, nothing at all.
     pub bigctx: Option<crate::agent::bigctx::BigctxHandle>,
+    /// `agent.bigctx` from config.json, so the tools quote the same
+    /// thresholds the pipeline applies.
+    pub bigctx_config: Option<serde_json::Value>,
     /// opaque id sent with every request so a multi-replica gateway routes
     /// one conversation to the same backend; automatic prefix caching is
     /// per-replica, so without it a round-robin hop re-bills the whole
@@ -337,6 +340,7 @@ pub fn run_agent(
                 handle.with(|s| s.state.clone()).as_ref(),
                 turn as u64,
                 model.context_window,
+                opts.bigctx_config.as_ref(),
             ));
         }
         opts.hooks.fire("turn_start", &json!({"turn": turn}));

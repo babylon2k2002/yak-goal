@@ -13,6 +13,10 @@ pub struct AgentSettings {
     /// the auto-compaction trigger in tokens, used only when the model's
     /// context window is unknown (a known window anchors the trigger at
     /// `window - reserve`, see `compact::effective_trigger`)
+    /// `agent.bigctx`: the reversible-compression tunables. Absent means the
+    /// built-in defaults, which are sized for a 128k–200k window; a small
+    /// window or a test session needs its own.
+    pub bigctx: Option<serde_json::Value>,
     pub compact_at_tokens: Option<u64>,
     pub keep_recent_tokens: Option<u64>,
     /// ceiling on one serialized request body, in bytes; a gateway in front of
@@ -93,6 +97,7 @@ pub fn parse(raw: &str) -> AgentSettings {
     let Some(agent) = value.get("agent") else {
         return s;
     };
+    s.bigctx = agent.get("bigctx").cloned().filter(|v| v.is_object());
     s.compact_at_tokens = agent.get("compact_at_tokens").and_then(|v| v.as_u64());
     s.keep_recent_tokens = agent.get("keep_recent_tokens").and_then(|v| v.as_u64());
     s.max_request_bytes = agent

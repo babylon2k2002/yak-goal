@@ -31,6 +31,7 @@ fn agent_opts<'a>(
     cache_ttl: Option<crate::providers::CacheTtl>,
     goal: Option<&crate::agent::goal::GoalRuntime>,
     bigctx: crate::agent::bigctx::BigctxHandle,
+    bigctx_config: Option<serde_json::Value>,
 ) -> AgentOptions<'a> {
     AgentOptions {
         max_request_bytes,
@@ -45,6 +46,7 @@ fn agent_opts<'a>(
         cache_ttl,
         goal: goal.cloned(),
         bigctx: Some(bigctx),
+        bigctx_config,
     }
 }
 
@@ -122,6 +124,9 @@ pub struct Session {
     /// with them because a tool runs on the tool thread while the state belongs
     /// to the session.
     pub bigctx_handle: crate::agent::bigctx::BigctxHandle,
+    /// `agent.bigctx` from config.json: the compression tunables. None means
+    /// the built-in defaults, which are sized for a 128k–200k window.
+    pub bigctx_config: Option<serde_json::Value>,
 }
 
 /// Project a history through the reversible-compression pipeline.
@@ -139,7 +144,7 @@ pub fn bigctx_view(
     round: u64,
     window: Option<u64>,
 ) -> (Vec<Msg>, Option<crate::agent::bigctx::CompressionState>) {
-    bigctx_view_with_nudge(seed, state, round, window).0
+    bigctx_view_with_nudge(seed, state, round, window, None).0
 }
 
 /// As [`bigctx_view`], also returning the nudge text to inject.
@@ -153,6 +158,7 @@ pub fn bigctx_view_with_nudge(
     state: Option<&crate::agent::bigctx::CompressionState>,
     round: u64,
     window: Option<u64>,
+    overrides: Option<&serde_json::Value>,
 ) -> (
     (Vec<Msg>, Option<crate::agent::bigctx::CompressionState>),
     Option<String>,
@@ -166,7 +172,8 @@ pub fn bigctx_view_with_nudge(
         first_slot: 0,
     };
     let projection = crate::agent::bigctx::project(seed, scheme);
-    let config = crate::agent::bigctx::default_config(window.unwrap_or(200_000));
+    let config =
+        crate::agent::bigctx::config_from_json(window.unwrap_or(200_000), overrides);
     let current = state
         .cloned()
         .unwrap_or_else(crate::agent::bigctx::create_initial_state);
@@ -220,6 +227,7 @@ pub fn bigctx_turn(
     state: Option<&crate::agent::bigctx::CompressionState>,
     round: u64,
     window: Option<u64>,
+    overrides: Option<&serde_json::Value>,
 ) -> crate::agent::bigctx::BigctxSession {
     let scheme = crate::agent::bigctx::IdScheme {
         round: round.max(1),
@@ -231,7 +239,7 @@ pub fn bigctx_turn(
             .cloned()
             .unwrap_or_else(crate::agent::bigctx::create_initial_state),
         messages: projection.messages,
-        config: crate::agent::bigctx::default_config(window.unwrap_or(200_000)),
+        config: crate::agent::bigctx::config_from_json(window.unwrap_or(200_000), overrides),
     }
 }
 
@@ -338,6 +346,7 @@ impl Session {
             self.cache_ttl,
             self.goal.as_ref(),
             self.bigctx_handle.clone(),
+            self.bigctx_config.clone(),
         );
         let model_id = model.model_id.clone();
         // the shared TaskView owns the answer stream, spinner, thinking
@@ -447,6 +456,7 @@ impl Session {
             self.bigctx.as_ref(),
             self.bigctx_round,
             self.model.as_ref().and_then(|m| m.context_window),
+            self.bigctx_config.as_ref(),
         );
         // The nudge rides the tail of the view: the head is the provider's
         // cached prefix, and rewriting it would cost a full cache miss.
@@ -783,6 +793,7 @@ impl Session {
             self.cache_ttl,
             self.goal.as_ref(),
             self.bigctx_handle.clone(),
+            self.bigctx_config.clone(),
         );
         let model_id = model.model_id.clone();
         let view = std::cell::RefCell::new(crate::term::render::TaskView::new(2, &model_id, true));
@@ -879,6 +890,7 @@ impl Session {
             self.cache_ttl,
             self.goal.as_ref(),
             self.bigctx_handle.clone(),
+            self.bigctx_config.clone(),
         );
         // the terminal path renders the reasoning trace through TaskView;
         // here it is only carried into the stored turn
@@ -899,6 +911,7 @@ impl Session {
             self.bigctx.as_ref(),
             self.bigctx_round,
             self.model.as_ref().and_then(|m| m.context_window),
+            self.bigctx_config.as_ref(),
         );
         // The nudge rides the tail of the view: the head is the provider's
         // cached prefix, and rewriting it would cost a full cache miss.
@@ -1520,6 +1533,7 @@ mod tests {
             bigctx: None,
             bigctx_round: 1,
             bigctx_handle: crate::agent::bigctx::BigctxHandle::new(),
+            bigctx_config: None,
         }
     }
 
@@ -1689,6 +1703,7 @@ mod tests {
             bigctx: None,
             bigctx_round: 1,
             bigctx_handle: crate::agent::bigctx::BigctxHandle::new(),
+            bigctx_config: None,
         };
         let (_outcome, _) = session
             .run_task("list the files", vec![])
@@ -1957,6 +1972,7 @@ mod tests {
             bigctx: None,
             bigctx_round: 1,
             bigctx_handle: crate::agent::bigctx::BigctxHandle::new(),
+            bigctx_config: None,
         };
         let history = vec![
             Msg::user("write the docs"),
@@ -2036,6 +2052,7 @@ mod tests {
             bigctx: None,
             bigctx_round: 1,
             bigctx_handle: crate::agent::bigctx::BigctxHandle::new(),
+            bigctx_config: None,
         };
         // a store whose directory vanishes after opening: append_turn cannot
         // create the thread file (ENOENT), which is exactly the shape of a
