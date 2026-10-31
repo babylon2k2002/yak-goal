@@ -119,12 +119,6 @@ pub fn process_turn_with_store(
             reprojected: 0,
         }
     };
-    if std::env::var("YAK_BIGCTX_DEBUG").is_ok() {
-        eprintln!(
-            "[bigctx] ccr result: stored={} reprojected={}",
-            ccr.stored, ccr.reprojected
-        );
-    }
     let messages = &ccr.messages[..];
     if ccr.stored > 0 || ccr.reprojected > 0 {
         sync_refs(&mut next, messages, &protection);

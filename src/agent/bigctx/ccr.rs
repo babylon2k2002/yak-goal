@@ -343,9 +343,6 @@ pub fn project(
             continue;
         }
         let Some(reference) = state.message_refs.ref_for(&message.id) else {
-            if std::env::var("YAK_BIGCTX_DEBUG").is_ok() {
-                eprintln!("[ccr] skip {}: no ref", message.id);
-            }
             result.messages.push(message.clone());
             continue;
         };
@@ -358,15 +355,6 @@ pub fn project(
         // A stored ref whose raw bytes came back: re-project the frozen
         // placeholder instead of leaking the payload onto the wire.
         if let Some(entry) = store.entry(&reference) {
-            if std::env::var("YAK_BIGCTX_DEBUG").is_ok() {
-                let matches = store.original(&reference) == Some(text);
-                eprintln!(
-                    "[ccr] reproject {} ref={} stored_raw_id={} call={} same_text={} text_head={:?} stored_head={:?}",
-                    message.id, reference, entry.raw_id, message.tool_call_id.as_deref().unwrap_or("-"), matches,
-                    &text[..text.len().min(60)],
-                    &store.original(&reference).unwrap_or("")[..store.original(&reference).map(|o| o.len().min(60)).unwrap_or(0)]
-                );
-            }
             let title = entry.command.as_deref().or(Some(entry.head.as_str()));
             let placeholder = build_placeholder(&reference, &entry.kind, entry.tokens, title);
             result.reprojected += 1;
@@ -378,9 +366,6 @@ pub fn project(
         }
 
         let tokens = count_message_tokens(message);
-        if std::env::var("YAK_BIGCTX_DEBUG").is_ok() {
-            eprintln!("[ccr] {} ref={} tokens={}", message.id, reference, tokens);
-        }
         if tokens < min_tokens {
             result.messages.push(message.clone());
             continue;
