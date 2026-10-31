@@ -142,6 +142,8 @@ pub struct AgentOptions<'a> {
     /// Where to record each round's usage and each fold, when the caller wants
     /// a cache report. None means the accounting is not collected.
     pub cache_ledger: Option<crate::agent::bigctx::CacheLedger>,
+    /// The CCR store, so a placeholder the model sees is retrievable.
+    pub ccr_store: Option<std::sync::Arc<std::sync::Mutex<crate::agent::bigctx::ContentStore>>>,
     /// opaque id sent with every request so a multi-replica gateway routes
     /// one conversation to the same backend; automatic prefix caching is
     /// per-replica, so without it a round-robin hop re-bills the whole
@@ -355,6 +357,7 @@ pub fn run_agent(
                 model.context_window,
                 opts.bigctx_config.as_ref(),
                 opts.cache_ledger.as_ref(),
+                opts.ccr_store.as_ref(),
             ));
 
             // The nudge is evaluated HERE, per round, because this is where the

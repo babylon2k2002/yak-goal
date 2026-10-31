@@ -24,6 +24,7 @@
 
 pub mod boundaries;
 pub mod cache_report;
+pub mod ccr;
 pub mod compress;
 pub mod config;
 pub mod crush;
@@ -55,6 +56,10 @@ pub mod types;
 // re-export nobody calls is a name that rots silently and shows up as an
 // unused-import warning on every build.
 pub use boundaries::resolve_boundaries;
+pub use ccr::{
+    ContentStore, CcrResult, RETRIEVE_TOOL_NAME, parse_placeholder, project as ccr_project,
+    retrieve as ccr_retrieve,
+};
 pub use cache_report::{
     CacheLedger, CacheReport, CacheSample, FoldEvent, build_cache_report, render_cache_report,
 };
@@ -65,7 +70,7 @@ pub use hide_consumed::hide_consumed_compress_calls;
 pub use host::{IdScheme, project, render};
 pub use nudge::{NudgeDecision, decide_nudge, reset_after_compression, stamp_nudge};
 pub use nudge_text::render_nudge;
-pub use pipeline::{process_turn, process_turn_at};
+pub use pipeline::{process_turn, process_turn_with_store};
 pub use protected::{Protection, compute_protection};
 pub use prune::{PruneOptions, prune};
 pub use recommend::{ContextRanges, screen};

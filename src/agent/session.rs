@@ -34,6 +34,7 @@ fn agent_opts<'a>(
     bigctx_config: Option<serde_json::Value>,
     bigctx_round: u64,
     cache_ledger: crate::agent::bigctx::CacheLedger,
+    ccr_store: Option<std::sync::Arc<std::sync::Mutex<crate::agent::bigctx::ContentStore>>>,
 ) -> AgentOptions<'a> {
     AgentOptions {
         max_request_bytes,
@@ -51,6 +52,7 @@ fn agent_opts<'a>(
         bigctx_config,
         bigctx_round,
         cache_ledger: Some(cache_ledger),
+        ccr_store,
     }
 }
 
@@ -134,6 +136,9 @@ pub struct Session {
     /// Cache accounting for the session, so `/status` can say what the folds
     /// actually cost. Shared with the loop and the tools.
     pub cache_ledger: crate::agent::bigctx::CacheLedger,
+    /// Originals kept out of the context (CCR). Shared with the tools so a
+    /// placeholder the model sees is retrievable through the same store.
+    pub ccr_store: std::sync::Arc<std::sync::Mutex<crate::agent::bigctx::ContentStore>>,
 }
 
 /// Project a history through the reversible-compression pipeline.
@@ -151,7 +156,7 @@ pub fn bigctx_view(
     round: u64,
     window: Option<u64>,
 ) -> (Vec<Msg>, Option<crate::agent::bigctx::CompressionState>) {
-    bigctx_view_with_nudge(seed, state, round, window, None).0
+    bigctx_view_with_nudge(seed, state, round, window, None, None).0
 }
 
 /// As [`bigctx_view`], also returning the nudge text to inject.
@@ -166,6 +171,7 @@ pub fn bigctx_view_with_nudge(
     round: u64,
     window: Option<u64>,
     overrides: Option<&serde_json::Value>,
+    mut store: Option<&mut crate::agent::bigctx::ContentStore>,
 ) -> (
     (Vec<Msg>, Option<crate::agent::bigctx::CompressionState>),
     Option<String>,
@@ -190,7 +196,13 @@ pub fn bigctx_view_with_nudge(
     // /status shows.
     let token_count = crate::agent::compact::estimate_tokens(seed, None);
     let turn =
-        crate::agent::bigctx::process_turn_at(&projection.messages, &current, &config, token_count);
+        crate::agent::bigctx::process_turn_with_store(
+            &projection.messages,
+            &current,
+            &config,
+            token_count,
+            store.as_deref_mut(),
+        );
     let view = crate::agent::bigctx::render(&turn.messages, &projection);
 
     // Render the nudge the decision asked for. This runs even with no block
@@ -265,6 +277,7 @@ pub fn bigctx_turn(
     window: Option<u64>,
     overrides: Option<&serde_json::Value>,
     ledger: Option<&crate::agent::bigctx::CacheLedger>,
+    store: Option<&std::sync::Arc<std::sync::Mutex<crate::agent::bigctx::ContentStore>>>,
 ) -> crate::agent::bigctx::BigctxSession {
     let scheme = crate::agent::bigctx::IdScheme {
         round: round.max(1),
@@ -294,6 +307,10 @@ pub fn bigctx_turn(
         messages: projection.messages,
         config: crate::agent::bigctx::config_from_json(window.unwrap_or(200_000), overrides),
         ledger: ledger.cloned(),
+        // The store outlives a round: a placeholder the model saw last turn
+        // must still be retrievable this turn, so the shared cell is handed
+        // over rather than a fresh empty one.
+        store: store.cloned(),
     }
 }
 
@@ -403,6 +420,7 @@ impl Session {
             self.bigctx_config.clone(),
             self.bigctx_round,
             self.cache_ledger.clone(),
+            Some(self.ccr_store.clone()),
         );
         let model_id = model.model_id.clone();
         // the shared TaskView owns the answer stream, spinner, thinking
@@ -513,6 +531,7 @@ impl Session {
             self.bigctx_round,
             self.model.as_ref().and_then(|m| m.context_window),
             self.bigctx_config.as_ref(),
+            None,
         );
         // The nudge rides the tail of the view: the head is the provider's
         // cached prefix, and rewriting it would cost a full cache miss.
@@ -852,6 +871,7 @@ impl Session {
             self.bigctx_config.clone(),
             self.bigctx_round,
             self.cache_ledger.clone(),
+            Some(self.ccr_store.clone()),
         );
         let model_id = model.model_id.clone();
         let view = std::cell::RefCell::new(crate::term::render::TaskView::new(2, &model_id, true));
@@ -951,6 +971,7 @@ impl Session {
             self.bigctx_config.clone(),
             self.bigctx_round,
             self.cache_ledger.clone(),
+            Some(self.ccr_store.clone()),
         );
         // the terminal path renders the reasoning trace through TaskView;
         // here it is only carried into the stored turn
@@ -972,6 +993,7 @@ impl Session {
             self.bigctx_round,
             self.model.as_ref().and_then(|m| m.context_window),
             self.bigctx_config.as_ref(),
+            None,
         );
         // The nudge rides the tail of the view: the head is the provider's
         // cached prefix, and rewriting it would cost a full cache miss.
@@ -1595,6 +1617,9 @@ mod tests {
             bigctx_handle: crate::agent::bigctx::BigctxHandle::new(),
             bigctx_config: None,
             cache_ledger: crate::agent::bigctx::CacheLedger::new(),
+        ccr_store: std::sync::Arc::new(std::sync::Mutex::new(
+            crate::agent::bigctx::ContentStore::new(),
+        )),
         }
     }
 
@@ -1766,6 +1791,9 @@ mod tests {
             bigctx_handle: crate::agent::bigctx::BigctxHandle::new(),
             bigctx_config: None,
             cache_ledger: crate::agent::bigctx::CacheLedger::new(),
+        ccr_store: std::sync::Arc::new(std::sync::Mutex::new(
+            crate::agent::bigctx::ContentStore::new(),
+        )),
         };
         let (_outcome, _) = session
             .run_task("list the files", vec![])
@@ -2036,6 +2064,9 @@ mod tests {
             bigctx_handle: crate::agent::bigctx::BigctxHandle::new(),
             bigctx_config: None,
             cache_ledger: crate::agent::bigctx::CacheLedger::new(),
+        ccr_store: std::sync::Arc::new(std::sync::Mutex::new(
+            crate::agent::bigctx::ContentStore::new(),
+        )),
         };
         let history = vec![
             Msg::user("write the docs"),
@@ -2117,6 +2148,9 @@ mod tests {
             bigctx_handle: crate::agent::bigctx::BigctxHandle::new(),
             bigctx_config: None,
             cache_ledger: crate::agent::bigctx::CacheLedger::new(),
+        ccr_store: std::sync::Arc::new(std::sync::Mutex::new(
+            crate::agent::bigctx::ContentStore::new(),
+        )),
         };
         // a store whose directory vanishes after opening: append_turn cannot
         // create the thread file (ENOENT), which is exactly the shape of a

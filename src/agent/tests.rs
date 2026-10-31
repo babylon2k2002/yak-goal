@@ -199,6 +199,7 @@ fn test_opts() -> AgentOptions<'static> {
         bigctx_config: None,
         bigctx_round: 1,
         cache_ledger: None,
+        ccr_store: None,
     }
 }
 

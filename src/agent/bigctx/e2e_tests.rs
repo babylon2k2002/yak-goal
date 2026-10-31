@@ -52,6 +52,7 @@ fn test_opts() -> AgentOptions<'static> {
         bigctx_config: None,
         bigctx_round: 1,
         cache_ledger: None,
+        ccr_store: None,
     }
 }
 
@@ -152,6 +153,7 @@ fn bigctx_session(history: &[Msg]) -> BigctxSession {
         messages: projection.messages,
         config,
         ledger: None,
+        store: None,
     }
 }
 

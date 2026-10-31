@@ -42,6 +42,10 @@ pub struct BigctxSession {
     /// Where a fold records itself for the cache accounting. None when the
     /// caller did not ask for a report.
     pub ledger: Option<crate::agent::bigctx::CacheLedger>,
+    /// Originals kept out of the context, retrievable by ref. Shared with the
+    /// pipeline: a placeholder the model sees must be retrievable through the
+    /// same store, and the store must survive across rounds.
+    pub store: Option<std::sync::Arc<std::sync::Mutex<crate::agent::bigctx::ContentStore>>>,
 }
 
 impl BigctxHandle {
@@ -624,6 +628,7 @@ pub fn bigctx_tools(handle: BigctxHandle) -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(CompressTool::new(handle.clone())),
         Box::new(DecompressTool::new(handle.clone())),
+        Box::new(RetrieveTool::new(handle.clone())),
         Box::new(StatusTool::new(handle)),
     ]
 }
@@ -657,6 +662,7 @@ mod tests {
             messages,
             config,
             ledger: None,
+            store: None,
         }
     }
 
@@ -921,7 +927,10 @@ mod tests {
         handle.set(session_with(vec![user("t1.0", "a")]));
         let tools = bigctx_tools(handle.clone());
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert_eq!(names, vec!["compress", "decompress", "acp_status"]);
+        assert_eq!(
+            names,
+            vec!["compress", "decompress", "acp_retrieve", "acp_status"]
+        );
     }
 
     #[test]
@@ -931,5 +940,173 @@ mod tests {
         handle.clear();
         let out = run(&StatusTool::new(handle.clone()), json!({}));
         assert!(out.error.is_some());
+    }
+}
+
+// ─── acp_retrieve ────────────────────────────────────────────────────────────
+
+/// The `acp_retrieve` tool: pull a stored original back by ref.
+///
+/// This is the other half of the placeholder. Without it a stored result is
+/// simply gone from the model's point of view, and it would have to guess.
+pub struct RetrieveTool {
+    handle: BigctxHandle,
+}
+
+impl RetrieveTool {
+    pub fn new(handle: BigctxHandle) -> RetrieveTool {
+        RetrieveTool { handle }
+    }
+}
+
+impl Tool for RetrieveTool {
+    fn name(&self) -> &str {
+        crate::agent::bigctx::ccr::RETRIEVE_TOOL_NAME
+    }
+    fn tier(&self) -> Tier {
+        Tier::Read
+    }
+    fn description(&self) -> &str {
+        "Retrieve the full text of a stored tool result. Placeholders like \
+         `📦 [acp-stored #m00042 · file read · 40,120 tok]` mark results that were kept out of the \
+         context to save space; call this with the ref to read one back. Large originals return \
+         a pointer instead of the payload."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "ref": {
+                    "type": "string",
+                    "description": "The ref from the placeholder, e.g. m00042"
+                }
+            },
+            "required": ["ref"]
+        })
+    }
+    fn preview(&self, args: &Value) -> String {
+        format!("retrieve {}", args["ref"].as_str().unwrap_or("?"))
+    }
+    fn execute(&self, args: &Value, _cwd: &Path, _log: &mut dyn FnMut(ToolProgress)) -> ToolOutput {
+        let raw = args["ref"].as_str().unwrap_or("").trim();
+        let Some(reference) = normalize_ref(raw) else {
+            return ToolOutput::err(format!(
+                "retrieve: \"{raw}\" is not a ref. Use the mNNNNN from the placeholder."
+            ));
+        };
+
+        let Some(result) = self.handle.with(|session| {
+            let store = session.store.as_ref()?.lock().ok()?;
+            crate::agent::bigctx::ccr::retrieve(
+                &store,
+                &reference,
+                crate::agent::bigctx::ccr::RETRIEVE_INLINE_TOKENS,
+            )
+        }) else {
+            return ToolOutput::err(NO_SESSION);
+        };
+
+        match result {
+            Some(got) => ToolOutput::ok(got.text),
+            None => ToolOutput::err(format!(
+                "retrieve: nothing is stored under {reference}. It may never have been stored, \
+                 or the ref is from another session — the placeholders in the conversation name \
+                 the ones that exist."
+            )),
+        }
+    }
+}
+
+/// Normalise a ref: `m42`, `M42`, `m00042` all become `m00042`.
+fn normalize_ref(raw: &str) -> Option<String> {
+    let lowered = raw.trim().to_ascii_lowercase();
+    let digits = lowered.strip_prefix('m')?;
+    if digits.is_empty() || digits.len() > 9 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let number: u64 = digits.parse().ok()?;
+    (number > 0).then(|| format!("m{number:05}"))
+}
+
+#[cfg(test)]
+mod retrieve_tests {
+    use super::*;
+
+    fn session_with_store() -> BigctxSession {
+        let messages = vec![CoreMessage::new(
+            "t1.0",
+            crate::agent::bigctx::types::MessageRole::Tool,
+            crate::agent::bigctx::types::MessageContentType::ToolResult,
+        )
+        .with_text("body")
+        .with_tool("read", "c1")];
+        let mut config = crate::agent::bigctx::default_config(200_000);
+        config.preserve_recent_messages = 0;
+        config.preserve_recent_tokens = 0;
+        let mut state = crate::agent::bigctx::create_initial_state();
+        let mut next = 1u64;
+        crate::agent::bigctx::assign_refs(&messages, &mut state.message_refs, &mut next, |_| false)
+            .unwrap();
+        state.next_ref_index = next;
+        BigctxSession {
+            state,
+            messages,
+            config,
+            ledger: None,
+            store: None,
+        }
+    }
+
+    fn run(tool: &dyn Tool, args: Value) -> ToolOutput {
+        let mut log = |_: ToolProgress| {};
+        tool.execute(&args, Path::new("."), &mut log)
+    }
+
+    #[test]
+    fn refs_are_normalised() {
+        assert_eq!(normalize_ref("m42").as_deref(), Some("m00042"));
+        assert_eq!(normalize_ref("M42").as_deref(), Some("m00042"));
+        assert_eq!(normalize_ref("m00042").as_deref(), Some("m00042"));
+        assert_eq!(normalize_ref("x42"), None);
+        assert_eq!(normalize_ref("m"), None);
+        assert_eq!(normalize_ref("m0"), None);
+    }
+
+    #[test]
+    fn an_unknown_ref_says_so() {
+        let handle = BigctxHandle::new();
+        handle.set(session_with_store());
+        let out = run(&RetrieveTool::new(handle), json!({"ref": "m00001"}));
+        assert!(out.error.is_some());
+        assert!(out.content.contains("nothing is stored"), "{}", out.content);
+    }
+
+    #[test]
+    fn a_bad_ref_is_refused() {
+        let handle = BigctxHandle::new();
+        handle.set(session_with_store());
+        let out = run(&RetrieveTool::new(handle), json!({"ref": "nonsense"}));
+        assert!(out.error.is_some());
+        assert!(out.content.contains("not a ref"));
+    }
+
+    #[test]
+    fn a_stored_original_comes_back() {
+        let handle = BigctxHandle::new();
+        let mut session = session_with_store();
+        session
+            .store
+            .store("m00001", "t1.0", "the full body", "file read", Some("read"), 100, "the", None);
+        handle.set(session);
+        let out = run(&RetrieveTool::new(handle), json!({"ref": "m00001"}));
+        assert!(out.error.is_none(), "{}", out.content);
+        assert_eq!(out.content, "the full body");
+    }
+
+    #[test]
+    fn retrieve_without_a_session_says_so() {
+        let out = run(&RetrieveTool::new(BigctxHandle::new()), json!({"ref": "m00001"}));
+        assert!(out.error.is_some());
+        assert!(out.content.contains("No conversation"));
     }
 }

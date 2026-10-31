@@ -51,6 +51,8 @@ pub struct TurnResult {
     /// How many payloads the last-resort truncation cut, and why it may have
     /// cut none when the session is over its window.
     pub truncated: crate::agent::bigctx::TruncateResult,
+    /// Tool results stored out of the context, and placeholders re-projected.
+    pub ccr: crate::agent::bigctx::CcrResult,
 }
 
 /// Run one pass over `messages`.
@@ -63,17 +65,18 @@ pub fn process_turn(
     state: &CompressionState,
     config: &BigctxConfig,
 ) -> TurnResult {
-    process_turn_at(messages, state, config, 0)
+    process_turn_with_store(messages, state, config, 0, None)
 }
 
 /// As [`process_turn`], with the current token count so the nudge can judge
-/// pressure. A caller that does not know the size passes 0 and gets no nudge
-/// rather than a wrong one.
-pub fn process_turn_at(
+/// pressure, and a content store for oversized tool results. A caller that does
+/// not know the size passes 0 and gets no nudge rather than a wrong one.
+pub fn process_turn_with_store(
     messages: &[CoreMessage],
     state: &CompressionState,
     config: &BigctxConfig,
     token_count: u64,
+    store: Option<&mut crate::agent::bigctx::ContentStore>,
 ) -> TurnResult {
     // 0. Crush oversized tool results first. It has to happen before pruning:
     //    once a result is folded into a summary its text is gone, and a crush
@@ -107,6 +110,28 @@ pub fn process_turn_at(
             ..Default::default()
         },
     );
+
+    // 3a-bis. Content-cached retrieval: keep oversized tool results out of the
+    //     context without losing them. Runs before prune so the placeholder is
+    //     what gets folded or carried, and at arrival so the bytes are frozen
+    //     the first time — a placeholder that changed per turn would move the
+    //     prefix and invalidate the cache it exists to protect.
+    let ccr = if let Some(store) = store {
+        let projected = crate::agent::bigctx::ccr::project(
+            messages,
+            &mut next,
+            store,
+            crate::agent::bigctx::ccr::MIN_TOOL_TOKENS,
+        );
+        projected
+    } else {
+        crate::agent::bigctx::CcrResult {
+            messages: messages.to_vec(),
+            stored: 0,
+            reprojected: 0,
+        }
+    };
+    let messages = &ccr.messages[..];
 
     // 3b. Hide compress calls whose blocks are gone, and stub the summaries a
     //     live call repeats. A long session otherwise pays for the receipts:
@@ -175,6 +200,7 @@ pub fn process_turn_at(
         nudge,
         crushed: crushed.crushed,
         truncated,
+        ccr,
     }
 }
 
