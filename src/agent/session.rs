@@ -2701,7 +2701,30 @@ mod tests {
             None,
         );
         assert_eq!(view, seed, "nothing folded means nothing to project");
-        assert!(state.is_none(), "and no state is created");
+        // A state IS created now, and that is deliberate: the nudge needs the
+        // refs to tell the model what it could compress, and a session that has
+        // never compressed is exactly the one that needs telling. The view is
+        // still byte-identical, which is the property that costs tokens.
+        assert!(
+            state.is_some(),
+            "a state is built so the nudge can cite refs"
+        );
+    }
+
+    #[test]
+    fn an_unfolded_view_is_byte_identical_to_the_history() {
+        // The property that actually matters: a session that has not folded
+        // anything pays nothing in the request, whatever state is kept beside
+        // it.
+        let seed = vec![Msg::user("a"), Msg::assistant("b")];
+        let session = tight_session(seed.clone());
+        let (view, _) = bigctx_view(
+            &session.seed,
+            session.bigctx.as_ref(),
+            session.bigctx_round,
+            None,
+        );
+        assert_eq!(view, seed);
     }
 
     #[test]
