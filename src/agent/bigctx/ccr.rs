@@ -388,6 +388,15 @@ pub fn project(
         }
 
         let tokens = count_message_tokens(message);
+        if std::env::var("YAK_CCR_DEBUG").is_ok() {
+            eprintln!(
+                "[ccr] {} tool={:?} tokens={} min={}",
+                message.id,
+                message.tool_name.as_deref(),
+                tokens,
+                min_tokens
+            );
+        }
         if tokens < min_tokens {
             result.messages.push(message.clone());
             continue;
