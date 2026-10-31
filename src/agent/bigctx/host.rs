@@ -290,9 +290,39 @@ pub fn render(view: &[CoreMessage], projection: &Projection) -> Vec<Msg> {
             // does, dropping it is safer than inventing a message.
             continue;
         };
-        out.push(original.clone());
+
+        // A node may have rewritten the core's text — a CCR placeholder, a
+        // crush cut — and that rewrite is the whole point of running the
+        // pipeline. Emitting the original would silently undo it.
+        let rewritten = core.text_or_empty();
+        if rewritten != original_text(original) {
+            out.push(replace_text(original, rewritten));
+        } else {
+            out.push(original.clone());
+        }
     }
 
+    out
+}
+
+
+/// The text a host message carries, for comparing against a rewritten core.
+fn original_text(message: &Msg) -> &str {
+    match message {
+        Msg::User { text, .. } | Msg::Assistant { text, .. } => text,
+        Msg::ToolResult { content, .. } => content,
+        Msg::Summary { text } => text,
+    }
+}
+
+/// A copy of `message` carrying different text.
+fn replace_text(message: &Msg, text: &str) -> Msg {
+    let mut out = message.clone();
+    match &mut out {
+        Msg::User { text: t, .. } | Msg::Assistant { text: t, .. } => *t = text.to_string(),
+        Msg::ToolResult { content, .. } => *content = text.to_string(),
+        Msg::Summary { text: t } => *t = text.to_string(),
+    }
     out
 }
 
