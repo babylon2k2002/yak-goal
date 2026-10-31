@@ -116,14 +116,15 @@ pub fn process_turn_with_store(
     //     what gets folded or carried, and at arrival so the bytes are frozen
     //     the first time — a placeholder that changed per turn would move the
     //     prefix and invalidate the cache it exists to protect.
-    let ccr = if let Some(store) = store {
-        let projected = crate::agent::bigctx::ccr::project(
+    let ccr = if config.ccr.enabled
+        && let Some(store) = store
+    {
+        crate::agent::bigctx::ccr::project(
             messages,
             &mut next,
             store,
-            crate::agent::bigctx::ccr::MIN_TOOL_TOKENS,
-        );
-        projected
+            config.ccr.min_tool_tokens,
+        )
     } else {
         crate::agent::bigctx::CcrResult {
             messages: messages.to_vec(),

@@ -112,6 +112,20 @@ pub struct BigctxConfig {
     /// Passes a block must survive before it counts as `Old` (tier-2 signal).
     pub promotion_threshold: u32,
     pub crush: CrushConfig,
+    pub ccr: CcrConfig,
+}
+
+/// Content-cached retrieval: keeping oversized tool results out of the context.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CcrConfig {
+    /// On by default: unlike crush, a placeholder is reversible (the original
+    /// is stored and retrievable), so the risk of turning it on is a round
+    /// trip, not lost data.
+    pub enabled: bool,
+    /// A tool result at or above this many tokens is stored rather than kept.
+    pub min_tool_tokens: u64,
+    /// Above this, retrieval returns a pointer instead of inlining.
+    pub retrieve_inline_tokens: u64,
 }
 
 /// Deterministic compression of oversized tool results.
@@ -177,6 +191,15 @@ pub fn config_from_json(
     }
     if let Some(r) = f64_at("crush_min_reduction") {
         config.crush.min_reduction = r;
+    }
+    if let Some(on) = bool_at("ccr_enabled") {
+        config.ccr.enabled = on;
+    }
+    if let Some(n) = u64_at("ccr_min_tool_tokens") {
+        config.ccr.min_tool_tokens = n;
+    }
+    if let Some(n) = u64_at("ccr_retrieve_inline_tokens") {
+        config.ccr.retrieve_inline_tokens = n;
     }
     if let Some(r) = f64_at("truncate_threshold") {
         config.truncate.threshold = r;
@@ -248,6 +271,11 @@ pub fn default_config(model_context_limit: u64) -> BigctxConfig {
         crush: CrushConfig {
             enabled: false,
             min_reduction: 0.1,
+        },
+        ccr: CcrConfig {
+            enabled: true,
+            min_tool_tokens: 4_000,
+            retrieve_inline_tokens: 4_000,
         },
     }
 }

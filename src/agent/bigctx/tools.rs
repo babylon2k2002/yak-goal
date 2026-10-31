@@ -1000,7 +1000,7 @@ impl Tool for RetrieveTool {
             crate::agent::bigctx::ccr::retrieve(
                 &store,
                 &reference,
-                crate::agent::bigctx::ccr::RETRIEVE_INLINE_TOKENS,
+                session.config.ccr.retrieve_inline_tokens,
             )
         }) else {
             return ToolOutput::err(NO_SESSION);
