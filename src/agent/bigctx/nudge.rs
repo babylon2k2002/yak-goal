@@ -204,13 +204,17 @@ pub fn decide_nudge(
 
 /// Minimum reclaimable mass for a pressure-band nudge to be worth injecting.
 fn min_pressure_benefit(window: u64, config: &BigctxConfig) -> u64 {
+    // Purely proportional to the window, with a small absolute floor.
+    //
+    // An absolute 5000 floor looked reasonable and was not: on a 40K window it
+    // demanded 12.5% of the context be reclaimable before speaking, which a
+    // session that has read eight files does not offer — measured, six
+    // consecutive rounds refused with "only 1520 tokens are reclaimable (need
+    // 5000)". The floor exists to stop a nudge that would save nothing, not to
+    // demand a fifth of the window.
     let scaled = (window as f64 * config.nudge.min_pressure_benefit_ratio).round() as u64;
-    // The 5000 floor is right for a large window but wrong for a small one: a
-    // 12K window cannot offer 5K of reclaimable mass without folding most of
-    // itself, so the floor turned every small-window pressure nudge into a
-    // permanent refusal. Cap the floor at a fraction of the window instead.
-    let ceiling = (window / 4).max(1);
-    scaled.max(5_000).min(ceiling).max(1)
+    let floor = 1_000.min(window / 10).max(1);
+    scaled.max(floor).max(1)
 }
 
 /// What "growth" is measured against.
@@ -514,5 +518,55 @@ mod first_sight_tests {
 
         let again = decide_nudge(&state, &config, 90_000, [10_000, 0, 0]);
         assert!(again.inject, "pressure outranks the growth cadence");
+    }
+}
+
+#[cfg(test)]
+mod pressure_threshold_tests {
+    use super::*;
+    use crate::agent::bigctx::config::default_config;
+    use crate::agent::bigctx::state::create_initial_state;
+
+    /// The threshold has to be a fraction of the window, not an absolute token
+    /// count.
+    ///
+    /// Regression: a fixed 5000 floor demanded 12.5% of a 40K context be
+    /// reclaimable before nudging. Measured on a real session: six consecutive
+    /// rounds refused with "only 1520 tokens are reclaimable (need 5000)",
+    /// while 1520 tokens was a perfectly foldable range.
+    #[test]
+    fn a_forty_k_window_nudges_on_a_small_reclaimable_range() {
+        let mut config = default_config(40_000);
+        config.model_context_limit = 40_000;
+        config.nudge.min_context_limit_pct = 0.05;
+        config.nudge.max_context_limit_pct = 0.10;
+        let state = create_initial_state();
+
+        // 8% used, 1520 reclaimable — the shape the real session had
+        let decision = decide_nudge(&state, &config, 3_200, [1_520, 0, 0]);
+        assert!(decision.inject, "reason: {}", decision.reason);
+    }
+
+    #[test]
+    fn a_large_window_still_demands_a_proportional_mass() {
+        let mut config = default_config(200_000);
+        config.model_context_limit = 200_000;
+        let state = create_initial_state();
+        // 1% of 200K is 2000; 500 is below it
+        let decision = decide_nudge(&state, &config, 190_000, [500, 0, 0]);
+        assert!(!decision.inject, "reason: {}", decision.reason);
+    }
+
+    #[test]
+    fn the_threshold_never_exceeds_a_tenth_of_the_window() {
+        // A floor larger than the window would make nudging impossible.
+        for window in [1_000u64, 5_000, 12_000, 40_000, 1_000_000] {
+            let config = default_config(window);
+            let threshold = min_pressure_benefit(window, &config);
+            assert!(
+                threshold <= (window / 10).max(1) || threshold <= 1_000,
+                "window {window}: threshold {threshold}"
+            );
+        }
     }
 }
