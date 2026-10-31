@@ -306,6 +306,8 @@ pub fn run_agent(
     // that a model stuck repeating itself cannot burn tokens forever
     const MAX_ROUNDS: usize = 500;
     let mut turn = 0;
+    // The nudge text for the round about to be sent, if this round earned one.
+    let mut round_nudge_text: Option<String> = None;
     loop {
         turn += 1;
         if turn > MAX_ROUNDS {
@@ -342,13 +344,30 @@ pub fn run_agent(
             // Two different numbers mint two different id sets for the same
             // messages, and then the refs acp_status prints are not the refs
             // compress can resolve.
+            let round_state = handle.with(|s| s.state.clone());
             handle.set(crate::agent::session::bigctx_turn(
                 &round_view,
-                handle.with(|s| s.state.clone()).as_ref(),
+                round_state.as_ref(),
                 opts.bigctx_round,
                 model.context_window,
                 opts.bigctx_config.as_ref(),
             ));
+
+            // The nudge is evaluated HERE, per round, because this is where the
+            // context actually grows. Evaluated once per task it could never
+            // fire: a task starts near-empty and the growth happens inside the
+            // loop.
+            if let Some(state) = round_state.as_ref()
+                && let Some(text) = crate::agent::session::round_nudge(
+                    &round_view,
+                    state,
+                    opts.bigctx_round,
+                    model.context_window,
+                    opts.bigctx_config.as_ref(),
+                )
+            {
+                round_nudge_text = Some(text);
+            }
         }
         opts.hooks.fire("turn_start", &json!({"turn": turn}));
         if let Some(Msg::User { text, attachments }) = pending.as_ref() {
@@ -435,11 +454,18 @@ pub fn run_agent(
         // of the request, and providers cache by input prefix (DeepSeek
         // context caching, Anthropic prompt caching), so any per-turn suffix
         // here re-bills the whole history at cache-miss price
+        // The nudge prefixes this round's prompt, not the history: the history
+        // is the provider's cached prefix and rewriting it would cost a full
+        // cache miss on every round the nudge appears.
+        let nudged_prompt: String = match round_nudge_text.take() {
+            Some(text) => format!("{text}\n\n---\n\n{pending_prompt}"),
+            None => pending_prompt.to_string(),
+        };
         let input = PromptInput {
             max_request_bytes: opts.max_request_bytes,
             system: opts.system,
             history: &history,
-            prompt: pending_prompt,
+            prompt: &nudged_prompt,
             attachments: pending_attachments,
             tools: &tool_defs,
             reasoning: opts.reasoning.as_deref(),

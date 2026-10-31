@@ -207,6 +207,42 @@ pub fn bigctx_view_with_nudge(
     ((view, Some(turn.state)), nudge)
 }
 
+/// Decide and render a nudge for one round of a running task.
+///
+/// Separate from [`bigctx_view_with_nudge`] because that runs once per TASK,
+/// and a task's context grows across its rounds — the growth the nudge exists
+/// to catch happens inside `run_agent`, so evaluating it outside meant a nudge
+/// could never fire during the one task it was meant to help.
+pub fn round_nudge(
+    history: &[Msg],
+    state: &crate::agent::bigctx::CompressionState,
+    round: u64,
+    window: Option<u64>,
+    overrides: Option<&serde_json::Value>,
+) -> Option<String> {
+    let scheme = crate::agent::bigctx::IdScheme {
+        round: round.max(1),
+        first_slot: 0,
+    };
+    let projection = crate::agent::bigctx::project(history, scheme);
+    let config = crate::agent::bigctx::config_from_json(window.unwrap_or(200_000), overrides);
+    let token_count = crate::agent::compact::estimate_tokens(history, None);
+
+    let ranges = crate::agent::bigctx::screen(&projection.messages, state, &config);
+    let pending = ranges.compressible_tokens();
+    let decision = crate::agent::bigctx::decide_nudge(state, &config, token_count, [pending, 0, 0]);
+
+    if std::env::var("YAK_BIGCTX_DEBUG").is_ok() {
+        eprintln!(
+            "[bigctx] round {round}: inject={} tokens={} window={} pending={} reason={}",
+            decision.inject, token_count, config.model_context_limit, pending, decision.reason
+        );
+    }
+
+    crate::agent::bigctx::render_nudge(&decision, &ranges, state, &config)
+        .map(|rendered| rendered.text)
+}
+
 /// Prepend a nudge to the last user message of a view.
 ///
 /// The nudge rides the *tail*, not the head: the head of the request is the
