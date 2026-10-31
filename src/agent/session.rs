@@ -314,8 +314,7 @@ pub fn bigctx_turn(
     }
 }
 
-impl Session {
-    /// Run the whole bigctx pipeline over a raw history and return what the round
+/// Run the whole bigctx pipeline over a raw history and return what the round
 /// should actually be sent, plus the state the tools should see.
 ///
 /// This is the loop-facing form of [`bigctx_view_with_nudge`]: it projects the
@@ -363,6 +362,8 @@ pub fn bigctx_round_view(
     );
     (view, turn.state, nudge)
 }
+
+impl Session {
 
 
 /// A resumed thread can already be over the window. Project its
