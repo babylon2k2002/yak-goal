@@ -354,6 +354,7 @@ pub fn run_agent(
                 opts.bigctx_round,
                 model.context_window,
                 opts.bigctx_config.as_ref(),
+                opts.cache_ledger.as_ref(),
             ));
 
             // The nudge is evaluated HERE, per round, because this is where the

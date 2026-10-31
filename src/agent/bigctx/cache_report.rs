@@ -377,7 +377,6 @@ pub fn render_cache_report(report: &CacheReport) -> String {
         t.hit_pct() as f64
     ));
 
-    let missed = t.input.saturating_sub(t.cached);
     out.push_str(&format!(
         "miss split: {} new content · {} compression repay ({:.0}% of the miss) · {} unattributed\n",
         format_tokens(t.new_content),

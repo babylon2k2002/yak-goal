@@ -656,6 +656,7 @@ mod tests {
             state,
             messages,
             config,
+            ledger: None,
         }
     }
 
