@@ -341,6 +341,13 @@ pub fn project(
         // A stored ref whose raw bytes came back: re-project the frozen
         // placeholder instead of leaking the payload onto the wire.
         if let Some(entry) = store.entry(&reference) {
+            if std::env::var("YAK_BIGCTX_DEBUG").is_ok() {
+                let matches = store.original(&reference) == Some(text);
+                eprintln!(
+                    "[ccr] reproject {} ref={} stored_raw_id={} same_text={}",
+                    message.id, reference, entry.raw_id, matches
+                );
+            }
             let title = entry.command.as_deref().or(Some(entry.head.as_str()));
             let placeholder = build_placeholder(&reference, &entry.kind, entry.tokens, title);
             result.reprojected += 1;
