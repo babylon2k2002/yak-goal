@@ -144,9 +144,8 @@ fn strip_ref_prefix(text: &str) -> &str {
     let Some(close) = rest.find("</acp>") else {
         return text;
     };
-    let after = &rest[close + "</acp>".len()..];
-    after.strip_prefix('
-').unwrap_or(after)
+    let after = &rest[close + 6..];
+    after.strip_prefix('\n').unwrap_or(after)
 }
 
 /// A parsed placeholder.
