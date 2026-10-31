@@ -197,6 +197,12 @@ pub fn bigctx_view_with_nudge(
     let ranges = crate::agent::bigctx::screen(&projection.messages, &turn.state, &config);
     let nudge = crate::agent::bigctx::render_nudge(&turn.nudge, &ranges, &turn.state, &config)
         .map(|rendered| rendered.text);
+    if std::env::var("YAK_BIGCTX_DEBUG").is_ok() {
+        eprintln!(
+            "[bigctx] view: inject={} tokens={} window={} reason={}",
+            turn.nudge.inject, token_count, config.model_context_limit, turn.nudge.reason
+        );
+    }
 
     ((view, Some(turn.state)), nudge)
 }
