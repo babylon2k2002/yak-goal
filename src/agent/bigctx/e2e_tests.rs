@@ -398,6 +398,7 @@ fn the_tools_refuse_to_run_without_a_session() {
                 "summary": "a summary long enough to clear the minimum size check"
             }]}),
             "decompress" => json!({"blockId": "b1"}),
+            "acp_retrieve" => json!({"ref": "m00001"}),
             _ => json!({}),
         };
         let out = tool.execute(&args, std::path::Path::new("."), &mut log);
