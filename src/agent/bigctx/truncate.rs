@@ -183,12 +183,12 @@ pub fn truncate_large_outputs(
 ///
 /// Largest first is the right order: the point is to reclaim a target, and one
 /// 40K payload reaches it where ten 4K ones each cost a marker.
-fn collect_candidates(
-    messages: &[CoreMessage],
+fn collect_candidates<'a>(
+    messages: &'a [CoreMessage],
     protected_from: usize,
     options: &TruncateOptions,
     predicate: impl Fn(&CoreMessage) -> bool,
-) -> Vec<&CoreMessage> {
+) -> Vec<&'a CoreMessage> {
     let mut found: Vec<&CoreMessage> = Vec::new();
     for message in messages.iter().take(protected_from) {
         if !predicate(message) {

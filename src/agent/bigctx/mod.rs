@@ -47,32 +47,22 @@ pub mod turn_integrity;
 pub mod truncate;
 pub mod types;
 
-pub use boundaries::{ResolvedRange, parse_boundary, resolve_boundaries};
-pub use compress::{CompressError, CompressOutcome, apply_compression, decompress_block};
+// Only the names the host actually reaches for are re-exported. The modules
+// are public, so anything else stays one `bigctx::<module>::` away — a
+// re-export nobody calls is a name that rots silently and shows up as an
+// unused-import warning on every build.
+pub use compress::{apply_compression, decompress_block};
 pub use config::{BigctxConfig, default_config};
-pub use crush::{
-    CrushKind, CrushOutput, CrushResult, CrushStrategy, crush, crush_json, crush_tool_results,
-};
-pub use hide_consumed::{HideResult, hide_consumed_compress_calls};
-pub use host::{IdScheme, Projection, project, render};
+pub use crush::crush_tool_results;
+pub use host::{IdScheme, project, render};
 pub use nudge::{NudgeDecision, decide_nudge, reset_after_compression, stamp_nudge};
-pub use nudge_text::{NudgeVoice, RenderedNudge, render_nudge};
-pub use rules::{DEFAULT_PROMPTS, Prompts};
-pub use pipeline::{TurnResult, process_turn, process_turn_at};
+pub use nudge_text::render_nudge;
+pub use pipeline::{process_turn, process_turn_at};
 pub use protected::{Protection, compute_protection};
-pub use prune::{PruneOptions, prune, summary_message_id};
-pub use recommend::{ContextRanges, CompressibleRange, ProtectedRange, build_context_ranges, screen};
-pub use refs::{assign_refs, empty_ref_map, index_to_ref, ref_to_index};
-pub use state::{
-    CompressionStateExt, active_blocks, allocate_block_id, allocate_run_id, block_by_id,
-    covered_message_ids, create_initial_state, highest_active_tier,
-};
-pub use sync::{SyncResult, advance_survival, sync_blocks};
-pub use tokenize::{count_message_tokens, default_count_tokens};
+pub use prune::{PruneOptions, prune};
+pub use recommend::{ContextRanges, screen};
+pub use refs::assign_refs;
+pub use state::{CompressionStateExt, create_initial_state};
 pub use tools::{BigctxHandle, BigctxSession, bigctx_tools};
 pub use truncate::{TruncateOptions, TruncateResult, truncate_large_outputs};
-pub use turn_integrity::{Withdrawals, turn_groups, withdrawals};
-pub use types::{
-    BlockGeneration, CompressionBlock, CompressionState, CompressionStats, CoreMessage,
-    MessageContentType, MessageRefMap, MessageRole, NudgeState, Tier,
-};
+pub use types::{CompressionState, CoreMessage, MessageContentType, MessageRole, Tier};
