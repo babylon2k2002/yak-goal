@@ -51,9 +51,11 @@ pub mod types;
 // are public, so anything else stays one `bigctx::<module>::` away — a
 // re-export nobody calls is a name that rots silently and shows up as an
 // unused-import warning on every build.
+pub use boundaries::resolve_boundaries;
 pub use compress::{apply_compression, decompress_block};
 pub use config::{BigctxConfig, default_config};
-pub use crush::crush_tool_results;
+pub use crush::{CrushResult, crush_tool_results};
+pub use hide_consumed::hide_consumed_compress_calls;
 pub use host::{IdScheme, project, render};
 pub use nudge::{NudgeDecision, decide_nudge, reset_after_compression, stamp_nudge};
 pub use nudge_text::render_nudge;
@@ -65,4 +67,7 @@ pub use refs::assign_refs;
 pub use state::{CompressionStateExt, create_initial_state};
 pub use tools::{BigctxHandle, BigctxSession, bigctx_tools};
 pub use truncate::{TruncateOptions, TruncateResult, truncate_large_outputs};
-pub use types::{CompressionState, CoreMessage, MessageContentType, MessageRole, Tier};
+pub use types::{
+    BlockGeneration, CompressionBlock, CompressionState, CoreMessage, MessageContentType,
+    MessageRole, Tier,
+};
