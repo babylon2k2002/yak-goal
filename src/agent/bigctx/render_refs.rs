@@ -76,7 +76,7 @@ fn acp_tag(reference: &str, tokens: u64, kind: &str) -> String {
 ///
 /// Only this message's own tag is removed: a message whose text legitimately
 /// starts with another ref's tag is content, not a stale render.
-fn strip_own_tag(text: &str, reference: &str) -> &str {
+fn strip_own_tag<'a>(text: &'a str, reference: &str) -> &'a str {
     let Some(rest) = text.strip_prefix("<acp ") else {
         return text;
     };
