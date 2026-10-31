@@ -567,42 +567,6 @@ impl Tool for StatusTool {
 fn render_status(session: &mut BigctxSession) -> String {
     // The report owns the rendering. Duplicating it here would give the model
     // and the user two descriptions of the same state that can disagree.
-    if std::env::var("YAK_BIGCTX_DEBUG").is_ok() {
-        let prot = crate::agent::bigctx::compute_protection(
-            &session.messages,
-            &session.state,
-            &session.config,
-        );
-        let with_refs = session
-            .messages
-            .iter()
-            .filter(|m| session.state.message_refs.ref_for(&m.id).is_some())
-            .count();
-        let protected = session
-            .messages
-            .iter()
-            .filter(|m| prot.is_protected(m))
-            .count();
-        eprintln!(
-            "[bigctx] status: msgs={} with_refs={} protected={} preserve_tok={} min_range={}",
-            session.messages.len(),
-            with_refs,
-            protected,
-            session.config.preserve_recent_tokens,
-            session.config.compress.min_range_tokens
-        );
-        for (i, m) in session.messages.iter().enumerate() {
-            let r = session.state.message_refs.ref_for(&m.id).unwrap_or("-");
-            let p = if prot.is_protected(m) { "P" } else { "." };
-            eprintln!(
-                "[bigctx]   {i:2} {p} {r:8} {:?}/{:?} {}tok call={:?}",
-                m.role,
-                m.content_type,
-                crate::agent::bigctx::tokenize::count_message_tokens(m),
-                m.tool_call_id
-            );
-        }
-    }
     let report = crate::agent::bigctx::build_report(
         &session.messages,
         &session.messages,
@@ -911,7 +875,7 @@ mod tests {
         let handle = BigctxHandle::new();
         handle.set(session_with(vec![user("t1.0", "a")]));
         let out = run(&StatusTool::new(handle.clone()), json!({}));
-        assert!(out.content.contains("No blocks"));
+        assert!(out.content.contains("compressed so far"));
     }
 
     #[test]

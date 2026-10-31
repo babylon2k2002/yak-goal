@@ -190,7 +190,17 @@ pub fn render_report(report: &Report) -> String {
     }
 
     if report.blocks.is_empty() {
-        out.push_str("\nNo blocks — nothing has been compressed this session.\n");
+        // Say what is true and what to do next. The old wording read as a
+        // contradiction next to a non-empty `compressible` list, and a model
+        // facing it looped on acp_status instead of calling compress.
+        if report.compressible.compressible.is_empty() {
+            out.push_str("\ncompressed so far: nothing.\n");
+        } else {
+            out.push_str(
+                "\ncompressed so far: nothing — this is a fresh session, and the ranges below \
+                 are still available to fold.\n",
+            );
+        }
     } else {
         out.push_str(&format!("\nblocks ({}):\n", report.blocks.len()));
         for block in &report.blocks {
@@ -516,7 +526,7 @@ mod tests {
         let messages = vec![user("t1.0", "hello")];
         let report = build_report(&messages, &messages, &create_initial_state(), &cfg(100_000));
         let text = render_report(&report);
-        assert!(text.contains("No blocks"));
+        assert!(text.contains("compressed so far: nothing"));
         assert!(text.contains("compressible"));
     }
 
