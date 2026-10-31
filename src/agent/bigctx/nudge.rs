@@ -155,10 +155,17 @@ pub fn decide_nudge(
     // A session that arrives already over the band — a resumed thread, a
     // restored state — has grown nothing this process has seen. Gating it on
     // growth would leave it sitting on a full window forever, so a first sight
-    // with real mass bypasses the gate.
+    // bypasses the gate.
+    //
+    // The bypass must NOT also require `best_pending >= growth`: that compares
+    // a reclaimable mass against a *window-scaled* growth step, and on any
+    // window below the 20K floor the step is 20K while a realistic pending is
+    // far smaller — so the condition was unsatisfiable exactly where a first
+    // nudge matters most. Requiring real mass (`> 0`) is the honest test, and
+    // the pressure gate below already refuses a nudge that offers nothing.
     let first_sight = state.nudge.last_nudge_shown_tokens == 0
         && state.nudge.baseline_tokens == 0
-        && best_pending >= growth;
+        && best_pending > 0;
     if !first_sight && grown < growth {
         return NudgeDecision::no(format!(
             "grown {grown} tokens since the last nudge (needs {growth})"
@@ -433,5 +440,54 @@ mod tests {
             state.nudge.baseline_tokens, 1_000,
             "the baseline is the session start, not the latest turn"
         );
+    }
+}
+
+#[cfg(test)]
+mod first_sight_tests {
+    use super::*;
+    use crate::agent::bigctx::config::default_config;
+    use crate::agent::bigctx::state::create_initial_state;
+
+    /// A first sight with any real mass must nudge, even when the mass is far
+    /// below the window-scaled growth step.
+    ///
+    /// Regression: the bypass required `pending >= growth`, which compares a
+    /// reclaimable mass against a step that is 20K on every window below the
+    /// floor — unsatisfiable on exactly the small windows where the first nudge
+    /// matters most, and the reason a pressured session produced no nudge at
+    /// all.
+    #[test]
+    fn a_first_sight_with_small_mass_still_nudges() {
+        let mut config = default_config(12_000);
+        config.model_context_limit = 12_000;
+        let state = create_initial_state();
+        // 75% used, 3.2K reclaimable — a realistic small-window shape
+        let decision = decide_nudge(&state, &config, 9_000, [3_237, 0, 0]);
+        assert!(decision.inject, "reason: {}", decision.reason);
+        assert_eq!(decision.tier, Some(Tier::One));
+    }
+
+    #[test]
+    fn a_first_sight_with_no_mass_still_refuses() {
+        let mut config = default_config(12_000);
+        config.model_context_limit = 12_000;
+        let state = create_initial_state();
+        let decision = decide_nudge(&state, &config, 9_000, [0, 0, 0]);
+        assert!(!decision.inject);
+    }
+
+    #[test]
+    fn the_growth_gate_still_applies_after_a_nudge() {
+        let mut config = default_config(12_000);
+        config.model_context_limit = 12_000;
+        let mut state = create_initial_state();
+        let first = decide_nudge(&state, &config, 9_000, [3_237, 0, 0]);
+        assert!(first.inject);
+        stamp_nudge(&mut state, &first, 9_000);
+
+        // same size, no growth: silent
+        let again = decide_nudge(&state, &config, 9_000, [3_237, 0, 0]);
+        assert!(!again.inject, "an unthrottled nudge is paid every round");
     }
 }

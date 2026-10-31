@@ -477,29 +477,3 @@ fn injecting_into_an_empty_view_is_a_no_op() {
     assert!(view.is_empty());
 }
 
-/// Diagnostic: print what each stage of the nudge path sees.
-#[test]
-fn diagnose_the_nudge_path() {
-    let history = history_with_bulk();
-    let window = 12_000u64;
-    let scheme = crate::agent::bigctx::IdScheme { round: 1, first_slot: 0 };
-    let projection = crate::agent::bigctx::project(&history, scheme);
-    let config = crate::agent::bigctx::default_config(window);
-    let mut state = crate::agent::bigctx::create_initial_state();
-    let mut next = 1u64;
-    crate::agent::bigctx::assign_refs(&projection.messages, &mut state.message_refs, &mut next, |_| false).unwrap();
-    state.next_ref_index = next;
-
-    let tokens = crate::agent::compact::estimate_tokens(&history, None);
-    let ranges = crate::agent::bigctx::screen(&projection.messages, &state, &config);
-    let decision = crate::agent::bigctx::decide_nudge(&state, &config, tokens, [ranges.compressible_tokens(), 0, 0]);
-
-    panic!(
-        "tokens={tokens} window={window} usage={:.2} compressible_ranges={} pending={} decision={:?} reason={}",
-        tokens as f64 / window as f64,
-        ranges.compressible.len(),
-        ranges.compressible_tokens(),
-        decision.inject,
-        decision.reason
-    );
-}
