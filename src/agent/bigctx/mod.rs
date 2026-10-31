@@ -44,6 +44,7 @@ pub mod tools;
 #[cfg(test)]
 mod e2e_tests;
 pub mod turn_integrity;
+pub mod truncate;
 pub mod types;
 
 pub use boundaries::{ResolvedRange, parse_boundary, resolve_boundaries};
@@ -69,6 +70,7 @@ pub use state::{
 pub use sync::{SyncResult, advance_survival, sync_blocks};
 pub use tokenize::{count_message_tokens, default_count_tokens};
 pub use tools::{BigctxHandle, BigctxSession, bigctx_tools};
+pub use truncate::{TruncateOptions, TruncateResult, truncate_large_outputs};
 pub use turn_integrity::{Withdrawals, turn_groups, withdrawals};
 pub use types::{
     BlockGeneration, CompressionBlock, CompressionState, CompressionStats, CoreMessage,

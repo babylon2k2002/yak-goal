@@ -48,6 +48,9 @@ pub struct TurnResult {
     pub nudge: crate::agent::bigctx::NudgeDecision,
     /// How many tool results were mechanically crushed this pass.
     pub crushed: usize,
+    /// How many payloads the last-resort truncation cut, and why it may have
+    /// cut none when the session is over its window.
+    pub truncated: crate::agent::bigctx::TruncateResult,
 }
 
 /// Run one pass over `messages`.
@@ -135,6 +138,21 @@ pub fn process_turn_at(
     );
     crate::agent::bigctx::stamp_nudge(&mut next, &nudge, token_count);
 
+    // 7. emergency truncate: the valve for a session that ignored the nudge.
+    //    Runs last because everything above is preferable — a fold keeps the
+    //    originals, a truncation does not. Only fires above the threshold.
+    let truncated = crate::agent::bigctx::truncate_large_outputs(
+        &view,
+        token_count,
+        config,
+        &crate::agent::bigctx::TruncateOptions {
+            protect_recent_messages: config.preserve_recent_messages,
+            include_text_messages: true,
+            ..Default::default()
+        },
+    );
+    let view = truncated.messages.clone();
+
     TurnResult {
         messages: view,
         state: next,
@@ -143,6 +161,7 @@ pub fn process_turn_at(
         withdrawals: gate,
         nudge,
         crushed: crushed.crushed,
+        truncated,
     }
 }
 
