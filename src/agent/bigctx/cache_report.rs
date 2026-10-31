@@ -313,8 +313,22 @@ pub fn build_cache_report(
         ..Default::default()
     };
 
+    // Folds waiting to be charged. A fold lands in the gap between two
+    // requests, so the first request after it pays the re-payment.
+    //
+    // `folds` carries each fold with the number of requests that followed it,
+    // which lets the timeline be reconstructed: fold k happened after
+    // `samples.len() - requests_after` requests.
     let mut pending: Vec<FoldEvent> = Vec::new();
     for (index, sample) in samples.iter().enumerate() {
+        // Everything folded before this request and not yet charged.
+        for (fold, requests_after, _) in folds {
+            let happened_before = samples.len().saturating_sub(*requests_after);
+            if happened_before == index {
+                pending.push(*fold);
+            }
+        }
+
         totals.input += sample.input;
         totals.cached += sample.cached;
         totals.output += sample.output;
