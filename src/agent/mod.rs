@@ -289,6 +289,8 @@ pub fn run_agent(
     // is edited in place, so a provider reading its own cache back never sees
     // a prefix that was rewritten under it.
     let mut cache_stable: Option<usize> = usable_anchor(opts.cache_anchor, history.len());
+    // The compressed view for the round being built, when bigctx is on.
+    let mut bigctx_view: Option<Vec<Msg>> = None;
     let mut final_text = String::new();
     let mut interrupted = false;
     // mid-stream drops recovered so far; the cap keeps a link that drops
@@ -335,6 +337,7 @@ pub fn run_agent(
         // seed was moved into `history` and is empty for the rest of the run, so
         // a handle filled before the loop would show the tools the previous
         // task's history — nothing at all on a session's first task.
+        bigctx_view = None;
         if let Some(handle) = opts.bigctx.as_ref() {
             // The prompt of the current round is still in `pending` — it joins
             // `history` only when the round's answer is pushed. A tool call
@@ -350,9 +353,39 @@ pub fn run_agent(
             // messages, and then the refs acp_status prints are not the refs
             // compress can resolve.
             let round_state = handle.with(|s| s.state.clone());
+
+            // Run the WHOLE pipeline here, not once before the task.
+            //
+            // The caller's view is built from `self.seed`, which is empty on a
+            // session's first task and holds only the previous task's history
+            // afterwards. A task's context grows across its own rounds, so every
+            // node — crush, CCR, prune, truncate, render-refs — was never
+            // running where the growth happens. Only the nudge had been moved
+            // into the loop.
+            let config = crate::agent::bigctx::config_from_json(
+                model.context_window.unwrap_or(200_000),
+                opts.bigctx_config.as_ref(),
+            );
+            let base_state = round_state
+                .clone()
+                .unwrap_or_else(crate::agent::bigctx::create_initial_state);
+            let token_count = crate::agent::compact::estimate_tokens(&round_view, None);
+            let mut store_guard = opts.ccr_store.as_ref().and_then(|s| s.lock().ok());
+            let turn = crate::agent::bigctx::process_turn_with_store(
+                &round_view,
+                &base_state,
+                &config,
+                token_count,
+                store_guard.as_deref_mut(),
+            );
+            drop(store_guard);
+
+            // What this round is actually sent. `history` stays the persistent
+            // record; the view is a projection of it.
+            bigctx_view = Some(turn.messages);
             handle.set(crate::agent::session::bigctx_turn(
                 &round_view,
-                round_state.as_ref(),
+                Some(&turn.state),
                 opts.bigctx_round,
                 model.context_window,
                 opts.bigctx_config.as_ref(),
@@ -360,19 +393,13 @@ pub fn run_agent(
                 opts.ccr_store.as_ref(),
             ));
 
-            // The nudge is evaluated HERE, per round, because this is where the
-            // context actually grows. Evaluated once per task it could never
-            // fire: a task starts near-empty and the growth happens inside the
-            // loop.
-            if let Some(state) = round_state.as_ref()
-                && let Some(text) = crate::agent::session::round_nudge(
-                    &round_view,
-                    state,
-                    opts.bigctx_round,
-                    model.context_window,
-                    opts.bigctx_config.as_ref(),
-                )
-            {
+            if let Some(text) = crate::agent::session::round_nudge(
+                &round_view,
+                &turn.state,
+                opts.bigctx_round,
+                model.context_window,
+                opts.bigctx_config.as_ref(),
+            ) {
                 round_nudge_text = Some(text);
             }
         }
@@ -471,7 +498,7 @@ pub fn run_agent(
         let input = PromptInput {
             max_request_bytes: opts.max_request_bytes,
             system: opts.system,
-            history: &history,
+            history: bigctx_view.as_deref().unwrap_or(&history),
             prompt: &nudged_prompt,
             attachments: pending_attachments,
             tools: &tool_defs,
