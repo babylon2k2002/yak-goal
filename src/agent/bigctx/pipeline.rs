@@ -116,6 +116,15 @@ pub fn process_turn_with_store(
     //     what gets folded or carried, and at arrival so the bytes are frozen
     //     the first time — a placeholder that changed per turn would move the
     //     prefix and invalidate the cache it exists to protect.
+    if std::env::var("YAK_BIGCTX_DEBUG").is_ok() {
+        eprintln!(
+            "[bigctx] ccr: enabled={} min_tokens={} store_present={} msgs={}",
+            config.ccr.enabled,
+            config.ccr.min_tool_tokens,
+            store.is_some(),
+            messages.len()
+        );
+    }
     let ccr = if config.ccr.enabled
         && let Some(store) = store
     {
