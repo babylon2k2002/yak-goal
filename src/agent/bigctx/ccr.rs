@@ -135,6 +135,20 @@ pub fn build_placeholder(reference: &str, kind: &str, tokens: u64, title: Option
     )
 }
 
+
+/// Drop a leading `<acp …>mNNNNN</acp>` citation prefix, when present.
+fn strip_ref_prefix(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix("<acp ") else {
+        return text;
+    };
+    let Some(close) = rest.find("</acp>") else {
+        return text;
+    };
+    let after = &rest[close + "</acp>".len()..];
+    after.strip_prefix('
+').unwrap_or(after)
+}
+
 /// A parsed placeholder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedPlaceholder {
@@ -149,7 +163,11 @@ pub struct ParsedPlaceholder {
 /// Strict on purpose: ordinary text that happens to mention `[acp-stored` must
 /// not be mistaken for one, or a payload would be replaced by a stub of itself.
 pub fn parse_placeholder(text: &str) -> Option<ParsedPlaceholder> {
-    let text = text.trim();
+    // render-refs prefixes every message with `<acp tokens="…" type="…">mNNNNN</acp>`
+    // so the model can cite it. A placeholder carries that prefix on every round
+    // after the first, and without stripping it here the placeholder would stop
+    // being recognised and be stored again as fresh content.
+    let text = strip_ref_prefix(text.trim());
     let rest = text.strip_prefix("📦 [acp-stored #")?;
     let (reference, rest) = rest.split_once(' ')?;
     if !reference.starts_with('m') || reference.len() < 6 {
@@ -506,6 +524,19 @@ mod tests {
     fn a_placeholder_names_the_retrieval_tool() {
         let placeholder = build_placeholder("m00042", "shell output", 1_000, None);
         assert!(placeholder.contains("acp_retrieve(\"m00042\")"));
+    }
+
+    #[test]
+    fn a_ref_prefixed_placeholder_is_still_recognised() {
+        // render-refs puts `<acp …>mNNNNN</acp>
+` in front of every message, so
+        // from the second round on a placeholder wears that prefix. Failing to
+        // see through it would re-store the placeholder as fresh content.
+        let placeholder = build_placeholder("m00042", "file read", 40_120, Some("a.rs"));
+        let prefixed = format!("<acp tokens=\"40,120\" type=\"read\">m00042</acp>
+{placeholder}");
+        let parsed = parse_placeholder(&prefixed).expect("must see through the prefix");
+        assert_eq!(parsed.reference, "m00042");
     }
 
     #[test]

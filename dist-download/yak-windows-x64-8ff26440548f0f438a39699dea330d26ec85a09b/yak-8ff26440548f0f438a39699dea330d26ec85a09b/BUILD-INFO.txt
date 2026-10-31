@@ -1,6 +1,0 @@
-built from : babylon2k2002/yak-goal
-commit     : 8ff26440548f0f438a39699dea330d26ec85a09b
-run        : https://github.com/babylon2k2002/yak-goal/actions/runs/41212463732
-toolchain  : stable
-tests      : false
-sha256     : b81b9d15b41f9e0e0f91a5f7de305d5b2db080e0555c098f95a72f68d03d86a5
