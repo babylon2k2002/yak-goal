@@ -567,6 +567,31 @@ impl Tool for StatusTool {
 fn render_status(session: &mut BigctxSession) -> String {
     // The report owns the rendering. Duplicating it here would give the model
     // and the user two descriptions of the same state that can disagree.
+    if std::env::var("YAK_BIGCTX_DEBUG").is_ok() {
+        let prot = crate::agent::bigctx::compute_protection(
+            &session.messages,
+            &session.state,
+            &session.config,
+        );
+        let with_refs = session
+            .messages
+            .iter()
+            .filter(|m| session.state.message_refs.ref_for(&m.id).is_some())
+            .count();
+        let protected = session
+            .messages
+            .iter()
+            .filter(|m| prot.is_protected(m))
+            .count();
+        eprintln!(
+            "[bigctx] status: msgs={} with_refs={} protected={} preserve_tok={} min_range={}",
+            session.messages.len(),
+            with_refs,
+            protected,
+            session.config.preserve_recent_tokens,
+            session.config.compress.min_range_tokens
+        );
+    }
     let report = crate::agent::bigctx::build_report(
         &session.messages,
         &session.messages,
