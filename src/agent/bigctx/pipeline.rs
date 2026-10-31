@@ -122,7 +122,9 @@ pub fn process_turn_with_store(
             config.ccr.enabled,
             config.ccr.min_tool_tokens,
             store.is_some(),
-            messages.len()
+            messages.len(),
+            0,
+            0
         );
     }
     let ccr = if config.ccr.enabled
@@ -141,6 +143,12 @@ pub fn process_turn_with_store(
             reprojected: 0,
         }
     };
+    if std::env::var("YAK_BIGCTX_DEBUG").is_ok() {
+        eprintln!(
+            "[bigctx] ccr result: stored={} reprojected={}",
+            ccr.stored, ccr.reprojected
+        );
+    }
     let messages = &ccr.messages[..];
 
     // 3b. Hide compress calls whose blocks are gone, and stub the summaries a
