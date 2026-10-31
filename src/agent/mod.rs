@@ -373,15 +373,35 @@ pub fn run_agent(
             );
             drop(store_guard);
 
-            // What this round is actually sent. `history` stays the persistent
-            // record; the view is a projection of it.
-            if std::env::var("YAK_BIGCTX_DEBUG").is_ok() {
-                for m in &view {
-                    if let crate::agent::Msg::ToolResult { content, .. } = m {
-                        eprintln!("[bigctx] view tool result: {:?}", &content[..content.len().min(90)]);
-                    }
+            // CCR replaces a tool result ONCE, at arrival, and the replacement
+            // has to become the stored message. Left only in the view, the next
+            // round would re-project the raw history, mint a fresh ref for the
+            // same payload and store it again — the placeholder would never
+            // stabilise and the refs the model was told about would drift.
+            //
+            // Only placeholders are written back. Folding and pruning stay
+            // view-only: they decide what to send, not what was said.
+            for message in &view {
+                let crate::agent::Msg::ToolResult {
+                    call_id, content, ..
+                } = message
+                else {
+                    continue;
+                };
+                if !content.contains(crate::agent::bigctx::ccr::STORED_PLACEHOLDER_MARKER) {
+                    continue;
+                }
+                if let Some(stored) = history.iter_mut().find(|m| {
+                    matches!(
+                        m,
+                        crate::agent::Msg::ToolResult { call_id: id, .. } if id == call_id
+                    )
+                }) && let crate::agent::Msg::ToolResult { content: slot, .. } = stored
+                {
+                    *slot = content.clone();
                 }
             }
+
             bigctx_view = Some(view.clone());
             handle.set(crate::agent::session::bigctx_turn(
                 &view,

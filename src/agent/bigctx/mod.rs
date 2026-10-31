@@ -57,8 +57,8 @@ pub mod types;
 // unused-import warning on every build.
 pub use boundaries::resolve_boundaries;
 pub use ccr::{
-    ContentStore, CcrResult, RETRIEVE_TOOL_NAME, parse_placeholder, project as ccr_project,
-    retrieve as ccr_retrieve,
+    CcrResult, ContentStore, RETRIEVE_TOOL_NAME, STORED_PLACEHOLDER_MARKER, parse_placeholder,
+    project as ccr_project, retrieve as ccr_retrieve,
 };
 pub use cache_report::{
     CacheLedger, CacheReport, CacheSample, FoldEvent, build_cache_report, render_cache_report,
