@@ -344,8 +344,10 @@ pub fn project(
             if std::env::var("YAK_BIGCTX_DEBUG").is_ok() {
                 let matches = store.original(&reference) == Some(text);
                 eprintln!(
-                    "[ccr] reproject {} ref={} stored_raw_id={} same_text={}",
-                    message.id, reference, entry.raw_id, matches
+                    "[ccr] reproject {} ref={} stored_raw_id={} same_text={} text_head={:?} stored_head={:?}",
+                    message.id, reference, entry.raw_id, matches,
+                    &text[..text.len().min(60)],
+                    &store.original(&reference).unwrap_or("")[..store.original(&reference).map(|o| o.len().min(60)).unwrap_or(0)]
                 );
             }
             let title = entry.command.as_deref().or(Some(entry.head.as_str()));
