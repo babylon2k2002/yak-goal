@@ -153,6 +153,19 @@ pub fn process_turn_at(
     );
     let view = truncated.messages.clone();
 
+    // 8. render-refs: write each message's citation ref into its text.
+    //
+    // Without this the model cannot name a message it wants to fold without
+    // first asking acp_status — a round trip on every compression, and the
+    // reason the feature read as something you look up rather than something
+    // you do. Runs last so it tags the final view, and the token snapshot it
+    // writes is frozen at first render so the prefix cache stays stable.
+    let view = crate::agent::bigctx::render_refs(
+        &view,
+        &mut next,
+        crate::agent::bigctx::RenderStrategy::All,
+    );
+
     TurnResult {
         messages: view,
         state: next,
