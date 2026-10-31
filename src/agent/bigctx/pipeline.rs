@@ -89,6 +89,14 @@ pub fn process_turn_with_store(
     };
     let messages = &crushed.messages[..];
 
+
+    // 0a. assign-refs. Protection is computed from the same rules the gate uses
+    //     later, so a message blocked here is blocked consistently. This has to
+    //     precede CCR: a placeholder names the ref of the message it replaces.
+    let mut next = state.clone();
+    let protection = compute_protection(messages, &next, config);
+    sync_refs(&mut next, messages, &protection);
+
     // 0b. Content-cached retrieval: keep oversized tool results out of the
     //     context without losing them. It MUST run before prune: once a result
     //     is folded into a summary its text is gone and there is nothing left to
@@ -118,20 +126,17 @@ pub fn process_turn_with_store(
         );
     }
     let messages = &ccr.messages[..];
+    if ccr.stored > 0 || ccr.reprojected > 0 {
+        sync_refs(&mut next, messages, &protection);
+    }
 
-    // 1. assign-refs. Protection is computed from the same rules the gate uses
-    //    later, so a message blocked here is blocked consistently.
-    let mut next = state.clone();
-    let protection = compute_protection(messages, &next, config);
-    sync_refs(&mut next, messages, &protection);
-
-    // 2. sync-blocks, then age. Ageing before the fold decision means a block
+    // 1. sync-blocks, then age. Ageing before the fold decision means a block
     //    that has survived long enough is already eligible for distillation.
     let (synced, sync_result) = sync_blocks(messages, &next);
     next = synced;
     advance_survival(&mut next, config.promotion_threshold);
 
-    // 3. prune. Summaries are injected so the model can see what it folded.
+    // 2. prune. Summaries are injected so the model can see what it folded.
     let view = prune(
         messages,
         &next,
@@ -142,18 +147,18 @@ pub fn process_turn_with_store(
     );
 
 
-    // 3b. Hide compress calls whose blocks are gone, and stub the summaries a
+    // 2b. Hide compress calls whose blocks are gone, and stub the summaries a
     //     live call repeats. A long session otherwise pays for the receipts:
     //     the arguments duplicate every summary the block already holds.
     let hidden = crate::agent::bigctx::hide_consumed_compress_calls(&next, &view);
     let view = hidden.messages;
 
-    // 4/5. The fold gate runs against the full array, not the view, so that a
+    // 3. The fold gate runs against the full array, not the view, so that a
     //      requested range is judged the way it will be applied.
     let requested = collect_fold_candidates(&view, &next, &protection);
     let gate = withdrawals(messages, &requested);
 
-    // 6. nudge: does the model need telling? The pending mass is measured from
+    // 4. nudge: does the model need telling? The pending mass is measured from
     //    the same screening the status tool reports, so the number in the nudge
     //    and the number in `acp_status` cannot disagree.
     // Screened against the FULL array, not the pruned view. A folded message is
@@ -172,7 +177,7 @@ pub fn process_turn_with_store(
     );
     crate::agent::bigctx::stamp_nudge(&mut next, &nudge, token_count);
 
-    // 7. emergency truncate: the valve for a session that ignored the nudge.
+    // 5. emergency truncate: the valve for a session that ignored the nudge.
     //    Runs last because everything above is preferable — a fold keeps the
     //    originals, a truncation does not. Only fires above the threshold.
     let truncated = crate::agent::bigctx::truncate_large_outputs(
@@ -187,7 +192,7 @@ pub fn process_turn_with_store(
     );
     let view = truncated.messages.clone();
 
-    // 8. render-refs: write each message's citation ref into its text.
+    // 6. render-refs: write each message's citation ref into its text.
     //
     // Without this the model cannot name a message it wants to fold without
     // first asking acp_status — a round trip on every compression, and the
