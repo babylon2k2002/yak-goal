@@ -527,13 +527,14 @@ mod tests {
 
     #[test]
     fn a_ref_prefixed_placeholder_is_still_recognised() {
-        // render-refs puts `<acp …>mNNNNN</acp>
-` in front of every message, so
-        // from the second round on a placeholder wears that prefix. Failing to
-        // see through it would re-store the placeholder as fresh content.
+        // render-refs puts a citation prefix in front of every message, so from
+        // the second round on a placeholder wears one. Failing to see through it
+        // would re-store the placeholder as fresh content.
         let placeholder = build_placeholder("m00042", "file read", 40_120, Some("a.rs"));
-        let prefixed = format!("<acp tokens=\"40,120\" type=\"read\">m00042</acp>
-{placeholder}");
+        let prefixed = format!(
+            "<acp tokens=\"40,120\" type=\"read\">m00042</acp>{}{}",
+            '\n', placeholder
+        );
         let parsed = parse_placeholder(&prefixed).expect("must see through the prefix");
         assert_eq!(parsed.reference, "m00042");
     }
