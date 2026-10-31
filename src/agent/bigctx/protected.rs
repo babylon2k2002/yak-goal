@@ -445,9 +445,18 @@ mod budget_tests {
         config.preserve_recent_messages = 0;
         config.preserve_recent_tokens = 2_500;
 
-        // each ~250 tokens (1000 chars / 4)
+        // Plain user messages, not tool results: pair symmetry would pull a
+        // result's matching call in and protect the whole run, which is a
+        // different (correct) behaviour from the budget under test.
         let messages: Vec<CoreMessage> = (0..6)
-            .map(|i| big(&format!("t1.{i}"), 1_000))
+            .map(|i| {
+                CoreMessage::new(
+                    format!("t1.{i}"),
+                    MessageRole::User,
+                    MessageContentType::Text,
+                )
+                .with_text("x".repeat(1_000))
+            })
             .collect();
         let protection = compute_protection(&messages, &create_initial_state(), &config);
         let protected = messages.iter().filter(|m| protection.is_protected(m)).count();
