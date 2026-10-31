@@ -598,7 +598,7 @@ fn render_status(session: &mut BigctxSession) -> String {
                 "[bigctx]   {i:2} {p} {r:8} {:?}/{:?} {}tok call={:?}",
                 m.role,
                 m.content_type,
-                crate::agent::bigctx::count_message_tokens(m),
+                crate::agent::bigctx::tokenize::count_message_tokens(m),
                 m.tool_call_id
             );
         }
