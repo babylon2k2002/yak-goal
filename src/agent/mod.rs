@@ -125,6 +125,14 @@ pub struct AgentOptions<'a> {
     /// the extension host; event hooks fire at turn and tool boundaries.
     /// An empty host (nothing discovered) fires none and mounts nothing.
     pub hooks: &'a crate::agent::ext::Extensions,
+    /// The compression tools' shared cell, when the caller registered them.
+    ///
+    /// The loop refreshes it at the top of every round with the history as it
+    /// stands *now*. That matters: the caller's `seed` is moved into the loop
+    /// and is empty for the whole run, so a handle populated before the run
+    /// would show the tools the previous task's history — on the first task of
+    /// a session, nothing at all.
+    pub bigctx: Option<crate::agent::bigctx::BigctxHandle>,
     /// opaque id sent with every request so a multi-replica gateway routes
     /// one conversation to the same backend; automatic prefix caching is
     /// per-replica, so without it a round-robin hop re-bills the whole
@@ -309,6 +317,18 @@ pub fn run_agent(
                 round_start,
                 usage: None,
             });
+        }
+        // Refresh the compression tools' view of the conversation. The caller's
+        // seed was moved into `history` and is empty for the rest of the run, so
+        // a handle filled before the loop would show the tools the previous
+        // task's history — nothing at all on a session's first task.
+        if let Some(handle) = opts.bigctx.as_ref() {
+            handle.set(crate::agent::session::bigctx_turn(
+                &history,
+                handle.with(|s| s.state.clone()).as_ref(),
+                turn as u64,
+                model.context_window,
+            ));
         }
         opts.hooks.fire("turn_start", &json!({"turn": turn}));
         if let Some(Msg::User { text, attachments }) = pending.as_ref() {

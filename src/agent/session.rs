@@ -335,6 +335,7 @@ impl Session {
             self.cache_anchor(),
             self.cache_ttl,
             self.goal.as_ref(),
+            self.bigctx_handle.clone(),
         );
         let model_id = model.model_id.clone();
         // the shared TaskView owns the answer stream, spinner, thinking
@@ -450,16 +451,6 @@ impl Session {
         if let Some(text) = nudge.as_deref() {
             inject_nudge(&mut view_seed, text);
         }
-        // Hand the tools the same state and view this request is built from.
-        // They fold *the array the protection rules were computed against*;
-        // a different one would let them compress something the next turn
-        // treats as protected.
-        self.bigctx_handle.set(bigctx_turn(
-            &self.seed,
-            bigctx_state.as_ref(),
-            self.bigctx_round,
-            self.model.as_ref().and_then(|m| m.context_window),
-        ));
         let mut on_update = |u: AgentUpdate| {
             match u {
                 AgentUpdate::Delta(text) => {
@@ -789,6 +780,7 @@ impl Session {
             self.cache_anchor(),
             self.cache_ttl,
             self.goal.as_ref(),
+            self.bigctx_handle.clone(),
         );
         let model_id = model.model_id.clone();
         let view = std::cell::RefCell::new(crate::term::render::TaskView::new(2, &model_id, true));
@@ -884,6 +876,7 @@ impl Session {
             self.cache_anchor(),
             self.cache_ttl,
             self.goal.as_ref(),
+            self.bigctx_handle.clone(),
         );
         // the terminal path renders the reasoning trace through TaskView;
         // here it is only carried into the stored turn
@@ -910,12 +903,6 @@ impl Session {
         if let Some(text) = nudge.as_deref() {
             inject_nudge(&mut view_seed, text);
         }
-        self.bigctx_handle.set(bigctx_turn(
-            &self.seed,
-            bigctx_state.as_ref(),
-            self.bigctx_round,
-            self.model.as_ref().and_then(|m| m.context_window),
-        ));
         let mut on_update = |u: AgentUpdate| {
             match &u {
                 AgentUpdate::ReasoningDelta(text) => {

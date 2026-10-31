@@ -48,6 +48,7 @@ fn test_opts() -> AgentOptions<'static> {
         cache_anchor: None,
         cache_ttl: None,
         goal: None,
+        bigctx: None,
     }
 }
 
