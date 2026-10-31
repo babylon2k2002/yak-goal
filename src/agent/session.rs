@@ -315,7 +315,56 @@ pub fn bigctx_turn(
 }
 
 impl Session {
-    /// A resumed thread can already be over the window. Project its
+    /// Run the whole bigctx pipeline over a raw history and return what the round
+/// should actually be sent, plus the state the tools should see.
+///
+/// This is the loop-facing form of [`bigctx_view_with_nudge`]: it projects the
+/// host messages into bigctx space, runs every node, and renders the result
+/// back. The loop needs exactly this once per round — a task's context grows
+/// across its own rounds, so a view built once before the task never sees the
+/// growth.
+pub fn bigctx_round_view(
+    seed: &[Msg],
+    state: Option<&crate::agent::bigctx::CompressionState>,
+    round: u64,
+    window: Option<u64>,
+    overrides: Option<&serde_json::Value>,
+    mut store: Option<&mut crate::agent::bigctx::ContentStore>,
+) -> (
+    Vec<Msg>,
+    crate::agent::bigctx::CompressionState,
+    Option<String>,
+) {
+    let scheme = crate::agent::bigctx::IdScheme {
+        round: round.max(1),
+        first_slot: 0,
+    };
+    let projection = crate::agent::bigctx::project(seed, scheme);
+    let config = crate::agent::bigctx::config_from_json(window.unwrap_or(200_000), overrides);
+    let current = state
+        .cloned()
+        .unwrap_or_else(crate::agent::bigctx::create_initial_state);
+    let token_count = crate::agent::compact::estimate_tokens(seed, None);
+
+    let turn = crate::agent::bigctx::process_turn_with_store(
+        &projection.messages,
+        &current,
+        &config,
+        token_count,
+        store.as_deref_mut(),
+    );
+    let view = crate::agent::bigctx::render(&turn.messages, &projection);
+    let nudge = round_nudge(
+        &view,
+        &turn.state,
+        round,
+        window,
+        overrides,
+    );
+    (view, turn.state, nudge)
+}
+
+/// A resumed thread can already be over the window. Project its
     /// oversized tool results down before the first request — the very cut
     /// the loop's own prune would make at the first turn end, only silent, so
     /// resuming a big thread does not repeat that notice turn after turn. A

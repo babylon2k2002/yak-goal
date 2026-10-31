@@ -362,30 +362,23 @@ pub fn run_agent(
             // node — crush, CCR, prune, truncate, render-refs — was never
             // running where the growth happens. Only the nudge had been moved
             // into the loop.
-            let config = crate::agent::bigctx::config_from_json(
-                model.context_window.unwrap_or(200_000),
-                opts.bigctx_config.as_ref(),
-            );
-            let base_state = round_state
-                .clone()
-                .unwrap_or_else(crate::agent::bigctx::create_initial_state);
-            let token_count = crate::agent::compact::estimate_tokens(&round_view, None);
             let mut store_guard = opts.ccr_store.as_ref().and_then(|s| s.lock().ok());
-            let turn = crate::agent::bigctx::process_turn_with_store(
+            let (view, state, nudge) = crate::agent::session::bigctx_round_view(
                 &round_view,
-                &base_state,
-                &config,
-                token_count,
+                round_state.as_ref(),
+                opts.bigctx_round,
+                model.context_window,
+                opts.bigctx_config.as_ref(),
                 store_guard.as_deref_mut(),
             );
             drop(store_guard);
 
             // What this round is actually sent. `history` stays the persistent
             // record; the view is a projection of it.
-            bigctx_view = Some(turn.messages);
+            bigctx_view = Some(view.clone());
             handle.set(crate::agent::session::bigctx_turn(
-                &round_view,
-                Some(&turn.state),
+                &view,
+                Some(&state),
                 opts.bigctx_round,
                 model.context_window,
                 opts.bigctx_config.as_ref(),
@@ -393,13 +386,7 @@ pub fn run_agent(
                 opts.ccr_store.as_ref(),
             ));
 
-            if let Some(text) = crate::agent::session::round_nudge(
-                &round_view,
-                &turn.state,
-                opts.bigctx_round,
-                model.context_window,
-                opts.bigctx_config.as_ref(),
-            ) {
+            if let Some(text) = nudge {
                 round_nudge_text = Some(text);
             }
         }
