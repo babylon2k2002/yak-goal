@@ -136,6 +136,9 @@ pub struct AgentOptions<'a> {
     /// `agent.bigctx` from config.json, so the tools quote the same
     /// thresholds the pipeline applies.
     pub bigctx_config: Option<serde_json::Value>,
+    /// The id round the caller's view was projected with. The tools must use
+    /// the same one, or they mint ids for messages the view named differently.
+    pub bigctx_round: u64,
     /// opaque id sent with every request so a multi-replica gateway routes
     /// one conversation to the same backend; automatic prefix caching is
     /// per-replica, so without it a round-robin hop re-bills the whole
@@ -335,10 +338,14 @@ pub fn run_agent(
             if let Some(user) = pending.as_ref() {
                 round_view.push(user.clone());
             }
+            // The round number must match the one the caller's view used.
+            // Two different numbers mint two different id sets for the same
+            // messages, and then the refs acp_status prints are not the refs
+            // compress can resolve.
             handle.set(crate::agent::session::bigctx_turn(
                 &round_view,
                 handle.with(|s| s.state.clone()).as_ref(),
-                turn as u64,
+                opts.bigctx_round,
                 model.context_window,
                 opts.bigctx_config.as_ref(),
             ));

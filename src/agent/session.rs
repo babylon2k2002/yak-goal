@@ -32,6 +32,7 @@ fn agent_opts<'a>(
     goal: Option<&crate::agent::goal::GoalRuntime>,
     bigctx: crate::agent::bigctx::BigctxHandle,
     bigctx_config: Option<serde_json::Value>,
+    bigctx_round: u64,
 ) -> AgentOptions<'a> {
     AgentOptions {
         max_request_bytes,
@@ -47,6 +48,7 @@ fn agent_opts<'a>(
         goal: goal.cloned(),
         bigctx: Some(bigctx),
         bigctx_config,
+        bigctx_round,
     }
 }
 
@@ -363,6 +365,7 @@ impl Session {
             self.goal.as_ref(),
             self.bigctx_handle.clone(),
             self.bigctx_config.clone(),
+            self.bigctx_round,
         );
         let model_id = model.model_id.clone();
         // the shared TaskView owns the answer stream, spinner, thinking
@@ -810,6 +813,7 @@ impl Session {
             self.goal.as_ref(),
             self.bigctx_handle.clone(),
             self.bigctx_config.clone(),
+            self.bigctx_round,
         );
         let model_id = model.model_id.clone();
         let view = std::cell::RefCell::new(crate::term::render::TaskView::new(2, &model_id, true));
@@ -907,6 +911,7 @@ impl Session {
             self.goal.as_ref(),
             self.bigctx_handle.clone(),
             self.bigctx_config.clone(),
+            self.bigctx_round,
         );
         // the terminal path renders the reasoning trace through TaskView;
         // here it is only carried into the stored turn

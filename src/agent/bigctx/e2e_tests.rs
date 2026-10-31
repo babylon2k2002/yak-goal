@@ -50,6 +50,7 @@ fn test_opts() -> AgentOptions<'static> {
         goal: None,
         bigctx: None,
         bigctx_config: None,
+        bigctx_round: 1,
     }
 }
 
