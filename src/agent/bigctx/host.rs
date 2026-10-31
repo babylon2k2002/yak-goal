@@ -294,8 +294,14 @@ pub fn render(view: &[CoreMessage], projection: &Projection) -> Vec<Msg> {
         // A node may have rewritten the core's text — a CCR placeholder, a
         // crush cut — and that rewrite is the whole point of running the
         // pipeline. Emitting the original would silently undo it.
+        //
+        // A summary core has no origin message of its own: `base_origin_of`
+        // hands back the message it replaced, whose text is the whole point of
+        // keeping it (the first user message is pinned for exactly this reason).
+        // Only a core that still stands for a real message may be rewritten.
         let rewritten = core.text_or_empty();
-        if rewritten != original_text(original) {
+        let originals = original_text(original);
+        if !is_summary(original) && rewritten != originals {
             out.push(replace_text(original, rewritten));
         } else {
             out.push(original.clone());
@@ -305,6 +311,13 @@ pub fn render(view: &[CoreMessage], projection: &Projection) -> Vec<Msg> {
     out
 }
 
+
+
+/// True when the origin message is a host-level artefact rather than a message a
+/// core may rewrite.
+fn is_summary(message: &Msg) -> bool {
+    matches!(message, Msg::Summary { .. })
+}
 
 /// The text a host message carries, for comparing against a rewritten core.
 fn original_text(message: &Msg) -> &str {
