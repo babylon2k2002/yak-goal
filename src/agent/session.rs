@@ -197,12 +197,6 @@ pub fn bigctx_view_with_nudge(
     let ranges = crate::agent::bigctx::screen(&projection.messages, &turn.state, &config);
     let nudge = crate::agent::bigctx::render_nudge(&turn.nudge, &ranges, &turn.state, &config)
         .map(|rendered| rendered.text);
-    if std::env::var("YAK_BIGCTX_DEBUG").is_ok() {
-        eprintln!(
-            "[bigctx] view: inject={} tokens={} window={} reason={}",
-            turn.nudge.inject, token_count, config.model_context_limit, turn.nudge.reason
-        );
-    }
 
     ((view, Some(turn.state)), nudge)
 }
@@ -231,13 +225,6 @@ pub fn round_nudge(
     let ranges = crate::agent::bigctx::screen(&projection.messages, state, &config);
     let pending = ranges.compressible_tokens();
     let decision = crate::agent::bigctx::decide_nudge(state, &config, token_count, [pending, 0, 0]);
-
-    if std::env::var("YAK_BIGCTX_DEBUG").is_ok() {
-        eprintln!(
-            "[bigctx] round {round}: inject={} tokens={} window={} pending={} reason={}",
-            decision.inject, token_count, config.model_context_limit, pending, decision.reason
-        );
-    }
 
     crate::agent::bigctx::render_nudge(&decision, &ranges, state, &config)
         .map(|rendered| rendered.text)
