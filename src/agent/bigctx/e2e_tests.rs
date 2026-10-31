@@ -433,10 +433,11 @@ fn a_pressured_session_nudges_and_the_nudge_reaches_the_view() {
         1,
         Some(window),
         None,
+        None,
     )
     .0;
     let (_view2, nudge) =
-        crate::agent::session::bigctx_view_with_nudge(&history, None, 1, Some(window), None);
+        crate::agent::session::bigctx_view_with_nudge(&history, None, 1, Some(window), None, None);
 
     let nudge = nudge.expect("a session over the band with foldable mass must nudge");
     assert!(
@@ -493,7 +494,7 @@ fn a_pressured_session_nudges_and_the_nudge_reaches_the_view() {
 fn a_small_session_is_not_nudged() {
     let history = vec![Msg::user("hi"), Msg::assistant("hello")];
     let (_view, nudge) =
-        crate::agent::session::bigctx_view_with_nudge(&history, None, 1, Some(1_000_000), None);
+        crate::agent::session::bigctx_view_with_nudge(&history, None, 1, Some(1_000_000), None, None);
     assert!(nudge.is_none(), "a nearly empty session has nothing to say");
 }
 

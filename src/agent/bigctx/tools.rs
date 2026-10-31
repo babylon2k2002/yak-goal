@@ -1094,9 +1094,14 @@ mod retrieve_tests {
     fn a_stored_original_comes_back() {
         let handle = BigctxHandle::new();
         let mut session = session_with_store();
-        session
-            .store
+        let store = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::agent::bigctx::ContentStore::new(),
+        ));
+        store
+            .lock()
+            .unwrap()
             .store("m00001", "t1.0", "the full body", "file read", Some("read"), 100, "the", None);
+        session.store = Some(store);
         handle.set(session);
         let out = run(&RetrieveTool::new(handle), json!({"ref": "m00001"}));
         assert!(out.error.is_none(), "{}", out.content);
