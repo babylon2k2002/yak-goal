@@ -407,3 +407,70 @@ fn the_tools_refuse_to_run_without_a_session() {
         );
     }
 }
+
+/// A session over the band with real foldable mass must produce a nudge, and
+/// that nudge must reach the model's view.
+///
+/// Without this the whole feature is inert: the model is never told it could
+/// compress, so it never calls the tool, so no block is ever created.
+#[test]
+fn a_pressured_session_nudges_and_the_nudge_reaches_the_view() {
+    let history = history_with_bulk();
+    let window = 20_000u64; // small, so the fixture is genuinely over the band
+
+    let (view, _state) = crate::agent::session::bigctx_view_with_nudge(
+        &history,
+        None,
+        1,
+        Some(window),
+    )
+    .0;
+    let (_view2, nudge) =
+        crate::agent::session::bigctx_view_with_nudge(&history, None, 1, Some(window));
+
+    let nudge = nudge.expect("a session over the band with foldable mass must nudge");
+    assert!(
+        nudge.contains("compress("),
+        "the nudge must carry the call shape: {nudge}"
+    );
+    assert!(
+        nudge.contains("KEEP VERBATIM"),
+        "the nudge must carry the summary rules"
+    );
+
+    // And injecting it changes the tail, not the head.
+    let mut view = view;
+    let head_before = view.first().cloned();
+    crate::agent::session::inject_nudge(&mut view, &nudge);
+    assert_eq!(view.first().cloned(), head_before, "the head is the cached prefix");
+    let last_user = view
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            Msg::User { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .expect("a user message exists");
+    assert!(
+        last_user.contains("compress("),
+        "the nudge rides the last user message: {last_user}"
+    );
+}
+
+/// Below the band, no nudge — an unthrottled nudge is a fixed cost on every
+/// request.
+#[test]
+fn a_small_session_is_not_nudged() {
+    let history = vec![Msg::user("hi"), Msg::assistant("hello")];
+    let (_view, nudge) =
+        crate::agent::session::bigctx_view_with_nudge(&history, None, 1, Some(1_000_000));
+    assert!(nudge.is_none(), "a nearly empty session has nothing to say");
+}
+
+/// An empty view has nowhere to put a nudge and must not panic.
+#[test]
+fn injecting_into_an_empty_view_is_a_no_op() {
+    let mut view: Vec<Msg> = Vec::new();
+    crate::agent::session::inject_nudge(&mut view, "a nudge");
+    assert!(view.is_empty());
+}

@@ -137,9 +137,26 @@ pub fn bigctx_view(
     round: u64,
     window: Option<u64>,
 ) -> (Vec<Msg>, Option<crate::agent::bigctx::CompressionState>) {
-    let folded = state.is_some_and(|s| s.blocks.iter().any(|b| b.active));
-    if !folded || seed.is_empty() {
-        return (seed.to_vec(), state.cloned());
+    bigctx_view_with_nudge(seed, state, round, window).0
+}
+
+/// As [`bigctx_view`], also returning the nudge text to inject.
+///
+/// The nudge is returned rather than injected here because where it goes is a
+/// host decision: prefixing the last user message keeps the provider's cached
+/// prefix intact, while putting it in the system prompt would rewrite the head
+/// of every request and throw the whole cache away.
+pub fn bigctx_view_with_nudge(
+    seed: &[Msg],
+    state: Option<&crate::agent::bigctx::CompressionState>,
+    round: u64,
+    window: Option<u64>,
+) -> (
+    (Vec<Msg>, Option<crate::agent::bigctx::CompressionState>),
+    Option<String>,
+) {
+    if seed.is_empty() {
+        return ((seed.to_vec(), state.cloned()), None);
     }
 
     let scheme = crate::agent::bigctx::IdScheme {
@@ -159,7 +176,32 @@ pub fn bigctx_view(
     let turn =
         crate::agent::bigctx::process_turn_at(&projection.messages, &current, &config, token_count);
     let view = crate::agent::bigctx::render(&turn.messages, &projection);
-    (view, Some(turn.state))
+
+    // Render the nudge the decision asked for. This runs even with no block
+    // yet: a session that has never compressed still needs to be told it
+    // *could*, or it never starts.
+    let ranges = crate::agent::bigctx::screen(&turn.messages, &turn.state, &config);
+    let nudge = crate::agent::bigctx::render_nudge(&turn.nudge, &ranges, &turn.state, &config)
+        .map(|rendered| rendered.text);
+
+    ((view, Some(turn.state)), nudge)
+}
+
+/// Prepend a nudge to the last user message of a view.
+///
+/// The nudge rides the *tail*, not the head: the head of the request is the
+/// provider's cached prefix, and rewriting it costs a full cache miss on every
+/// turn the nudge appears.
+pub fn inject_nudge(view: &mut [Msg], nudge: &str) {
+    if nudge.trim().is_empty() {
+        return;
+    }
+    for message in view.iter_mut().rev() {
+        if let Msg::User { text, .. } = message {
+            *text = format!("{nudge}\n\n---\n\n{text}");
+            return;
+        }
+    }
 }
 
 /// Build the tool-facing view of a turn: the same state and message array the
@@ -394,12 +436,17 @@ impl Session {
         // Projected here, after `identity` has taken its shared borrows and
         // before the closures take `&mut self`: `bigctx_view` needs `&mut self`
         // (it advances the state), and a borrow held across it would conflict.
-        let (mut view_seed, bigctx_state) = bigctx_view(
+        let ((mut view_seed, bigctx_state), nudge) = bigctx_view_with_nudge(
             &self.seed,
             self.bigctx.as_ref(),
             self.bigctx_round,
             self.model.as_ref().and_then(|m| m.context_window),
         );
+        // The nudge rides the tail of the view: the head is the provider's
+        // cached prefix, and rewriting it would cost a full cache miss.
+        if let Some(text) = nudge.as_deref() {
+            inject_nudge(&mut view_seed, text);
+        }
         // Hand the tools the same state and view this request is built from.
         // They fold *the array the protection rules were computed against*;
         // a different one would let them compress something the next turn
@@ -849,12 +896,17 @@ impl Session {
         };
         // the json path sends the compressed view too, so a --json session gets
         // the same folding as the terminal one
-        let (mut view_seed, bigctx_state) = bigctx_view(
+        let ((mut view_seed, bigctx_state), nudge) = bigctx_view_with_nudge(
             &self.seed,
             self.bigctx.as_ref(),
             self.bigctx_round,
             self.model.as_ref().and_then(|m| m.context_window),
         );
+        // The nudge rides the tail of the view: the head is the provider's
+        // cached prefix, and rewriting it would cost a full cache miss.
+        if let Some(text) = nudge.as_deref() {
+            inject_nudge(&mut view_seed, text);
+        }
         self.bigctx_handle.set(bigctx_turn(
             &self.seed,
             bigctx_state.as_ref(),
