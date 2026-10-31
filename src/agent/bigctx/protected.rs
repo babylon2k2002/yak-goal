@@ -142,9 +142,17 @@ pub fn compute_protection(
     }
 
     if config.preserve_recent_tokens > 0 {
+        // At least one message is protected even when it alone exceeds the
+        // budget: the newest message is the one being answered, and a budget
+        // smaller than a single payload would otherwise protect nothing.
+        //
+        // After that the loop stops as soon as the budget is spent. It must not
+        // keep going because one message blew it — that is how a 800-token
+        // budget over 4K tool results ended up protecting the entire session,
+        // making every fold impossible.
         let mut accumulated = 0u64;
-        for (message, tokens) in visible.iter().rev() {
-            if accumulated >= config.preserve_recent_tokens {
+        for (index, (message, tokens)) in visible.iter().rev().enumerate() {
+            if index > 0 && accumulated >= config.preserve_recent_tokens {
                 break;
             }
             out.protected_bases
@@ -389,5 +397,62 @@ mod tests {
         let msgs = vec![user("t1.1", "a"), user("t1.2", "b")];
         let prot = compute_protection(&msgs, &state, &cfg);
         assert!(prot.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use crate::agent::bigctx::config::default_config;
+    use crate::agent::bigctx::state::create_initial_state;
+
+    fn big(id: &str, chars: usize) -> CoreMessage {
+        CoreMessage::new(id, MessageRole::Tool, MessageContentType::ToolResult)
+            .with_text("x".repeat(chars))
+            .with_tool("read", id)
+    }
+
+    /// A token budget smaller than a single payload must protect one message,
+    /// not the whole session.
+    ///
+    /// Regression: the loop only stopped once the accumulator passed the
+    /// budget, so a 4K payload under an 800-token budget blew it on the first
+    /// message and every earlier message was protected too — `protected == all`
+    /// on a real session, and therefore "compressible: none" forever.
+    #[test]
+    fn a_budget_smaller_than_one_payload_does_not_protect_everything() {
+        let mut config = default_config(200_000);
+        config.preserve_recent_messages = 0;
+        config.preserve_recent_tokens = 800;
+
+        // six 4K-token payloads
+        let messages: Vec<CoreMessage> = (0..6)
+            .map(|i| big(&format!("t1.{i}"), 16_000))
+            .collect();
+        let protection = compute_protection(&messages, &create_initial_state(), &config);
+
+        let protected = messages.iter().filter(|m| protection.is_protected(m)).count();
+        assert_eq!(
+            protected, 1,
+            "only the newest message should be protected, got {protected}"
+        );
+    }
+
+    #[test]
+    fn a_budget_that_fits_several_messages_protects_several() {
+        let mut config = default_config(200_000);
+        config.preserve_recent_messages = 0;
+        config.preserve_recent_tokens = 2_500;
+
+        // each ~250 tokens (1000 chars / 4)
+        let messages: Vec<CoreMessage> = (0..6)
+            .map(|i| big(&format!("t1.{i}"), 1_000))
+            .collect();
+        let protection = compute_protection(&messages, &create_initial_state(), &config);
+        let protected = messages.iter().filter(|m| protection.is_protected(m)).count();
+        assert!(
+            protected >= 2 && protected < 6,
+            "expected a partial window, got {protected}"
+        );
     }
 }
