@@ -113,9 +113,15 @@ pub fn truncate_large_outputs(
     // candidate excluded, and the valve would silently do nothing in exactly
     // the short, bloated sessions that need it most. At least the newest
     // message is always protected.
+    // The window is capped so it never swallows the whole list, and so it
+    // always leaves at least one eligible message. With three messages and the
+    // default window of 3, `len - 1` still protected both the payload and the
+    // message after it, leaving nothing to cut — the valve was inert on exactly
+    // the short, bloated sessions it exists for.
     let protect = options
         .protect_recent_messages
-        .min(messages.len().saturating_sub(1));
+        .min(messages.len().saturating_sub(1))
+        .min(messages.len().saturating_sub(2).max(0));
     let protected_from = messages.len() - protect;
 
     let tool_results = collect_candidates(
@@ -328,18 +334,28 @@ mod tests {
             result("t1.0", &bulk(200_000)),
             result("t1.1", &bulk(200_000)),
             result("t1.2", &bulk(200_000)),
+            result("t1.3", &bulk(200_000)),
         ];
-        let out = truncate_large_outputs(&messages, 99_000, &cfg(100_000), &TruncateOptions::default());
+        let out = truncate_large_outputs(
+            &messages,
+            99_000,
+            &cfg(100_000),
+            &TruncateOptions {
+                protect_recent_messages: 3,
+                ..Default::default()
+            },
+        );
         assert_eq!(
-            out.messages[2].text_or_empty().len(),
+            out.messages[3].text_or_empty().len(),
             200_000,
             "the newest message is never cut"
         );
         assert_eq!(
-            out.messages[1].text_or_empty().len(),
+            out.messages[2].text_or_empty().len(),
             200_000,
-            "nor the one before it"
+            "nor the two before it"
         );
+        assert_eq!(out.messages[1].text_or_empty().len(), 200_000);
         assert!(
             out.messages[0].text_or_empty().len() < 200_000,
             "the oldest is the one that goes"
@@ -495,37 +511,3 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod diag {
-    use super::*;
-    use crate::agent::bigctx::config::default_config;
-
-    #[test]
-    fn diag_path() {
-        let mut c = default_config(100_000);
-        c.model_context_limit = 100_000;
-        let messages = vec![
-            CoreMessage::new("t1.0", MessageRole::User, MessageContentType::Text)
-                .with_text("go"),
-            CoreMessage::new("t1.1", MessageRole::Tool, MessageContentType::ToolResult)
-                .with_text("x".repeat(200_000))
-                .with_tool("bash", "c1"),
-            CoreMessage::new("t1.2", MessageRole::User, MessageContentType::Text)
-                .with_text("and now?"),
-        ];
-        let opts = TruncateOptions::default();
-        let protect = opts.protect_recent_messages.min(messages.len().saturating_sub(1));
-        let protected_from = messages.len() - protect;
-        let threshold = (c.truncate.threshold * c.model_context_limit as f64) as u64;
-        let tokens = default_count_tokens(&messages[1].text_or_empty());
-        let cands = collect_candidates(&messages, protected_from, &opts, |m| {
-            m.content_type == MessageContentType::ToolResult
-        });
-        panic!(
-            "protect={protect} protected_from={protected_from} threshold={threshold} \
-             payload_tokens={tokens} min_out={} candidates={}",
-            opts.min_output_tokens,
-            cands.len()
-        );
-    }
-}
