@@ -405,6 +405,7 @@ mod budget_tests {
     use super::*;
     use crate::agent::bigctx::config::default_config;
     use crate::agent::bigctx::state::create_initial_state;
+    use crate::agent::bigctx::types::{MessageContentType, MessageRole};
 
     fn big(id: &str, chars: usize) -> CoreMessage {
         CoreMessage::new(id, MessageRole::Tool, MessageContentType::ToolResult)
