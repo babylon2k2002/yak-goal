@@ -607,6 +607,19 @@ Cite a range as startId/endId when you call compress.
 ");
     }
 
+    // What CCR is holding out of the context. A placeholder the model sees is
+    // only useful if the original is still there, so the count belongs in the
+    // status the model reads.
+    if let Some(store) = session.store.as_ref()
+        && let Ok(store) = store.lock()
+        && !store.is_empty()
+    {
+        text.push_str("
+
+");
+        text.push_str(&crate::agent::bigctx::ccr::render_store_summary(&store));
+    }
+
     // The cache accounting, when the caller asked for it. This is the part that
     // says whether folding is actually cheaper — a fold that breaks the prompt
     // cache can cost more than the tokens it removed.
