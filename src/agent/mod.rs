@@ -375,6 +375,13 @@ pub fn run_agent(
 
             // What this round is actually sent. `history` stays the persistent
             // record; the view is a projection of it.
+            if std::env::var("YAK_BIGCTX_DEBUG").is_ok() {
+                for m in &view {
+                    if let crate::agent::Msg::ToolResult { content, .. } = m {
+                        eprintln!("[bigctx] view tool result: {:?}", &content[..content.len().min(90)]);
+                    }
+                }
+            }
             bigctx_view = Some(view.clone());
             handle.set(crate::agent::session::bigctx_turn(
                 &view,
