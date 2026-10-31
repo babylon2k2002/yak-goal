@@ -122,9 +122,7 @@ pub fn process_turn_with_store(
             config.ccr.enabled,
             config.ccr.min_tool_tokens,
             store.is_some(),
-            messages.len(),
-            0,
-            0
+            messages.len()
         );
     }
     let ccr = if config.ccr.enabled
