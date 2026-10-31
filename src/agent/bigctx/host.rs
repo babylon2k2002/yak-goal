@@ -299,9 +299,12 @@ pub fn render(view: &[CoreMessage], projection: &Projection) -> Vec<Msg> {
         // hands back the message it replaced, whose text is the whole point of
         // keeping it (the first user message is pinned for exactly this reason).
         // Only a core that still stands for a real message may be rewritten.
+        // Only a core that IS this message may rewrite it. After a fold the
+        // surviving core for a consumed message is a block core whose base id
+        // still resolves to the original — honouring its text there would
+        // replace the pinned task statement with the summary.
         let rewritten = core.text_or_empty();
-        let originals = original_text(original);
-        if !is_summary(original) && rewritten != originals {
+        if core.id == base && rewritten != original_text(original) {
             out.push(replace_text(original, rewritten));
         } else {
             out.push(original.clone());
@@ -312,12 +315,6 @@ pub fn render(view: &[CoreMessage], projection: &Projection) -> Vec<Msg> {
 }
 
 
-
-/// True when the origin message is a host-level artefact rather than a message a
-/// core may rewrite.
-fn is_summary(message: &Msg) -> bool {
-    matches!(message, Msg::Summary { .. })
-}
 
 /// The text a host message carries, for comparing against a rewritten core.
 fn original_text(message: &Msg) -> &str {
@@ -634,4 +631,47 @@ mod tests {
         let second = project(&history, IdScheme::default());
         assert_eq!(second.messages[0].id, id_a, "append must not shift ids");
     }
+    #[test]
+    fn a_block_core_does_not_rewrite_the_message_it_consumed() {
+        // After a fold, the surviving core for a consumed message is a block
+        // core whose base id still resolves to the original. Honouring its text
+        // would replace the pinned task statement with the summary.
+        let messages = vec![user("the task"), assistant("answer")];
+        let projection = project(&messages, IdScheme::default());
+        let mut block = projection.messages[0].clone();
+        block.id = "b1".to_string();
+        block.role = MessageRole::System;
+        block.text = Some("[Compressed conversation section]
+the task".to_string());
+
+        let view = render(&[block], &projection);
+        assert!(
+            view.iter().any(|m| matches!(m, Msg::User { text, .. } if text == "the task")),
+            "the original must survive a block core: {view:?}"
+        );
+    }
+
+    #[test]
+    fn a_rewritten_core_reaches_the_wire() {
+        // CCR and crush rewrite a message in place; that rewrite is the point of
+        // running the pipeline, so render must emit it rather than the original.
+        let messages = vec![user("go"), Msg::ToolResult {
+            call_id: "c1".into(),
+            name: "read".into(),
+            content: "the whole file".into(),
+            error: None,
+            attachments: Vec::new(),
+        }];
+        let mut projection = project(&messages, IdScheme::default());
+        let mut core = projection.messages[1].clone();
+        core.text = Some("PLACEHOLDER".to_string());
+        projection.messages[1] = core.clone();
+
+        let view = render(&[core], &projection);
+        assert!(
+            view.iter().any(|m| matches!(m, Msg::ToolResult { content, .. } if content == "PLACEHOLDER")),
+            "the rewrite must reach the wire: {view:?}"
+        );
+    }
+
 }
