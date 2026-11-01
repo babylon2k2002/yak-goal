@@ -256,6 +256,12 @@ pub fn maybe_auto_fold(
     let config = crate::agent::bigctx::config_from_json(window.unwrap_or(200_000), overrides);
     let token_count = crate::agent::compact::estimate_tokens(history, None);
     let window_tok = config.model_context_limit;
+    // `nudge_enabled: false` means the user turned automatic compression off,
+    // and the backstop is part of that feature — not a separate one. Folding
+    // anyway would spend model calls against an explicit "don't".
+    if !config.nudge.enabled {
+        return (None, None);
+    }
     // Below the nudge's floor there is no pressure: the fold would save
     // little and cost a model call plus a cache miss.
     let usage = if window_tok > 0 {
@@ -3201,4 +3207,31 @@ fn auto_fold_declines_without_a_model() {
     let state = crate::agent::bigctx::create_initial_state();
     let (folded, _) = maybe_auto_fold(&seed, &state, None, 1, Some(40_000), None, false);
     assert!(folded.is_none(), "no model, no summary, no fold");
+}
+
+/// `nudge_enabled: false` is the user switching automatic compression off.
+/// The backstop is part of that feature, not a separate one, so it must obey
+/// the same switch — otherwise the setting silently does nothing.
+#[test]
+fn auto_fold_obeys_nudge_enabled_false() {
+    let mut seed = Vec::new();
+    for i in 0..40 {
+        seed.push(Msg::user(format!("question {i} about component {i} and its behaviour in depth")));
+        seed.push(Msg::assistant("the component validates records, buffers a window, and flushes on a boundary"));
+    }
+    let state = crate::agent::bigctx::create_initial_state();
+    let overrides = serde_json::json!({ "nudge_enabled": false });
+    let (folded, _) = maybe_auto_fold(
+        &seed,
+        &state,
+        None,
+        1,
+        Some(40_000),
+        Some(&overrides),
+        false,
+    );
+    assert!(
+        folded.is_none(),
+        "nudges off means the automatic fold is off too"
+    );
 }
