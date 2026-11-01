@@ -581,7 +581,6 @@ pub fn run_agent(
                 &mut sink,
                 &mut ch,
                 opts.bigctx.as_ref(),
-                opts.bigctx_round,
             );
             usage_marker = after.usage_marker;
             cache_stable = after.cache_stable;
