@@ -276,75 +276,86 @@ pub fn maybe_auto_fold(
     if nudged_this_round {
         return (None, None);
     }
-    let ranges = crate::agent::bigctx::screen(&projection.messages, state, &config);
-    let Some(best) = ranges
-        .compressible
-        .iter()
-        .max_by_key(|r| r.tokens)
-    else {
-        return (None, None);
-    };
-    // `screen` already merged to the minimum range; a remaining range here is
-    // worth folding.
-    let resolved = match crate::agent::bigctx::resolve_boundaries(
-        &best.start_ref,
-        &best.end_ref,
-        &projection.messages,
-        state,
-    ) {
-        Ok(resolved) => resolved,
-        Err(_) => return (None, None),
-    };
     // The summary needs the model; without one, nothing to fold with.
     let Some(model) = model else {
         return (None, None);
     };
-    let summary = match crate::agent::compact::summarize(
-        model,
-        &history[resolved.start_index..=resolved.end_index.min(history.len() - 1)],
-        None,
-    ) {
-        Ok(summary) => summary,
-        Err(_) => return (None, None),
-    };
-    let protection = crate::agent::bigctx::compute_protection(
-        &projection.messages,
-        state,
-        &config,
-    );
+    // Fold until the pressure is relieved, not just once.
+    //
+    // One fold per round loses to a context that grows faster than the rounds
+    // come: measured, two folds of 5 and 2 messages still left a session at
+    // 151% of its window, because the messages between the foldable ranges
+    // (protected, or too small to merge) kept the total up. The loop stops on
+    // its own terms — nothing left worth folding, or the pressure gone — so it
+    // cannot spin.
     let mut new_state = state.clone();
-    let outcome = crate::agent::bigctx::apply_compression(
-        &mut new_state,
-        &projection.messages,
-        &resolved,
-        &summary,
-        &protection,
-        &config,
-        None,
-        now(),
-    );
-    match outcome {
-        Ok(outcome) => {
-            // The fold is the response the nudge asked for, so that nudge is
-            // spent: clear the mark and re-arm from the new size. Without
-            // this the session stays "already nudged" forever, the yield in
-            // `maybe_compact` never lifts, and the context grows unchecked.
-            let remaining = crate::agent::bigctx::screen(
-                &projection.messages,
-                &new_state,
-                &config,
-            );
-            crate::agent::bigctx::reset_after_compression(
-                &mut new_state,
-                remaining.compressible_tokens(),
-            );
-            (
-                Some(new_state),
-                Some((outcome.block_id, outcome.message_count)),
-            )
+    let mut folded_total = 0usize;
+    let mut last_block = String::new();
+    loop {
+        let ranges = crate::agent::bigctx::screen(&projection.messages, &new_state, &config);
+        let Some(best) = ranges.compressible.iter().max_by_key(|r| r.tokens) else {
+            break;
+        };
+        let resolved = match crate::agent::bigctx::resolve_boundaries(
+            &best.start_ref,
+            &best.end_ref,
+            &projection.messages,
+            &new_state,
+        ) {
+            Ok(resolved) => resolved,
+            Err(_) => break,
+        };
+        let summary = match crate::agent::compact::summarize(
+            model,
+            &history[resolved.start_index..=resolved.end_index.min(history.len() - 1)],
+            None,
+        ) {
+            Ok(summary) => summary,
+            Err(_) => break,
+        };
+        let protection = crate::agent::bigctx::compute_protection(
+            &projection.messages,
+            &new_state,
+            &config,
+        );
+        let outcome = match crate::agent::bigctx::apply_compression(
+            &mut new_state,
+            &projection.messages,
+            &resolved,
+            &summary,
+            &protection,
+            &config,
+            None,
+            now(),
+        ) {
+            Ok(outcome) => outcome,
+            Err(_) => break,
+        };
+        last_block = outcome.block_id;
+        folded_total += outcome.message_count;
+        // Stop once the session is back under the floor: another fold would
+        // spend a model call on a context that no longer needs it.
+        let saved: u64 = new_state.blocks.iter().map(|b| b.compressed_tokens).sum();
+        let after = token_count.saturating_sub(saved);
+        let still_hot =
+            window_tok > 0 && (after as f64 / window_tok as f64) >= config.nudge.min_context_limit_pct;
+        if !still_hot {
+            break;
         }
-        Err(_) => (None, None),
     }
+    if folded_total == 0 {
+        return (None, None);
+    }
+    // The folds are the response the nudge asked for, so that nudge is spent:
+    // clear the mark and re-arm from the new size. Without this the session
+    // stays "already nudged" forever, the yield in `maybe_compact` never
+    // lifts, and the context grows unchecked.
+    let remaining = crate::agent::bigctx::screen(&projection.messages, &new_state, &config);
+    crate::agent::bigctx::reset_after_compression(
+        &mut new_state,
+        remaining.compressible_tokens(),
+    );
+    (Some(new_state), Some((last_block, folded_total)))
 }
 
 /// Unix seconds — the timestamp `CompressionBlock` wants. Kept next to the
