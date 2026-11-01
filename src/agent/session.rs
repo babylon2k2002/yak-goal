@@ -202,6 +202,7 @@ pub fn bigctx_view_with_nudge(
             &config,
             token_count,
             store.as_deref_mut(),
+            round,
         );
     let view = crate::agent::bigctx::render(&turn.messages, &projection);
 
@@ -265,17 +266,14 @@ pub fn maybe_auto_fold(
     if usage < config.nudge.min_context_limit_pct {
         return (None, None);
     }
-    // Give the model its round. A nudge stamped this round records the
-    // current size, so `token_count == last_nudge_shown_tokens` means the
-    // model has not had a chance to act yet — folding now would steal the
-    // exact material the nudge just pointed at.
+    // Give the model exactly one round.
     //
-    // Once the context has grown past that mark, a round has passed without a
-    // fold (a successful fold calls `reset_after_compression`, which zeroes
-    // the mark). That is the case this backstop exists for.
-    if state.nudge.last_nudge_shown_tokens > 0
-        && token_count <= state.nudge.last_nudge_shown_tokens
-    {
+    // The nudge is stamped at the current size on the very round it fires, and
+    // this runs after that stamp — so comparing token counts would be equal on
+    // every round and the backstop would never fire. The round number is the
+    // monotonic signal: a nudge stamped in THIS round means the model has not
+    // answered yet; stamped in an earlier round means it had its chance.
+    if state.nudge.last_nudge_round > 0 && state.nudge.last_nudge_round >= round {
         return (None, None);
     }
     let ranges = crate::agent::bigctx::screen(&projection.messages, state, &config);
@@ -491,6 +489,7 @@ pub fn bigctx_round_view(
         &config,
         token_count,
         store.as_deref_mut(),
+        round,
     );
     let view = crate::agent::bigctx::render(&turn.messages, &projection);
     let nudge = round_nudge(

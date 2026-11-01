@@ -558,6 +558,7 @@ pub fn run_agent(
             model.context_window,
             on_update,
             opts.bigctx.as_ref(),
+            opts.bigctx_round,
         );
         // the pre-request compaction check: a session
         // that was interrupted — or resumed — over its window is compacted
@@ -580,6 +581,7 @@ pub fn run_agent(
                 &mut sink,
                 &mut ch,
                 opts.bigctx.as_ref(),
+                opts.bigctx_round,
             );
             usage_marker = after.usage_marker;
             cache_stable = after.cache_stable;
@@ -1235,6 +1237,7 @@ fn bigctx_fold_pending(
     bigctx: Option<&crate::agent::bigctx::BigctxHandle>,
     estimate: u64,
     window: Option<u64>,
+    round: u64,
 ) -> bool {
     /// Above this share of the window the summarizer stops waiting.
     const YIELD_CEILING_PCT: f64 = 0.85;
@@ -1250,12 +1253,12 @@ fn bigctx_fold_pending(
     }
     handle
         .with(|session| {
-            let mark = session.state.nudge.last_nudge_shown_tokens;
-            // A nudge stamped at the CURRENT size means the model has not had
-            // its round yet: yielding here is the point of the mechanism.
-            // Once the context has grown past the mark, a round went by with
-            // no fold, and continuing to yield would let the window fill.
-            mark > 0 && estimate <= mark
+            let mark = session.state.nudge.last_nudge_round;
+            // A nudge stamped in THIS round is unanswered: the model has not
+            // had its chance yet, so the summarizer waits. Stamped in an
+            // earlier round means the model sat on it, and continuing to
+            // yield would let the window fill.
+            mark > 0 && mark >= round
         })
         .unwrap_or(false)
 }
@@ -1300,7 +1303,7 @@ fn maybe_compact(
     //
     // Yielding one round lets it respond. The yield is bounded: near the
     // window there is no room to wait, so the summarizer takes over anyway.
-    if bigctx_fold_pending(bigctx, estimate, model.context_window) {
+    if bigctx_fold_pending(bigctx, estimate, model.context_window, round) {
         return after;
     }
     if compact::should_compact(estimate, trigger) {

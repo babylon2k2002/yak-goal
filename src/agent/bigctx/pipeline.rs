@@ -65,7 +65,7 @@ pub fn process_turn(
     state: &CompressionState,
     config: &BigctxConfig,
 ) -> TurnResult {
-    process_turn_with_store(messages, state, config, 0, None)
+    process_turn_with_store(messages, state, config, 0, None, 0)
 }
 
 /// As [`process_turn`], with the current token count so the nudge can judge
@@ -77,6 +77,7 @@ pub fn process_turn_with_store(
     config: &BigctxConfig,
     token_count: u64,
     store: Option<&mut crate::agent::bigctx::ContentStore>,
+    round: u64,
 ) -> TurnResult {
     // 0. Crush oversized tool results first. It has to happen before pruning:
     //    once a result is folded into a summary its text is gone, and a crush
@@ -169,7 +170,7 @@ pub fn process_turn_with_store(
         token_count,
         [tier1_pending, 0, 0],
     );
-    crate::agent::bigctx::stamp_nudge(&mut next, &nudge, token_count);
+    crate::agent::bigctx::stamp_nudge(&mut next, &nudge, token_count, round);
 
     // 5. emergency truncate: the valve for a session that ignored the nudge.
     //    Runs last because everything above is preferable — a fold keeps the

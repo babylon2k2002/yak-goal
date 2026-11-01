@@ -233,7 +233,12 @@ fn growth_reference(nudge: &NudgeState, token_count: u64) -> u64 {
 }
 
 /// Record that a nudge was shown, so the next pass can measure growth from it.
-pub fn stamp_nudge(state: &mut CompressionState, decision: &NudgeDecision, token_count: u64) {
+pub fn stamp_nudge(
+    state: &mut CompressionState,
+    decision: &NudgeDecision,
+    token_count: u64,
+    round: u64,
+) {
     if state.nudge.baseline_tokens == 0 {
         state.nudge.baseline_tokens = token_count;
     }
@@ -241,6 +246,7 @@ pub fn stamp_nudge(state: &mut CompressionState, decision: &NudgeDecision, token
         return;
     }
     state.nudge.last_nudge_shown_tokens = token_count;
+    state.nudge.last_nudge_round = round;
     if let Some(tier) = decision.tier {
         state
             .nudge
@@ -257,6 +263,9 @@ pub fn stamp_nudge(state: &mut CompressionState, decision: &NudgeDecision, token
 /// the context refills.
 pub fn reset_after_compression(state: &mut CompressionState, token_count: u64) {
     state.nudge.last_nudge_shown_tokens = 0;
+    // A fold answers the nudge, so the round mark clears with it: the next
+    // automatic fold must not be blocked by a nudge that was already acted on.
+    state.nudge.last_nudge_round = 0;
     state.nudge.last_per_message_nudge_tokens = token_count;
     state.nudge.baseline_tokens = token_count;
     state.nudge.last_shown_by_tier.clear();
@@ -361,7 +370,7 @@ mod tests {
         let mut state = create_initial_state();
         let first = decide_nudge(&state, &c, 70_000, [30_000, 0, 0]);
         assert!(first.inject, "{}", first.reason);
-        stamp_nudge(&mut state, &first, 70_000);
+        stamp_nudge(&mut state, &first, 70_000, 1);
 
         let again = decide_nudge(&state, &c, 70_000, [30_000, 0, 0]);
         assert!(!again.inject, "an unthrottled nudge is paid every round");
@@ -372,7 +381,7 @@ mod tests {
         let c = cfg(100_000);
         let mut state = create_initial_state();
         let first = decide_nudge(&state, &c, 70_000, [30_000, 0, 0]);
-        stamp_nudge(&mut state, &first, 70_000);
+        stamp_nudge(&mut state, &first, 70_000, 1);
 
         let step = adaptive_growth(Some(100_000), &c);
         let again = decide_nudge(&state, &c, 70_000 + step + 1, [30_000, 0, 0]);
@@ -418,7 +427,7 @@ mod tests {
         let c = cfg(100_000);
         let mut state = create_initial_state();
         let first = decide_nudge(&state, &c, 70_000, [30_000, 0, 0]);
-        stamp_nudge(&mut state, &first, 70_000);
+        stamp_nudge(&mut state, &first, 70_000, 1);
 
         // the model compressed: the context shrank
         reset_after_compression(&mut state, 40_000);
@@ -442,9 +451,9 @@ mod tests {
     fn stamping_records_the_baseline_once() {
         let mut state = create_initial_state();
         let decision = NudgeDecision::no("test");
-        stamp_nudge(&mut state, &decision, 1_000);
+        stamp_nudge(&mut state, &decision, 1_000, 1);
         assert_eq!(state.nudge.baseline_tokens, 1_000);
-        stamp_nudge(&mut state, &decision, 9_000);
+        stamp_nudge(&mut state, &decision, 9_000, 2);
         assert_eq!(
             state.nudge.baseline_tokens, 1_000,
             "the baseline is the session start, not the latest turn"
@@ -498,7 +507,7 @@ mod first_sight_tests {
         // 50% used: inside the band (45%–75%)
         let first = decide_nudge(&state, &config, 50_000, [10_000, 0, 0]);
         assert!(first.inject, "reason: {}", first.reason);
-        stamp_nudge(&mut state, &first, 50_000);
+        stamp_nudge(&mut state, &first, 50_000, 1);
 
         let again = decide_nudge(&state, &config, 50_000, [10_000, 0, 0]);
         assert!(!again.inject, "an unthrottled nudge is paid every round");
@@ -514,7 +523,7 @@ mod first_sight_tests {
         let mut state = create_initial_state();
         let first = decide_nudge(&state, &config, 90_000, [10_000, 0, 0]);
         assert!(first.inject);
-        stamp_nudge(&mut state, &first, 90_000);
+        stamp_nudge(&mut state, &first, 90_000, 1);
 
         let again = decide_nudge(&state, &config, 90_000, [10_000, 0, 0]);
         assert!(again.inject, "pressure outranks the growth cadence");
