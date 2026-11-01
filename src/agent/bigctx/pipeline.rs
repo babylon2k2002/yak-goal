@@ -169,6 +169,12 @@ pub fn process_turn_with_store(
         token_count,
         [tier1_pending, 0, 0],
     );
+    if std::env::var("YAK_NUDGE_DEBUG").is_ok() {
+        eprintln!(
+            "[nudge] tokens={token_count} pending={tier1_pending} inject={} reason={}",
+            nudge.inject, nudge.reason
+        );
+    }
     crate::agent::bigctx::stamp_nudge(&mut next, &nudge, token_count);
 
     // 5. emergency truncate: the valve for a session that ignored the nudge.

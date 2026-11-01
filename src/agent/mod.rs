@@ -431,6 +431,9 @@ pub fn run_agent(
             ));
 
             if let Some(text) = nudge {
+                if std::env::var("YAK_NUDGE_DEBUG").is_ok() {
+                    eprintln!("[nudge] round={turn} injecting: {text:.200}");
+                }
                 round_nudge_text = Some(text);
             }
         }
