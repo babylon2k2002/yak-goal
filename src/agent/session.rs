@@ -456,14 +456,7 @@ pub fn bigctx_turn(
     // view here matches the round's own — and a folded message drops out of it
     // the way it drops out of the request.
     let config = crate::agent::bigctx::config_from_json(window.unwrap_or(200_000), overrides);
-    let token_count = crate::agent::compact::estimate_tokens(seed, None);
-    let view = crate::agent::bigctx::process_turn(
-        &projection.messages,
-        &state,
-        &config,
-        token_count,
-    )
-    .messages;
+    let view = crate::agent::bigctx::process_turn(&projection.messages, &state, &config).messages;
 
     crate::agent::bigctx::BigctxSession {
         state,
