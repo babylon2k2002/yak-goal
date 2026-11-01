@@ -3130,3 +3130,54 @@ mod tests {
         );
     }
 }
+
+/// The automatic fold must not fire while the nudge it answers is still
+/// outstanding.
+///
+/// A nudge stamped at the current size means the model has not had its round
+/// yet. Folding then would steal the exact material the nudge pointed at — the
+/// same race the yield in `maybe_compact` exists to prevent.
+#[test]
+fn auto_fold_declines_while_the_nudge_is_unanswered() {
+    // 40 turns of prose: past the 45% pressure floor of a 40K window.
+    let mut seed = Vec::new();
+    for i in 0..40 {
+        seed.push(Msg::user(format!("question {i} about component {i} and its behaviour in depth")));
+        seed.push(Msg::assistant("the component validates records, buffers a window, and flushes on a boundary"));
+    }
+    let tokens = crate::agent::compact::estimate_tokens(&seed, None);
+
+    let mut state = crate::agent::bigctx::create_initial_state();
+    // A nudge was stamped at exactly this size: unanswered.
+    state.nudge.last_nudge_shown_tokens = tokens;
+
+    let (folded, _) = maybe_auto_fold(&seed, &state, None, 1, Some(40_000), None);
+    assert!(
+        folded.is_none(),
+        "the fold must wait for the model's round, not race the nudge it just sent"
+    );
+}
+
+/// Below the pressure floor there is nothing worth folding: the saving would
+/// not cover the summary call plus the cache miss it causes.
+#[test]
+fn auto_fold_declines_below_the_pressure_floor() {
+    let seed = vec![Msg::user("a short question"), Msg::assistant("a short answer")];
+    let state = crate::agent::bigctx::create_initial_state();
+    let (folded, _) = maybe_auto_fold(&seed, &state, None, 1, Some(40_000), None);
+    assert!(folded.is_none(), "no pressure, no fold");
+}
+
+/// With no model there is no summary, and no summary means no fold. The
+/// backstop must degrade quietly rather than fold with empty text.
+#[test]
+fn auto_fold_declines_without_a_model() {
+    let mut seed = Vec::new();
+    for i in 0..40 {
+        seed.push(Msg::user(format!("question {i} about component {i} and its behaviour in depth")));
+        seed.push(Msg::assistant("the component validates records, buffers a window, and flushes on a boundary"));
+    }
+    let state = crate::agent::bigctx::create_initial_state();
+    let (folded, _) = maybe_auto_fold(&seed, &state, None, 1, Some(40_000), None);
+    assert!(folded.is_none(), "no model, no summary, no fold");
+}
