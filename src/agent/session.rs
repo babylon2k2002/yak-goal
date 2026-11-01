@@ -451,10 +451,25 @@ pub fn bigctx_turn(
     );
     state.next_ref_index = next_index;
 
+    // Price `acp_status` against what the pipeline actually sends. Running the
+    // nodes over the projected array is the same pass the loop runs, so the
+    // view here matches the round's own — and a folded message drops out of it
+    // the way it drops out of the request.
+    let config = crate::agent::bigctx::config_from_json(window.unwrap_or(200_000), overrides);
+    let token_count = crate::agent::compact::estimate_tokens(seed, None);
+    let view = crate::agent::bigctx::process_turn(
+        &projection.messages,
+        &state,
+        &config,
+        token_count,
+    )
+    .messages;
+
     crate::agent::bigctx::BigctxSession {
         state,
         messages: projection.messages,
-        config: crate::agent::bigctx::config_from_json(window.unwrap_or(200_000), overrides),
+        view,
+        config,
         ledger: ledger.cloned(),
         // The store outlives a round: a placeholder the model saw last turn
         // must still be retrievable this turn, so the shared cell is handed

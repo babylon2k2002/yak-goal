@@ -38,6 +38,11 @@ pub struct BigctxSession {
     pub state: CompressionState,
     /// The full resent history, projected to cores.
     pub messages: Vec<CoreMessage>,
+    /// The same array after the pipeline folded it — what the model is
+    /// actually sent. `acp_status` prices this, not `messages`: the full array
+    /// still holds every folded message, so pricing it would report the size
+    /// the fold was supposed to relieve, not the size that remains.
+    pub view: Vec<CoreMessage>,
     pub config: BigctxConfig,
     /// Where a fold records itself for the cache accounting. None when the
     /// caller did not ask for a report.
@@ -594,7 +599,7 @@ fn render_status(session: &mut BigctxSession) -> String {
     // The report owns the rendering. Duplicating it here would give the model
     // and the user two descriptions of the same state that can disagree.
     let report = crate::agent::bigctx::build_report(
-        &session.messages,
+        &session.view,
         &session.messages,
         &session.state,
         &session.config,
@@ -672,6 +677,7 @@ mod tests {
         state.next_ref_index = next;
         BigctxSession {
             state,
+            view: messages.clone(),
             messages,
             config,
             ledger: None,
@@ -1063,6 +1069,7 @@ mod retrieve_tests {
         state.next_ref_index = next;
         BigctxSession {
             state,
+            view: messages.clone(),
             messages,
             config,
             ledger: None,

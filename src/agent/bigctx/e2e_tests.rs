@@ -150,6 +150,7 @@ fn bigctx_session(history: &[Msg]) -> BigctxSession {
 
     BigctxSession {
         state,
+        view: projection.messages.clone(),
         messages: projection.messages,
         config,
         ledger: None,
