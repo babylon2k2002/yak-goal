@@ -410,6 +410,9 @@ pub fn project(
         // first line does, when they are available.
         let command = extract_command(message.text.as_deref(), MAX_HEAD_CHARS);
 
+        if std::env::var("YAK_CCR_DEBUG").is_ok() {
+            eprintln!("[ccr] STORING {} ref={} tokens={}", message.id, reference, tokens);
+        }
         store.store(
             &reference,
             &message.id,
