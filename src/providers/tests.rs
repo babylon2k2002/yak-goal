@@ -561,3 +561,115 @@ fn responses_stream_without_terminal_event_is_truncated() {
     let (result, _) = responses_stream("data: {\"type\":\"response.created\"}\n\n");
     assert_eq!(result, Err(TRUNCATED_STREAM.into()));
 }
+
+// ─── side-channel decision probe ────────────────────────────────────────────
+
+/// Probe: can a side-channel decision request reuse the main request's cache?
+///
+/// The side-channel nudge decision only pays off if the small extra request
+/// reads the conversation prefix back from the provider's prompt cache. If
+/// every decision request is a full cache miss, the feature costs more than the
+/// compression it triggers and is not worth building.
+///
+/// Measures it directly: send a main request with a large stable history, then
+/// a decision request with the SAME history and a different tail, and compare
+/// the `cached` figure the provider reports.
+///
+/// Gated on an env var so CI (no provider credentials) skips it:
+///
+/// ```text
+/// YAK_DECIDE_PROBE=1 cargo test a_decision_request_reads -- --nocapture
+/// ```
+#[test]
+fn a_decision_request_reads_the_main_prefix_from_cache() {
+    if std::env::var("YAK_DECIDE_PROBE").is_err() {
+        eprintln!("skipped: set YAK_DECIDE_PROBE=1 to run against a real provider");
+        return;
+    }
+    let query = std::env::var("YAK_DECIDE_MODEL")
+        .unwrap_or_else(|_| "hub/deepseek-v4.1-flash-1017".to_string());
+    let model = resolve_model_by_id(&query).unwrap_or_else(|e| panic!("cannot resolve {query}: {e}"));
+
+    // 20 turns of prose: big enough that a cache hit is unmistakable.
+    let mut history = Vec::new();
+    for i in 0..20 {
+        history.push(Msg::user(format!(
+            "Question {i}: describe the behaviour of component {i} in the system, \
+             including its inputs, outputs, failure modes and the invariants it \
+             maintains. Answer in prose."
+        )));
+        history.push(Msg::assistant(
+            "Component accepts a stream of records and emits a projection. It \
+             validates each record against the schema, buffers up to a fixed \
+             window, and flushes on either a boundary marker or the window limit. \
+             Its failure modes are schema rejection (reported, never silently \
+             dropped), buffer overflow (backpressure, not truncation) and a \
+             mid-stream reset (the caller replays from the last acknowledged \
+             offset). The invariant it maintains is that every emitted projection \
+             covers a contiguous, non-overlapping span of the input, and that no \
+             record is emitted twice."
+                .to_string(),
+        ));
+    }
+    let history_tokens: u64 = history
+        .iter()
+        .map(|m| match m {
+            Msg::User { text, .. } | Msg::Assistant { text, .. } | Msg::Summary { text } => {
+                (text.chars().count() as u64).div_ceil(4)
+            }
+            Msg::ToolResult { content, .. } => (content.chars().count() as u64).div_ceil(4),
+        })
+        .sum();
+    eprintln!("history ≈ {history_tokens} tokens over {} messages", history.len());
+
+    let measure = |prompt: &str| -> (u64, u64, String) {
+        let input = PromptInput {
+            max_request_bytes: crate::core::http::MAX_REQUEST_BYTES,
+            system: None,
+            history: &history,
+            prompt,
+            attachments: &[],
+            tools: &[],
+            reasoning: None,
+            cache_anchor: None,
+            cache_key: None,
+            cache_ttl: None,
+        };
+        let mut usage = None;
+        let mut text = String::new();
+        model
+            .stream(&input, true, &mut |event| match event {
+                Event::Delta(t) => text.push_str(&t),
+                Event::Usage(u) => usage = Some(u),
+                _ => {}
+            })
+            .expect("request");
+        let u = usage.expect("the provider reported no usage");
+        (u.input, u.cached, text)
+    };
+
+    let (input1, cached1, _) = measure("Summarise the components above in one sentence.");
+    eprintln!("main:      input={input1} cached={cached1}");
+
+    let decision_prompt = "Given the conversation above exactly as it stands now, \
+        is compressing older consumed context NOW net-beneficial for the current task?\n\
+        Reply with ONLY one line of JSON, nothing else:\n\
+        {\"compress\": false}\n\
+        or {\"compress\": true, \"range\": \"mNNNNN-mNNNNN\", \"topic\": \"<short topic>\"}";
+    let (input2, cached2, text2) = measure(decision_prompt);
+    eprintln!("decision:  input={input2} cached={cached2}");
+    eprintln!("decision answer: {:?}", text2.trim());
+
+    let reused = cached2 as f64 / history_tokens.max(1) as f64;
+    eprintln!(
+        "prefix reuse: {:.1}% of the history ({cached2} / ~{history_tokens})",
+        reused * 100.0
+    );
+    assert!(
+        reused >= 0.5,
+        "the decision request reused only {:.0}% of the prefix (cached={cached2}, \
+         history≈{history_tokens}); the side-channel would cost a full cache miss \
+         per decision and is not worth building as designed",
+        reused * 100.0
+    );
+}
