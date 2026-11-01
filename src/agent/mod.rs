@@ -362,21 +362,6 @@ pub fn run_agent(
             // node — crush, CCR, prune, truncate, render-refs — was never
             // running where the growth happens. Only the nudge had been moved
             // into the loop.
-            if std::env::var("YAK_CCR_DEBUG").is_ok() {
-                eprintln!(
-                    "[round] history={} kinds={:?}",
-                    history.len(),
-                    history
-                        .iter()
-                        .map(|m| match m {
-                            crate::agent::Msg::User { .. } => "U",
-                            crate::agent::Msg::Assistant { .. } => "A",
-                            crate::agent::Msg::ToolResult { name, .. } => name.as_str(),
-                            crate::agent::Msg::Summary { .. } => "S",
-                        })
-                        .collect::<Vec<_>>()
-                );
-            }
             let mut store_guard = opts.ccr_store.as_ref().and_then(|s| s.lock().ok());
             let (view, state, nudge) = crate::agent::session::bigctx_round_view(
                 &round_view,

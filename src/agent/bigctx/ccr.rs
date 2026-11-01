@@ -350,38 +350,17 @@ pub fn project(
         reprojected: 0,
     };
 
-    if std::env::var("YAK_CCR_DEBUG").is_ok() {
-        eprintln!(
-            "[ccr] entered with {} msgs: {:?}",
-            messages.len(),
-            messages
-                .iter()
-                .map(|m| format!("{}:{:?}", m.id, m.content_type))
-                .collect::<Vec<_>>()
-        );
-    }
     for message in messages {
         if message.content_type != MessageContentType::ToolResult {
             result.messages.push(message.clone());
             continue;
         }
         if is_never_stored(message.tool_name.as_deref()) {
-            if std::env::var("YAK_CCR_DEBUG").is_ok() {
-                eprintln!("[ccr] skip {} never-stored {:?}", message.id, message.tool_name);
-            }
             result.messages.push(message.clone());
             continue;
         }
         let text = message.text_or_empty();
         if text.is_empty() || parse_placeholder(text).is_some() {
-            if std::env::var("YAK_CCR_DEBUG").is_ok() {
-                eprintln!(
-                    "[ccr] skip {} empty={} placeholder={}",
-                    message.id,
-                    text.is_empty(),
-                    parse_placeholder(text).is_some()
-                );
-            }
             result.messages.push(message.clone());
             continue;
         }
@@ -409,17 +388,6 @@ pub fn project(
         }
 
         let tokens = count_message_tokens(message);
-        if std::env::var("YAK_CCR_DEBUG").is_ok() {
-            eprintln!(
-                "[ccr] {} tool={:?} tokens={} min={} head={:?} len={}",
-                message.id,
-                message.tool_name.as_deref(),
-                tokens,
-                min_tokens,
-                &message.text_or_empty()[..message.text_or_empty().len().min(50)],
-                message.text_or_empty().len()
-            );
-        }
         if tokens < min_tokens {
             result.messages.push(message.clone());
             continue;
@@ -431,9 +399,6 @@ pub fn project(
         // first line does, when they are available.
         let command = extract_command(message.text.as_deref(), MAX_HEAD_CHARS);
 
-        if std::env::var("YAK_CCR_DEBUG").is_ok() {
-            eprintln!("[ccr] STORING {} ref={} tokens={}", message.id, reference, tokens);
-        }
         store.store(
             &reference,
             &message.id,
