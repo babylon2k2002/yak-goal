@@ -344,7 +344,7 @@ fn rebuild_messages(
         // check deliberately PRECEDES the covered check: swapping them would
         // let a range strip the last guaranteed user message off the wire, and
         // strict providers reject a conversation with no user message.
-        if false && Some(index) == first_user_index {
+        if Some(index) == first_user_index {
             result.push(message.clone());
             continue;
         }
