@@ -1310,3 +1310,76 @@ fn a_transport_failure_is_still_resent() {
 fn an_interrupt_is_never_resent() {
     assert!(!recoverable_failure("interrupted"));
 }
+
+/// A tool result must be stored before either destructive pruner can shrink
+/// it below CCR's floor.
+///
+/// The pruners keep 4,096 head + 1,024 tail chars. For a result just over the
+/// 8,192-char prune threshold that is ~5.2K chars / ~1.3K tokens — under the
+/// 4,000-token CCR floor — so the original was neither kept nor storable and
+/// the dropped middle was gone for good.
+#[test]
+fn an_oversized_result_is_stored_before_the_pruners_shrink_it() {
+    use crate::agent::bigctx;
+
+    // 26,143 chars: the size that reproduced the loss (a 26K source file).
+    let body = "x".repeat(26_143);
+    let mut history = vec![
+        Msg::user("read the file"),
+        Msg::ToolResult {
+            call_id: "c1".into(),
+            name: "read".into(),
+            content: body.clone(),
+            error: None,
+            attachments: Vec::new(),
+        },
+    ];
+
+    let handle = bigctx::BigctxHandle::new();
+    let store = std::sync::Arc::new(std::sync::Mutex::new(bigctx::ContentStore::new()));
+    let mut opts = test_opts();
+    opts.bigctx = Some(&handle);
+    opts.ccr_store = Some(store.clone());
+    // The tools read their config from the installed session, so install one
+    // the way a real round does.
+    handle.set(crate::agent::session::bigctx_turn(
+        &history,
+        None,
+        1,
+        Some(200_000),
+        None,
+        None,
+        Some(&store),
+    ));
+
+    ccr_store_pending(&mut history, &opts);
+
+    let Msg::ToolResult { content, .. } = &history[1] else {
+        panic!("the result must survive as a tool result");
+    };
+    assert!(
+        bigctx::parse_placeholder(content).is_some(),
+        "an oversized result must become a placeholder, not stay raw: {content:.80}"
+    );
+    assert!(
+        content.len() < 200,
+        "the placeholder must be short, or the pruners still have work: {} chars",
+        content.len()
+    );
+    let parsed = bigctx::parse_placeholder(content).unwrap();
+    let original = store
+        .lock()
+        .unwrap()
+        .original(&parsed.reference)
+        .expect("the original must be retrievable")
+        .to_string();
+    assert_eq!(
+        original, body,
+        "the stored original must be the bytes the tool returned"
+    );
+
+    // The point of running first: the pruners now find nothing to cut, so the
+    // payload is not silently destroyed on the way past them.
+    let pruned = compact::prune_tool_results(&mut history);
+    assert_eq!(pruned.count, 0, "a placeholder is not a pruning candidate");
+}
