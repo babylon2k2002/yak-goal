@@ -462,6 +462,19 @@ pub fn run_agent(
         // image turns keep their pixels — including anything a tool result
         // added mid-run.
         crate::agent::session::budget_images(&mut history);
+        // Store oversized tool results BEFORE either destructive pruner runs.
+        //
+        // A tool result joins `history` inside the round that produced it —
+        // after this round's `round_view` snapshot was taken. So the pipeline
+        // above never sees it, and the pruners below would cut it down on the
+        // very same round: a 26K-char result became 5.2K chars (1,313 tokens),
+        // which is under CCR's 4,000-token floor, so the original was neither
+        // kept nor storable. The two systems were fighting over one payload and
+        // the lossy one always won, because it ran first.
+        //
+        // Run CCR here instead: the placeholder is ~90 chars, so both pruners
+        // find nothing to cut, and the original stays retrievable by ref.
+        ccr_store_pending(&mut history, opts);
         // the trigger is window-anchored, never a running count: it cannot
         // change across the run, so it is resolved fresh at each use from the
         // config and the model's window, with no cache to keep honest
@@ -1039,6 +1052,97 @@ struct AfterTurn {
     usage_marker: Option<(usize, Usage)>,
     /// stable cache prefix, or None once the rebuild rewrote below the summary
     cache_stable: Option<usize>,
+}
+
+/// Store the oversized tool results a round just produced, before the lossy
+/// pruners get to them.
+///
+/// A tool result joins `history` inside the round that produced it, after that
+/// round's `round_view` snapshot. The bigctx pipeline therefore never saw it,
+/// and `price_and_rewrite` / `maybe_compact` would cut it down on the same
+/// round. `prune_one` keeps 4,096 head + 1,024 tail chars, which lands under
+/// CCR's 4,000-token floor — the original was then neither kept nor storable.
+///
+/// Runs CCR against `history` with the ref map this round already assigned, so
+/// the placeholder written back carries the same ref the tools will resolve.
+/// The placeholder is ~90 chars, far below `PRUNE_THRESHOLD_CHARS`, so the
+/// pruners that follow find nothing to cut.
+fn ccr_store_pending(history: &mut [Msg], opts: &AgentOptions) {
+    let (Some(handle), Some(store)) = (opts.bigctx.as_ref(), opts.ccr_store.as_ref()) else {
+        return;
+    };
+    // CCR off means the pruners stay in charge: nothing to hand over.
+    let Some(min_tokens) = handle.with(|s| s.config.ccr.min_tool_tokens) else {
+        return;
+    };
+    if !handle.with(|s| s.config.ccr.enabled).unwrap_or(false) {
+        return;
+    }
+    let projection = crate::agent::bigctx::project(
+        history,
+        crate::agent::bigctx::IdScheme {
+            round: opts.bigctx_round.max(1),
+            first_slot: 0,
+        },
+    );
+    // Assign refs against the session's own map and advance its counter, so the
+    // placeholder carries the ref the tools will resolve. A ref minted here from
+    // a private copy of the state would diverge from the one `bigctx_turn`
+    // assigns next round, and the model would be handed a ref nothing resolves.
+    let mut projected = None;
+    handle.with(|session| {
+        let mut next_index = session.state.next_ref_index;
+        let _ = crate::agent::bigctx::assign_refs(
+            &projection.messages,
+            &mut session.state.message_refs,
+            &mut next_index,
+            |_| false,
+        );
+        session.state.next_ref_index = next_index;
+        let Ok(mut store) = store.lock() else {
+            return;
+        };
+        projected = Some(crate::agent::bigctx::ccr_project(
+            &projection.messages,
+            &mut session.state,
+            &mut store,
+            min_tokens,
+        ));
+        // Write back only where the slot still holds the exact text the store
+        // recorded: two calls in one round can share an id, and matching on id
+        // alone would put one result's placeholder over another's.
+        let Some(projected) = projected.as_ref() else {
+            return;
+        };
+        if projected.stored == 0 && projected.reprojected == 0 {
+            return;
+        }
+        for message in &projected.messages {
+            let crate::agent::bigctx::CoreMessage {
+                text: Some(text),
+                content_type: crate::agent::bigctx::MessageContentType::ToolResult,
+                ..
+            } = message
+            else {
+                continue;
+            };
+            let Some(parsed) = crate::agent::bigctx::parse_placeholder(text) else {
+                continue;
+            };
+            let Some(original) = store.original(&parsed.reference) else {
+                continue;
+            };
+            for slot in history.iter_mut() {
+                let Msg::ToolResult { content, .. } = slot else {
+                    continue;
+                };
+                if content == original {
+                    *content = text.clone();
+                    break;
+                }
+            }
+        }
+    });
 }
 
 /// Compact when the estimate says the window is under pressure: prune
