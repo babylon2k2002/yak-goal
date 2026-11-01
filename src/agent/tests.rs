@@ -1362,8 +1362,9 @@ fn an_oversized_result_is_stored_before_the_pruners_shrink_it() {
         "an oversized result must become a placeholder, not stay raw: {content:.80}"
     );
     assert!(
-        content.len() < 200,
-        "the placeholder must be short, or the pruners still have work: {} chars",
+        content.len() < compact::PRUNE_THRESHOLD_CHARS,
+        "the placeholder must sit below the prune threshold, or the pruners \
+         still have work: {} chars",
         content.len()
     );
     let parsed = bigctx::parse_placeholder(content).unwrap();
