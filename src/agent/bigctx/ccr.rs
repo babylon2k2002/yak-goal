@@ -350,6 +350,16 @@ pub fn project(
         reprojected: 0,
     };
 
+    if std::env::var("YAK_CCR_DEBUG").is_ok() {
+        eprintln!(
+            "[ccr] entered with {} msgs: {:?}",
+            messages.len(),
+            messages
+                .iter()
+                .map(|m| format!("{}:{:?}", m.id, m.content_type))
+                .collect::<Vec<_>>()
+        );
+    }
     for message in messages {
         if message.content_type != MessageContentType::ToolResult {
             result.messages.push(message.clone());
