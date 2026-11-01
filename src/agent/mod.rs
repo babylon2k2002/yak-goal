@@ -1100,7 +1100,6 @@ fn price_and_rewrite(
     window: Option<u64>,
     on_update: &mut dyn FnMut(AgentUpdate),
     bigctx: Option<&crate::agent::bigctx::BigctxHandle>,
-    round: u64,
 ) -> Option<u64> {
     let mut used_tokens = cfg.map(|_| compact::estimate_tokens(history, usage_marker));
     let rewrite = match (cfg, used_tokens) {
@@ -1271,7 +1270,6 @@ fn maybe_compact(
     sink: &mut StallSink<'_>,
     ch: &mut CompactHooks<'_>,
     bigctx: Option<&crate::agent::bigctx::BigctxHandle>,
-    round: u64,
 ) -> AfterTurn {
     let mut after = AfterTurn {
         usage_marker,
