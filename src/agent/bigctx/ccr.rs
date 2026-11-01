@@ -366,11 +366,22 @@ pub fn project(
             continue;
         }
         if is_never_stored(message.tool_name.as_deref()) {
+            if std::env::var("YAK_CCR_DEBUG").is_ok() {
+                eprintln!("[ccr] skip {} never-stored {:?}", message.id, message.tool_name);
+            }
             result.messages.push(message.clone());
             continue;
         }
         let text = message.text_or_empty();
         if text.is_empty() || parse_placeholder(text).is_some() {
+            if std::env::var("YAK_CCR_DEBUG").is_ok() {
+                eprintln!(
+                    "[ccr] skip {} empty={} placeholder={}",
+                    message.id,
+                    text.is_empty(),
+                    parse_placeholder(text).is_some()
+                );
+            }
             result.messages.push(message.clone());
             continue;
         }
