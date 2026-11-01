@@ -319,13 +319,21 @@ pub fn build_cache_report(
     // `folds` carries each fold with the number of requests that followed it,
     // which lets the timeline be reconstructed: fold k happened after
     // `samples.len() - requests_after` requests.
-    let mut pending: Vec<FoldEvent> = Vec::new();
+    //
+    // Each entry keeps its index into `folds`: `decompose` reports which
+    // pending fold the re-payment belongs to, and that credit has to land on
+    // the fold itself. Dropping the index here left every fold's `repay` at 0,
+    // so `fold_economics` judged payback against a re-payment it never saw —
+    // every fold read as "has not paid back".
+    let mut pending: Vec<(usize, FoldEvent)> = Vec::new();
+    // Re-payment credited per fold, by index into `folds`.
+    let mut repaid: Vec<u64> = vec![0; folds.len()];
     for (index, sample) in samples.iter().enumerate() {
         // Everything folded before this request and not yet charged.
-        for (fold, requests_after, _) in folds {
+        for (fold_index, (fold, requests_after, _)) in folds.iter().enumerate() {
             let happened_before = samples.len().saturating_sub(*requests_after);
             if happened_before == index {
-                pending.push(*fold);
+                pending.push((fold_index, *fold));
             }
         }
 
@@ -334,19 +342,32 @@ pub fn build_cache_report(
         totals.output += sample.output;
 
         let prev = index.checked_sub(1).map(|i| &samples[i]);
-        let decomposition = decompose(prev, sample, &pending);
+        let pending_folds: Vec<FoldEvent> = pending.iter().map(|(_, fold)| *fold).collect();
+        let decomposition = decompose(prev, sample, &pending_folds);
         totals.new_content += decomposition.new_content;
         totals.comp_repay += decomposition.comp_repay;
         totals.ttl_repay += decomposition.ttl_repay;
 
         // A fold is credited to the first sample after it and no further: the
         // re-payment happens once, on the request whose prefix moved.
-        if decomposition.fold_index.is_some() {
+        if let Some(owner) = decomposition.fold_index {
+            // `decompose` indexes into the slice it was handed, so map back
+            // through `pending` to the fold's place in `folds`.
+            if let Some((fold_index, _)) = pending.get(owner) {
+                repaid[*fold_index] += decomposition.comp_repay;
+            }
             pending.clear();
         }
     }
 
-    let economics = fold_economics(folds);
+    // Hand each fold the re-payment actually measured against it, rather than
+    // the 0 it was created with.
+    let charged: Vec<(FoldEvent, usize, u64)> = folds
+        .iter()
+        .enumerate()
+        .map(|(index, (fold, requests_after, _))| (*fold, *requests_after, repaid[index]))
+        .collect();
+    let economics = fold_economics(&charged);
     let measured_folds = economics
         .iter()
         .filter(|f| f.breakeven_turns.is_some() && f.requests_after > 0)
@@ -722,7 +743,6 @@ struct LedgerState {
 
 struct LedgerFold {
     event: FoldEvent,
-    repay: u64,
 }
 
 impl CacheLedger {
@@ -744,7 +764,7 @@ impl CacheLedger {
     /// follow.
     pub fn record_fold(&self, event: FoldEvent) {
         if let Ok(mut state) = self.inner.lock() {
-            state.folds.push(LedgerFold { event, repay: 0 });
+            state.folds.push(LedgerFold { event });
             state.requests_since.push(0);
         }
     }
@@ -755,13 +775,13 @@ impl CacheLedger {
             return build_cache_report(&[], &[]);
         };
         // Pair each fold with how many requests followed it. The re-payment is
-        // attributed by the decomposition inside build_cache_report, so the
-        // per-fold figure here is derived from the same pass.
+        // not tracked here: `build_cache_report` attributes it by decomposition
+        // and credits the owning fold, so the 0 passed in is a placeholder.
         let folds: Vec<(FoldEvent, usize, u64)> = state
             .folds
             .iter()
             .zip(state.requests_since.iter())
-            .map(|(fold, after)| (fold.event, *after, fold.repay))
+            .map(|(fold, after)| (fold.event, *after, 0))
             .collect();
         build_cache_report(&state.samples, &folds)
     }
@@ -843,5 +863,60 @@ mod ledger_tests {
         }
         let report = ledger.report();
         assert!(report.balances(), "residual {}", report.totals.residual());
+    }
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+
+    /// A fold's re-payment must be credited to that fold.
+    ///
+    /// `decompose` reports which pending fold the re-payment belongs to, but
+    /// `build_cache_report` used to discard that index — every fold kept the
+    /// `repay: 0` it was created with. `fold_economics` then judged payback
+    /// against a cost it never saw, so a fold that had actually paid back read
+    /// as "not paid back" forever.
+    #[test]
+    fn a_measured_repayment_lands_on_the_fold_that_caused_it() {
+        // Two requests; a fold landed between them and the prefix moved.
+        let samples = vec![
+            CacheSample::new(10_000, 0, 100),
+            // The rewrite: the cached prefix shrank hard and the miss is large.
+            CacheSample::new(20_000, 2_000, 100),
+        ];
+        // 10K removed, 100-token summary, one request after it.
+        let folds = vec![(FoldEvent::new(10_000, 100), 1, 0)];
+
+        let report = build_cache_report(&samples, &folds);
+        assert!(
+            report.folds[0].repay > 0,
+            "the re-payment must be attributed to the fold, not left at 0"
+        );
+        assert_eq!(
+            report.folds[0].repay, report.totals.comp_repay,
+            "the per-fold credit must sum to the measured total"
+        );
+        assert_eq!(report.folds[0].net_token_delta, {
+            let f = &report.folds[0];
+            f.repay as i64 + f.summary as i64 - f.saved as i64
+        });
+    }
+
+    /// The ledger's own path must produce the same attribution: it hands
+    /// `build_cache_report` a placeholder 0, which must not survive.
+    #[test]
+    fn the_ledger_reports_the_same_repayment_as_the_raw_builder() {
+        let ledger = CacheLedger::new();
+        ledger.record_sample(CacheSample::new(10_000, 0, 100));
+        ledger.record_fold(FoldEvent::new(10_000, 100));
+        ledger.record_sample(CacheSample::new(20_000, 2_000, 100));
+
+        let report = ledger.report();
+        assert_eq!(report.totals.requests, 2);
+        assert!(
+            report.folds[0].repay > 0,
+            "the ledger's placeholder 0 must be replaced by the attribution"
+        );
     }
 }

@@ -505,6 +505,7 @@ pub fn run_agent(
             cfg_now.as_ref(),
             model.context_window,
             on_update,
+            opts.bigctx.as_ref(),
         );
         // the pre-request compaction check: a session
         // that was interrupted — or resumed — over its window is compacted
@@ -526,6 +527,7 @@ pub fn run_agent(
                 cache_stable,
                 &mut sink,
                 &mut ch,
+                opts.bigctx.as_ref(),
             );
             usage_marker = after.usage_marker;
             cache_stable = after.cache_stable;
@@ -1043,6 +1045,7 @@ fn price_and_rewrite(
     cfg: Option<&compact::CompactConfig>,
     window: Option<u64>,
     on_update: &mut dyn FnMut(AgentUpdate),
+    bigctx: Option<&crate::agent::bigctx::BigctxHandle>,
 ) -> Option<u64> {
     let mut used_tokens = cfg.map(|_| compact::estimate_tokens(history, usage_marker));
     let rewrite = match (cfg, used_tokens) {
@@ -1051,10 +1054,25 @@ fn price_and_rewrite(
         }
         (None, _) | (Some(_), None) => true,
     };
+    // Same yield as `maybe_compact`: while a fold is pending, cutting a tool
+    // result down shrinks the very range the nudge pointed at. Attachments are
+    // still trimmed — they are not foldable material.
+    let fold_pending = bigctx_fold_pending(
+        bigctx,
+        used_tokens.unwrap_or(0),
+        window,
+    );
     if rewrite {
         compact::trim_old_attachments(history);
         // the pass is idempotent, so its notice fires at most once per result
-        let stale = compact::prune_stale_tool_results(history);
+        let stale = if fold_pending {
+            compact::PrunedResults {
+                count: 0,
+                freed_tokens: 0,
+            }
+        } else {
+            compact::prune_stale_tool_results(history)
+        };
         if stale.count > 0 {
             on_update(AgentUpdate::ToolResultsPruned { count: stale.count });
         }
@@ -1152,6 +1170,37 @@ fn ccr_store_pending(history: &mut [Msg], opts: &AgentOptions) {
     }
 }
 
+/// True when a nudge is outstanding and the model has not folded yet.
+///
+/// The signal is "we told it to compress and it has not" — not a timer. A
+/// successful fold calls `reset_after_compression`, which zeroes
+/// `last_nudge_shown_tokens`, so a non-zero value there means the nudge is
+/// still unanswered.
+///
+/// Bounded by the window: past `YIELD_CEILING_PCT` there is no room to wait for
+/// a model call, so the summarizer takes over regardless.
+fn bigctx_fold_pending(
+    bigctx: Option<&crate::agent::bigctx::BigctxHandle>,
+    estimate: u64,
+    window: Option<u64>,
+) -> bool {
+    /// Above this share of the window the summarizer stops waiting.
+    const YIELD_CEILING_PCT: f64 = 0.85;
+
+    let Some(handle) = bigctx else {
+        return false;
+    };
+    if let Some(w) = window
+        && w > 0
+        && estimate as f64 / w as f64 >= YIELD_CEILING_PCT
+    {
+        return false;
+    }
+    handle
+        .with(|session| session.state.nudge.last_nudge_shown_tokens > 0)
+        .unwrap_or(false)
+}
+
 /// Compact when the estimate says the window is under pressure: prune
 /// oversized tool results first (no model call, and it may relieve enough to
 /// skip summarizing at all), then summarize at a turn boundary. Runs before a
@@ -1166,6 +1215,7 @@ fn maybe_compact(
     cache_stable: Option<usize>,
     sink: &mut StallSink<'_>,
     ch: &mut CompactHooks<'_>,
+    bigctx: Option<&crate::agent::bigctx::BigctxHandle>,
 ) -> AfterTurn {
     let mut after = AfterTurn {
         usage_marker,
@@ -1180,6 +1230,20 @@ fn maybe_compact(
     // same chars/4 math `prune_seed_to_fit` runs), because a gateway that omits
     // usage must not silently switch the window gate off.
     let mut estimate = compact::estimate_tokens(history, usage_marker);
+    // Let a pending fold answer first.
+    //
+    // bigctx tells the model "these tokens are foldable" and then waits a
+    // round for it to act. This summarizer runs in that gap and rebuilds the
+    // history the model was about to fold, so the nudge's premise disappears:
+    // measured, a nudge offering 13,498 tokens was followed by a summary that
+    // left 100 tokens compressible — below `min_range_tokens`, so `compress`
+    // refused. The model was told to act and then had nothing to act on.
+    //
+    // Yielding one round lets it respond. The yield is bounded: near the
+    // window there is no room to wait, so the summarizer takes over anyway.
+    if bigctx_fold_pending(bigctx, estimate, model.context_window) {
+        return after;
+    }
     if compact::should_compact(estimate, trigger) {
         // pressure confirmed: prune oversized tool results first — it costs no
         // model call and may relieve enough to skip summarization entirely.
