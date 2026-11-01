@@ -62,6 +62,13 @@ pub enum AgentUpdate {
     Compacted {
         removed: usize,
     },
+    /// bigctx folded a range on its own, without the model calling `compress`.
+    /// The original stays retrievable by ref, so this is not a loss — it is
+    /// the deterministic backstop firing because the nudge went unanswered.
+    AutoFolded {
+        block: String,
+        removed: usize,
+    },
     /// one agent round is complete: everything it added to the history is in
     /// place (the pending prompt, the assistant message, the tool results).
     /// The session persists the slice here — at each round boundary, not at
@@ -449,6 +456,51 @@ pub fn run_agent(
             // which neither pruner touches, and the original stays
             // retrievable by ref.
             ccr_store_pending(&mut history, opts);
+
+            // Deterministic backstop: at pressure, fold the largest
+            // compressible range without waiting for the model to call
+            // `compress`. The nudge asks and waits a round; a model that
+            // spends that round on something else would otherwise leave the
+            // session growing past its window. `maybe_auto_fold` declines
+            // while a nudge is still outstanding, so this never steals the
+            // material the nudge just pointed at.
+            let (folded_state, folded) = crate::agent::session::maybe_auto_fold(
+                &round_view,
+                &state,
+                Some(model),
+                opts.bigctx_round,
+                model.context_window,
+                opts.bigctx_config.as_ref(),
+            );
+            if let (Some(folded_state), Some((block, removed))) = (folded_state, folded) {
+                // Re-run the pipeline over the folded state so the round is
+                // sent the view a fold actually produces (summary injected,
+                // folded messages gone) rather than the pre-fold one.
+                let mut store_guard = opts.ccr_store.as_ref().and_then(|s| s.lock().ok());
+                let (folded_view, settled, _) = crate::agent::session::bigctx_round_view(
+                    &round_view,
+                    Some(&folded_state),
+                    opts.bigctx_round,
+                    model.context_window,
+                    opts.bigctx_config.as_ref(),
+                    store_guard.as_deref_mut(),
+                );
+                drop(store_guard);
+                bigctx_view = Some(folded_view);
+                handle.set(crate::agent::session::bigctx_turn(
+                    &round_view,
+                    Some(&settled),
+                    opts.bigctx_round,
+                    model.context_window,
+                    opts.bigctx_config.as_ref(),
+                    opts.cache_ledger.as_ref(),
+                    opts.ccr_store.as_ref(),
+                ));
+                on_update(AgentUpdate::AutoFolded {
+                    block: block.clone(),
+                    removed,
+                });
+            }
 
             if let Some(text) = nudge {
                 round_nudge_text = Some(text);
@@ -1197,7 +1249,14 @@ fn bigctx_fold_pending(
         return false;
     }
     handle
-        .with(|session| session.state.nudge.last_nudge_shown_tokens > 0)
+        .with(|session| {
+            let mark = session.state.nudge.last_nudge_shown_tokens;
+            // A nudge stamped at the CURRENT size means the model has not had
+            // its round yet: yielding here is the point of the mechanism.
+            // Once the context has grown past the mark, a round went by with
+            // no fold, and continuing to yield would let the window fill.
+            mark > 0 && estimate <= mark
+        })
         .unwrap_or(false)
 }
 

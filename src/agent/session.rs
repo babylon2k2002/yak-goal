@@ -218,6 +218,146 @@ pub fn bigctx_view_with_nudge(
     ((view, Some(turn.state)), nudge)
 }
 
+/// Fold the largest compressible range automatically, without waiting for the
+/// model to call `compress`.
+///
+/// The nudge asks the model to compress and then waits a round for it to
+/// act. A model that does not — or that spends the round on something else —
+/// leaves the session growing past its window. This is the deterministic
+/// backstop: at or above the pressure threshold, pick the largest
+/// compressible range, write a summary with the same summarizer the
+/// automatic path uses, and apply the fold.
+///
+/// It runs only when a nudge is NOT outstanding (the model already had its
+/// chance this round) — otherwise it would fold before the model answered,
+/// which is exactly what the yield in `maybe_compact` exists to avoid.
+///
+/// Returns `(new_state, (block_id, messages_folded))` when a fold happened.
+pub fn maybe_auto_fold(
+    history: &[Msg],
+    state: &crate::agent::bigctx::CompressionState,
+    model: Option<&crate::providers::ResolvedModel>,
+    round: u64,
+    window: Option<u64>,
+    overrides: Option<&serde_json::Value>,
+) -> (
+    Option<crate::agent::bigctx::CompressionState>,
+    Option<(String, usize)>,
+) {
+    // The pressure band and what counts as a real saving come from the same
+    // config the nudge uses, so a session that would get a nudge can also be
+    // auto-folded, and a session that would not is left alone.
+    let scheme = crate::agent::bigctx::IdScheme {
+        round: round.max(1),
+        first_slot: 0,
+    };
+    let projection = crate::agent::bigctx::project(history, scheme);
+    let config = crate::agent::bigctx::config_from_json(window.unwrap_or(200_000), overrides);
+    let token_count = crate::agent::compact::estimate_tokens(history, None);
+    let window_tok = config.model_context_limit;
+    // Below the nudge's floor there is no pressure: the fold would save
+    // little and cost a model call plus a cache miss.
+    let usage = if window_tok > 0 {
+        token_count as f64 / window_tok as f64
+    } else {
+        0.0
+    };
+    if usage < config.nudge.min_context_limit_pct {
+        return (None, None);
+    }
+    // Give the model its round. A nudge stamped this round records the
+    // current size, so `token_count == last_nudge_shown_tokens` means the
+    // model has not had a chance to act yet — folding now would steal the
+    // exact material the nudge just pointed at.
+    //
+    // Once the context has grown past that mark, a round has passed without a
+    // fold (a successful fold calls `reset_after_compression`, which zeroes
+    // the mark). That is the case this backstop exists for.
+    if state.nudge.last_nudge_shown_tokens > 0
+        && token_count <= state.nudge.last_nudge_shown_tokens
+    {
+        return (None, None);
+    }
+    let ranges = crate::agent::bigctx::screen(&projection.messages, state, &config);
+    let Some(best) = ranges
+        .compressible
+        .iter()
+        .max_by_key(|r| r.tokens)
+    else {
+        return (None, None);
+    };
+    // `screen` already merged to the minimum range; a remaining range here is
+    // worth folding.
+    let resolved = match crate::agent::bigctx::resolve_boundaries(
+        &best.start_ref,
+        &best.end_ref,
+        &projection.messages,
+        state,
+    ) {
+        Ok(resolved) => resolved,
+        Err(_) => return (None, None),
+    };
+    // The summary needs the model; without one, nothing to fold with.
+    let Some(model) = model else {
+        return (None, None);
+    };
+    let summary = match crate::agent::compact::summarize(
+        model,
+        &history[resolved.start_index..=resolved.end_index.min(history.len() - 1)],
+        None,
+    ) {
+        Ok(summary) => summary,
+        Err(_) => return (None, None),
+    };
+    let protection = crate::agent::bigctx::compute_protection(
+        &projection.messages,
+        state,
+        &config,
+    );
+    let mut new_state = state.clone();
+    let outcome = crate::agent::bigctx::apply_compression(
+        &mut new_state,
+        &projection.messages,
+        &resolved,
+        &summary,
+        &protection,
+        &config,
+        None,
+        now(),
+    );
+    match outcome {
+        Ok(outcome) => {
+            // The fold is the response the nudge asked for, so that nudge is
+            // spent: clear the mark and re-arm from the new size. Without
+            // this the session stays "already nudged" forever, the yield in
+            // `maybe_compact` never lifts, and the context grows unchecked.
+            let remaining = crate::agent::bigctx::screen(
+                &projection.messages,
+                &new_state,
+                &config,
+            );
+            crate::agent::bigctx::reset_after_compression(
+                &mut new_state,
+                remaining.compressible_tokens(),
+            );
+            (
+                Some(new_state),
+                Some((outcome.block_id, outcome.message_count)),
+            )
+        }
+        Err(_) => (None, None),
+    }
+}
+
+/// Unix seconds — the timestamp `CompressionBlock` wants. Kept next to the
+/// only caller so the clock source is obvious.
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Decide and render a nudge for one round of a running task.
 ///
 /// Separate from [`bigctx_view_with_nudge`] because that runs once per TASK,
@@ -731,6 +871,12 @@ impl Session {
                     // the post-fold prefill reads as a hang
                     view.borrow_mut().resume_wait();
                 }
+                AgentUpdate::AutoFolded { .. } => {
+                    // Same shape as a compaction: the round about to be sent
+                    // is the post-fold one, so settle the line and spin.
+                    view.borrow_mut().pause();
+                    view.borrow_mut().resume_wait();
+                }
                 AgentUpdate::CompactStalled { reason } => {
                     // compaction is due and cannot run: the session keeps
                     // growing over the window, so the reason is the one thing
@@ -943,6 +1089,9 @@ impl Session {
                 view.borrow_mut().relabel("compacting context");
             }
             AgentUpdate::Compacted { .. } => {
+                view.borrow_mut().pause();
+            }
+            AgentUpdate::AutoFolded { .. } => {
                 view.borrow_mut().pause();
             }
             AgentUpdate::CompactStalled { reason } => {
@@ -1340,6 +1489,9 @@ fn event_json(u: &AgentUpdate) -> serde_json::Value {
         }
         AgentUpdate::Compacted { removed } => {
             serde_json::json!({"type": "compacted", "removed": removed})
+        }
+        AgentUpdate::AutoFolded { block, removed } => {
+            serde_json::json!({"type": "auto_folded", "block": block, "removed": removed})
         }
         AgentUpdate::Compacting => serde_json::json!({"type": "compacting"}),
         AgentUpdate::CompactStalled { reason } => {
