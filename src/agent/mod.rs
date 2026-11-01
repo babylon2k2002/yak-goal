@@ -420,8 +420,20 @@ pub fn run_agent(
             }
 
             bigctx_view = Some(view.clone());
+            // Hand the tools the FULL array, not the pruned view.
+            //
+            // `project` mints ids from array position (`t{round}.{index}`), so
+            // projecting `view` instead of `round_view` gives the same message
+            // a different id. The tools then cite ids that exist in the view
+            // but not in the array a fold is applied to, and a fold recorded
+            // against them covers messages `audit` cannot find: "b1 covers 5
+            // message(s) that are not in the history — it cannot be restored".
+            //
+            // The full array is also what `screen` and `compress` need: a
+            // folded message is hidden from the view by design, and folding it
+            // again (or resolving it) must still work.
             handle.set(crate::agent::session::bigctx_turn(
-                &view,
+                &round_view,
                 Some(&state),
                 opts.bigctx_round,
                 model.context_window,
@@ -429,6 +441,14 @@ pub fn run_agent(
                 opts.cache_ledger.as_ref(),
                 opts.ccr_store.as_ref(),
             ));
+            // CCR now runs here, against the same array the tools were just
+            // given. A tool result joins `history` inside the round that
+            // produced it, after this round's snapshot, so the pipeline above
+            // never saw it; the pruners below would cut it down on this same
+            // round. Running CCR first turns it into a ~200-char placeholder,
+            // which neither pruner touches, and the original stays
+            // retrievable by ref.
+            ccr_store_pending(&mut history, opts);
 
             if let Some(text) = nudge {
                 if std::env::var("YAK_NUDGE_DEBUG").is_ok() {
@@ -1064,64 +1084,41 @@ struct AfterTurn {
 /// round's `round_view` snapshot. The bigctx pipeline therefore never saw it,
 /// and `price_and_rewrite` / `maybe_compact` would cut it down on the same
 /// round. `prune_one` keeps 4,096 head + 1,024 tail chars, which lands under
-/// CCR's 4,000-token floor — the original was then neither kept nor storable.
+/// CCR's 4,000-token floor — the original was then neither kept nor storable,
+/// and the dropped middle was gone for good.
 ///
-/// Runs CCR against `history` with the ref map this round already assigned, so
-/// the placeholder written back carries the same ref the tools will resolve.
-/// The placeholder is ~90 chars, far below `PRUNE_THRESHOLD_CHARS`, so the
-/// pruners that follow find nothing to cut.
+/// Works from the session the tools were just handed (`session.messages`), not
+/// from a fresh projection: `project` mints ids from array position, so a
+/// second projection would assign the same message a different id and the
+/// placeholder would carry a ref nothing resolves. Only the tool results that
+/// changed are copied back, matched on content so a duplicate call id cannot
+/// put one result's placeholder over another's.
 fn ccr_store_pending(history: &mut [Msg], opts: &AgentOptions) {
     let (Some(handle), Some(store)) = (opts.bigctx.as_ref(), opts.ccr_store.as_ref()) else {
         return;
     };
-    // CCR off means the pruners stay in charge: nothing to hand over.
-    let Some(min_tokens) = handle.with(|s| s.config.ccr.min_tool_tokens) else {
+    let Ok(mut store) = store.lock() else {
         return;
     };
-    if !handle.with(|s| s.config.ccr.enabled).unwrap_or(false) {
-        return;
-    }
-    let projection = crate::agent::bigctx::project(
-        history,
-        crate::agent::bigctx::IdScheme {
-            round: opts.bigctx_round.max(1),
-            first_slot: 0,
-        },
-    );
-    // Assign refs against the session's own map and advance its counter, so the
-    // placeholder carries the ref the tools will resolve. A ref minted here from
-    // a private copy of the state would diverge from the one `bigctx_turn`
-    // assigns next round, and the model would be handed a ref nothing resolves.
-    let mut projected = None;
+    // (id, new text) for every tool result CCR replaced this pass.
+    let mut replacements: Vec<(String, String)> = Vec::new();
     handle.with(|session| {
-        let mut next_index = session.state.next_ref_index;
-        let _ = crate::agent::bigctx::assign_refs(
-            &projection.messages,
-            &mut session.state.message_refs,
-            &mut next_index,
-            |_| false,
-        );
-        session.state.next_ref_index = next_index;
-        let Ok(mut store) = store.lock() else {
+        if !session.config.ccr.enabled {
             return;
-        };
-        projected = Some(crate::agent::bigctx::ccr_project(
-            &projection.messages,
+        }
+        let min_tokens = session.config.ccr.min_tool_tokens;
+        let projected = crate::agent::bigctx::ccr_project(
+            &session.messages,
             &mut session.state,
             &mut store,
             min_tokens,
-        ));
-        // Write back only where the slot still holds the exact text the store
-        // recorded: two calls in one round can share an id, and matching on id
-        // alone would put one result's placeholder over another's.
-        let Some(projected) = projected.as_ref() else {
-            return;
-        };
+        );
         if projected.stored == 0 && projected.reprojected == 0 {
             return;
         }
         for message in &projected.messages {
             let crate::agent::bigctx::CoreMessage {
+                id,
                 text: Some(text),
                 content_type: crate::agent::bigctx::MessageContentType::ToolResult,
                 ..
@@ -1129,23 +1126,33 @@ fn ccr_store_pending(history: &mut [Msg], opts: &AgentOptions) {
             else {
                 continue;
             };
-            let Some(parsed) = crate::agent::bigctx::parse_placeholder(text) else {
-                continue;
-            };
-            let Some(original) = store.original(&parsed.reference) else {
-                continue;
-            };
-            for slot in history.iter_mut() {
-                let Msg::ToolResult { content, .. } = slot else {
-                    continue;
-                };
-                if content == original {
-                    *content = text.clone();
-                    break;
-                }
+            if crate::agent::bigctx::parse_placeholder(text).is_some() {
+                replacements.push((id.clone(), text.clone()));
             }
         }
     });
+    if replacements.is_empty() {
+        return;
+    }
+    // The core id is `t{round}.{index}` over the array the session was built
+    // from, which is `history` plus the pending prompt. Map by position back to
+    // the tool results in `history`.
+    for (core_id, text) in replacements {
+        let Some(slot) = core_id
+            .strip_prefix(&format!("t{}.", opts.bigctx_round.max(1)))
+            .and_then(|rest| rest.split('#').next())
+            .and_then(|index| index.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let Some(Msg::ToolResult { content, .. }) = history.get_mut(slot) else {
+            continue;
+        };
+        if crate::agent::bigctx::parse_placeholder(content).is_some() {
+            continue;
+        }
+        *content = text;
+    }
 }
 
 /// Compact when the estimate says the window is under pressure: prune
