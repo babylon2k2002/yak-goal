@@ -1338,7 +1338,7 @@ fn an_oversized_result_is_stored_before_the_pruners_shrink_it() {
     let handle = bigctx::BigctxHandle::new();
     let store = std::sync::Arc::new(std::sync::Mutex::new(bigctx::ContentStore::new()));
     let mut opts = test_opts();
-    opts.bigctx = Some(&handle);
+    opts.bigctx = Some(handle.clone());
     opts.ccr_store = Some(store.clone());
     // The tools read their config from the installed session, so install one
     // the way a real round does.
