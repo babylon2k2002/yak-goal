@@ -1100,6 +1100,7 @@ fn price_and_rewrite(
     window: Option<u64>,
     on_update: &mut dyn FnMut(AgentUpdate),
     bigctx: Option<&crate::agent::bigctx::BigctxHandle>,
+    round: u64,
 ) -> Option<u64> {
     let mut used_tokens = cfg.map(|_| compact::estimate_tokens(history, usage_marker));
     let rewrite = match (cfg, used_tokens) {
@@ -1111,11 +1112,7 @@ fn price_and_rewrite(
     // Same yield as `maybe_compact`: while a fold is pending, cutting a tool
     // result down shrinks the very range the nudge pointed at. Attachments are
     // still trimmed — they are not foldable material.
-    let fold_pending = bigctx_fold_pending(
-        bigctx,
-        used_tokens.unwrap_or(0),
-        window,
-    );
+    let fold_pending = bigctx_fold_pending(bigctx, used_tokens.unwrap_or(0), window, round);
     if rewrite {
         compact::trim_old_attachments(history);
         // the pass is idempotent, so its notice fires at most once per result
@@ -1278,6 +1275,7 @@ fn maybe_compact(
     sink: &mut StallSink<'_>,
     ch: &mut CompactHooks<'_>,
     bigctx: Option<&crate::agent::bigctx::BigctxHandle>,
+    round: u64,
 ) -> AfterTurn {
     let mut after = AfterTurn {
         usage_marker,
