@@ -202,7 +202,6 @@ pub fn bigctx_view_with_nudge(
             &config,
             token_count,
             store.as_deref_mut(),
-            round,
         );
     let view = crate::agent::bigctx::render(&turn.messages, &projection);
 
@@ -491,7 +490,6 @@ pub fn bigctx_round_view(
         &config,
         token_count,
         store.as_deref_mut(),
-        round,
     );
     let view = crate::agent::bigctx::render(&turn.messages, &projection);
     let nudge = round_nudge(
@@ -3155,7 +3153,7 @@ fn auto_fold_declines_while_the_nudge_is_unanswered() {
     // A nudge was stamped at exactly this size: unanswered.
     state.nudge.last_nudge_shown_tokens = tokens;
 
-    let (folded, _) = maybe_auto_fold(&seed, &state, None, 1, Some(40_000), None);
+    let (folded, _) = maybe_auto_fold(&seed, &state, None, 1, Some(40_000), None, true);
     assert!(
         folded.is_none(),
         "the fold must wait for the model's round, not race the nudge it just sent"
@@ -3168,7 +3166,7 @@ fn auto_fold_declines_while_the_nudge_is_unanswered() {
 fn auto_fold_declines_below_the_pressure_floor() {
     let seed = vec![Msg::user("a short question"), Msg::assistant("a short answer")];
     let state = crate::agent::bigctx::create_initial_state();
-    let (folded, _) = maybe_auto_fold(&seed, &state, None, 1, Some(40_000), None);
+    let (folded, _) = maybe_auto_fold(&seed, &state, None, 1, Some(40_000), None, false);
     assert!(folded.is_none(), "no pressure, no fold");
 }
 
@@ -3182,6 +3180,6 @@ fn auto_fold_declines_without_a_model() {
         seed.push(Msg::assistant("the component validates records, buffers a window, and flushes on a boundary"));
     }
     let state = crate::agent::bigctx::create_initial_state();
-    let (folded, _) = maybe_auto_fold(&seed, &state, None, 1, Some(40_000), None);
+    let (folded, _) = maybe_auto_fold(&seed, &state, None, 1, Some(40_000), None, false);
     assert!(folded.is_none(), "no model, no summary, no fold");
 }
