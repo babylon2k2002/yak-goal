@@ -243,15 +243,6 @@ impl MessageRefMap {
 pub struct NudgeState {
     /// Token count at the last injected nudge.
     pub last_nudge_shown_tokens: u64,
-    /// Round number at the last injected nudge.
-    ///
-    /// The automatic fold needs to know whether a round has actually passed
-    /// since the nudge, and neither token count nor `last_nudge_shown_tokens`
-    /// can answer that: the nudge is stamped at the current size on every
-    /// round it fires, so a same-round comparison is always equal. The round
-    /// number is the only monotonic signal that survives the stamp.
-    #[serde(default)]
-    pub last_nudge_round: u64,
     /// Token count at the last per-message nudge.
     pub last_per_message_nudge_tokens: u64,
     /// Session baseline the growth thresholds measure against.

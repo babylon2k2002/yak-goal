@@ -136,7 +136,6 @@ fn a_stalled_compaction_is_reported_once() {
             &mut sink,
             &mut ch,
             None,
-            1,
         );
     }
     assert_eq!(
@@ -170,7 +169,6 @@ fn a_stalled_compaction_is_reported_once() {
             &mut sink,
             &mut ch,
             None,
-            1,
         );
     }
     assert_eq!(stalled(&updates), 1);

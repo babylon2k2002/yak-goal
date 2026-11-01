@@ -241,6 +241,7 @@ pub fn maybe_auto_fold(
     round: u64,
     window: Option<u64>,
     overrides: Option<&serde_json::Value>,
+    nudged_this_round: bool,
 ) -> (
     Option<crate::agent::bigctx::CompressionState>,
     Option<(String, usize)>,
@@ -268,12 +269,12 @@ pub fn maybe_auto_fold(
     }
     // Give the model exactly one round.
     //
-    // The nudge is stamped at the current size on the very round it fires, and
-    // this runs after that stamp — so comparing token counts would be equal on
-    // every round and the backstop would never fire. The round number is the
-    // monotonic signal: a nudge stamped in THIS round means the model has not
-    // answered yet; stamped in an earlier round means it had its chance.
-    if state.nudge.last_nudge_round > 0 && state.nudge.last_nudge_round >= round {
+    // A nudge stamped this round means the model has not answered yet — folding
+    // now would steal the exact material the nudge pointed at. The flag comes
+    // from the pipeline that just ran rather than from a round counter: the
+    // counter the loop carries (`bigctx_round`) never advances, so comparing
+    // against it would yield on every round and the backstop would never fire.
+    if nudged_this_round {
         return (None, None);
     }
     let ranges = crate::agent::bigctx::screen(&projection.messages, state, &config);
@@ -471,6 +472,7 @@ pub fn bigctx_round_view(
     Vec<Msg>,
     crate::agent::bigctx::CompressionState,
     Option<String>,
+    bool,
 ) {
     let scheme = crate::agent::bigctx::IdScheme {
         round: round.max(1),
@@ -499,7 +501,10 @@ pub fn bigctx_round_view(
         window,
         overrides,
     );
-    (view, turn.state, nudge)
+    // Whether this round offered the model a fold. The automatic backstop
+    // yields exactly when it did — the model gets its round first.
+    let nudged = turn.nudge.inject;
+    (view, turn.state, nudge, nudged)
 }
 
 impl Session {

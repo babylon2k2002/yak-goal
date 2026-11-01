@@ -370,7 +370,7 @@ pub fn run_agent(
             // running where the growth happens. Only the nudge had been moved
             // into the loop.
             let mut store_guard = opts.ccr_store.as_ref().and_then(|s| s.lock().ok());
-            let (view, state, nudge) = crate::agent::session::bigctx_round_view(
+            let (view, state, nudge, nudged_this_round) = crate::agent::session::bigctx_round_view(
                 &round_view,
                 round_state.as_ref(),
                 opts.bigctx_round,
@@ -471,13 +471,14 @@ pub fn run_agent(
                 opts.bigctx_round,
                 model.context_window,
                 opts.bigctx_config.as_ref(),
+                nudged_this_round,
             );
             if let (Some(folded_state), Some((block, removed))) = (folded_state, folded) {
                 // Re-run the pipeline over the folded state so the round is
                 // sent the view a fold actually produces (summary injected,
                 // folded messages gone) rather than the pre-fold one.
                 let mut store_guard = opts.ccr_store.as_ref().and_then(|s| s.lock().ok());
-                let (folded_view, settled, _) = crate::agent::session::bigctx_round_view(
+                let (folded_view, settled, _, _) = crate::agent::session::bigctx_round_view(
                     &round_view,
                     Some(&folded_state),
                     opts.bigctx_round,
@@ -1112,7 +1113,7 @@ fn price_and_rewrite(
     // Same yield as `maybe_compact`: while a fold is pending, cutting a tool
     // result down shrinks the very range the nudge pointed at. Attachments are
     // still trimmed — they are not foldable material.
-    let fold_pending = bigctx_fold_pending(bigctx, used_tokens.unwrap_or(0), window, round);
+    let fold_pending = bigctx_fold_pending(bigctx, used_tokens.unwrap_or(0), window);
     if rewrite {
         compact::trim_old_attachments(history);
         // the pass is idempotent, so its notice fires at most once per result
@@ -1234,7 +1235,6 @@ fn bigctx_fold_pending(
     bigctx: Option<&crate::agent::bigctx::BigctxHandle>,
     estimate: u64,
     window: Option<u64>,
-    round: u64,
 ) -> bool {
     /// Above this share of the window the summarizer stops waiting.
     const YIELD_CEILING_PCT: f64 = 0.85;
@@ -1248,15 +1248,12 @@ fn bigctx_fold_pending(
     {
         return false;
     }
+    // A nudge still marked unanswered means the model may be about to fold;
+    // a successful fold (automatic or via the tool) calls
+    // `reset_after_compression`, which zeroes this mark, so a stale mark here
+    // really does mean "not acted on yet".
     handle
-        .with(|session| {
-            let mark = session.state.nudge.last_nudge_round;
-            // A nudge stamped in THIS round is unanswered: the model has not
-            // had its chance yet, so the summarizer waits. Stamped in an
-            // earlier round means the model sat on it, and continuing to
-            // yield would let the window fill.
-            mark > 0 && mark >= round
-        })
+        .with(|session| session.state.nudge.last_nudge_shown_tokens > 0)
         .unwrap_or(false)
 }
 
@@ -1301,7 +1298,7 @@ fn maybe_compact(
     //
     // Yielding one round lets it respond. The yield is bounded: near the
     // window there is no room to wait, so the summarizer takes over anyway.
-    if bigctx_fold_pending(bigctx, estimate, model.context_window, round) {
+    if bigctx_fold_pending(bigctx, estimate, model.context_window) {
         return after;
     }
     if compact::should_compact(estimate, trigger) {
