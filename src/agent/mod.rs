@@ -559,7 +559,6 @@ pub fn run_agent(
             model.context_window,
             on_update,
             opts.bigctx.as_ref(),
-            opts.bigctx_round,
         );
         // the pre-request compaction check: a session
         // that was interrupted — or resumed — over its window is compacted
