@@ -53,6 +53,9 @@ pub struct TurnResult {
     pub truncated: crate::agent::bigctx::TruncateResult,
     /// Tool results stored out of the context, and placeholders re-projected.
     pub ccr: crate::agent::bigctx::CcrResult,
+    /// How many results were asked to absorb themselves this pass. Zero is the
+    /// normal state and means the feature is inert.
+    pub prompted_for_absorb: usize,
 }
 
 /// Run one pass over `messages`.
@@ -86,6 +89,17 @@ pub fn process_turn_with_store(
         crate::agent::bigctx::crush_tool_results(messages, config.crush.min_reduction)
     } else {
         crate::agent::bigctx::CrushResult::unchanged(messages)
+    };
+    // 0-pre. Absorbed pairs leave the context here, before anything else looks
+    //        at it. This runs first so every later node — protection, pruning,
+    //        the fold gate, the token count — sees the context the model will
+    //        actually receive, and cannot try to fold a result the model was
+    //        already told was gone.
+    let unabsorbed = crate::agent::bigctx::hide_absorbed(&crushed.messages, state);
+    let crushed = crate::agent::bigctx::CrushResult {
+        messages: unabsorbed,
+        crushed: crushed.crushed,
+        strategies: crushed.strategies,
     };
     let messages = &crushed.messages[..];
 
@@ -199,6 +213,21 @@ pub fn process_turn_with_store(
         crate::agent::bigctx::RenderStrategy::All,
     );
 
+    // 7. absorb prompts: append the distillation demand to eligible results.
+    //
+    // Last, because the prompt names the result's citation ref and refs are only
+    // written by the step above. View-only: the returned array is what the model
+    // is sent, never what is persisted, so the marker reappears each turn until
+    // the model absorbs and then disappears with the hidden pair.
+    let prompted = crate::agent::bigctx::absorb::append_prompts(
+        &view,
+        &next,
+        config,
+        &protection,
+        token_count,
+    );
+    let view = prompted.messages;
+
     TurnResult {
         messages: view,
         state: next,
@@ -209,6 +238,7 @@ pub fn process_turn_with_store(
         crushed: crushed.crushed,
         truncated,
         ccr,
+        prompted_for_absorb: prompted.prompted_count,
     }
 }
 

@@ -649,8 +649,94 @@ pub fn bigctx_tools(handle: BigctxHandle) -> Vec<Box<dyn Tool>> {
         Box::new(DecompressTool::new(handle.clone())),
         Box::new(RetrieveTool::new(handle.clone())),
         Box::new(SearchTool::new(handle.clone())),
+        Box::new(AbsorbTool::new(handle.clone())),
         Box::new(StatusTool::new(handle)),
     ]
+}
+
+// ─── absorb ─────────────────────────────────────────────────────────────────
+
+/// The `absorb` tool: distil a large tool result now, so its original stops
+/// being re-sent.
+///
+/// The nudge waits until the context is 45% full; by then a 30k-token result
+/// has already been resent several times. This acts on the turn the result
+/// appears — the forced prompt appended to the result names the ref, and the
+/// model calls this with its distillation. The pair then leaves the context on
+/// the next turn and the model's own summary becomes the durable record.
+pub struct AbsorbTool {
+    handle: BigctxHandle,
+}
+
+impl AbsorbTool {
+    pub fn new(handle: BigctxHandle) -> AbsorbTool {
+        AbsorbTool { handle }
+    }
+}
+
+impl Tool for AbsorbTool {
+    fn name(&self) -> &str {
+        crate::agent::bigctx::absorb::ABSORB_TOOL_NAME
+    }
+    fn tier(&self) -> Tier {
+        Tier::Read
+    }
+    fn description(&self) -> &str {
+        "Distil a large tool result into its essentials. The original output is then removed \
+         from the context and your summary becomes the only durable record of it. Call this \
+         immediately when a tool result ends with an [ACP absorb] instruction."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "ref": {
+                    "type": "string",
+                    "description": "The message ref the [ACP absorb] instruction named."
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Distilled essentials: outcome, key values, exact paths:lines, error text verbatim, decisions."
+                }
+            },
+            "required": ["ref", "summary"]
+        })
+    }
+    fn preview(&self, args: &Value) -> String {
+        format!("absorb {}", args["ref"].as_str().unwrap_or(""))
+    }
+    fn execute(&self, args: &Value, _cwd: &Path, _log: &mut dyn FnMut(ToolProgress)) -> ToolOutput {
+        let Some(parsed) = crate::agent::bigctx::absorb::parse_call(args) else {
+            return ToolOutput::err(
+                "absorb needs both `ref` (the message ref) and `summary` (the distilled text).",
+            );
+        };
+
+        let result = self.handle.with(|session| {
+            // The protection set is recomputed here rather than carried on the
+            // handle: it is cheap, derived from the same rules, and a stale
+            // copy would let this tool absorb a result protection forbids.
+            let protection =
+                crate::agent::bigctx::compute_protection(&session.messages, &session.state, &session.config);
+            let outcome = crate::agent::bigctx::absorb::apply(
+                &session.state,
+                &session.messages,
+                &session.config,
+                &protection,
+                &parsed,
+            );
+            if outcome.ok {
+                session.state = outcome.state;
+            }
+            (outcome.ok, outcome.text)
+        });
+
+        match result {
+            Some((true, text)) => ToolOutput::ok(text),
+            Some((false, text)) => ToolOutput::err(text),
+            None => ToolOutput::err(NO_SESSION),
+        }
+    }
 }
 
 // ─── search_context ──────────────────────────────────────────────────────────
@@ -1082,7 +1168,14 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert_eq!(
             names,
-            vec!["compress", "decompress", "acp_retrieve", "search_context", "acp_status"]
+            vec![
+                "compress",
+                "decompress",
+                "acp_retrieve",
+                "search_context",
+                "absorb",
+                "acp_status"
+            ]
         );
     }
 

@@ -22,6 +22,7 @@
 //! provider knowledge. The host (see [`super::compact`]) owns the mapping to
 //! and from `Msg` and decides when to run.
 
+pub mod absorb;
 pub mod boundaries;
 pub mod cache_report;
 pub mod ccr;
@@ -57,6 +58,7 @@ pub mod types;
 // are public, so anything else stays one `bigctx::<module>::` away — a
 // re-export nobody calls is a name that rots silently and shows up as an
 // unused-import warning on every build.
+pub use absorb::{hide_absorbed};
 pub use boundaries::resolve_boundaries;
 pub use ccr::{
     CcrResult, ContentStore, RETRIEVE_TOOL_NAME, STORED_PLACEHOLDER_MARKER, parse_placeholder,
@@ -88,6 +90,6 @@ pub use state::{CompressionStateExt, create_initial_state};
 pub use tools::{BigctxHandle, BigctxSession, bigctx_tools};
 pub use truncate::{TruncateOptions, TruncateResult, truncate_large_outputs};
 pub use types::{
-    BlockGeneration, CompressionBlock, CompressionState, CoreMessage, MessageContentType,
+    AbsorbRecord, BlockGeneration, CompressionBlock, CompressionState, CoreMessage, MessageContentType,
     MessageRole, Tier,
 };

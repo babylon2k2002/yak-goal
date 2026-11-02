@@ -115,6 +115,11 @@ pub struct BigctxConfig {
     pub ccr: CcrConfig,
     /// Output-side steering: how much prose the model should emit.
     pub output_steering: crate::agent::bigctx::output_steering::OutputSteeringConfig,
+    /// Instant tool-result absorption. `None` means the built-in defaults
+    /// (off); the raw object is kept so `absorb::resolve_config` owns the
+    /// parsing and its validation rules live in one place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absorb: Option<serde_json::Value>,
 }
 
 /// Content-cached retrieval: keeping oversized tool results out of the context.
@@ -232,6 +237,9 @@ pub fn config_from_json(
     // vs out-of-range distinction.
     (config.output_steering, _) =
         crate::agent::bigctx::output_steering::resolve_config(object.get("output_steering"));
+    if let Some(raw) = object.get("absorb") {
+        config.absorb = Some(raw.clone());
+    }
     config
 }
 
@@ -287,6 +295,7 @@ pub fn default_config(model_context_limit: u64) -> BigctxConfig {
         // Off by default: this is the only lever that changes what the model
         // *says*, not what it reads, so it is opt-in.
         output_steering: crate::agent::bigctx::output_steering::OutputSteeringConfig::default(),
+        absorb: None,
     }
 }
 

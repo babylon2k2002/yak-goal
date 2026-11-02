@@ -256,6 +256,32 @@ pub struct NudgeState {
 pub struct CompressionStats {
     pub tokens_compressed: u64,
     pub compression_count: u64,
+    /// Tokens reclaimed by absorptions. Kept separate from
+    /// `tokens_compressed`: a fold replaces a range with a summary block the
+    /// model can restore, while an absorption makes the model's own summary
+    /// the only record — the two are not comparable savings.
+    #[serde(default)]
+    pub absorbed_tokens: u64,
+}
+
+/// One absorbed tool result: the pair that is now hidden, plus the summary
+/// that replaced it.
+///
+/// Both halves are named because hiding only the result would leave a tool call
+/// with no answer, which providers reject. `call_message_id` is empty when the
+/// call was not visible when the absorption happened (it had already been
+/// folded); the result id alone is then still enough to keep it out of context.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AbsorbRecord {
+    pub tool_call_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub call_message_id: String,
+    pub result_message_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absorb_call_id: Option<String>,
+    pub summary: String,
+    pub tokens_reclaimed: u64,
+    pub created_at: u64,
 }
 
 /// Everything the algorithm must remember across turns.
@@ -268,6 +294,12 @@ pub struct CompressionState {
     pub token_snapshot: std::collections::BTreeMap<String, u64>,
     pub nudge: NudgeState,
     pub stats: CompressionStats,
+    /// One entry per absorbed tool result. Empty until the model calls
+    /// `absorb`; the pair named here is hidden from every later turn, so an
+    /// entry is the difference between a tool result the model can still see
+    /// and one it has already distilled away.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub absorbed: Vec<AbsorbRecord>,
     /// Next ids to hand out. Monotonic; never reset, so an issued id is never
     /// reused with different content.
     pub next_block_id: u64,

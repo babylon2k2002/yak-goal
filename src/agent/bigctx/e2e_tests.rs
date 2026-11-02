@@ -401,6 +401,7 @@ fn the_tools_refuse_to_run_without_a_session() {
             "decompress" => json!({"blockId": "b1"}),
             "acp_retrieve" => json!({"ref": "m00001"}),
             "search_context" => json!({"query": "anything"}),
+            "absorb" => json!({"ref": "m00001", "summary": "s"}),
             _ => json!({}),
         };
         let out = tool.execute(&args, std::path::Path::new("."), &mut log);
