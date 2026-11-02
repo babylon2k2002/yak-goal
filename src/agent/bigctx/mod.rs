@@ -33,6 +33,7 @@ pub mod host;
 pub mod protected;
 pub mod nudge;
 pub mod nudge_text;
+pub mod output_steering;
 pub mod pipeline;
 pub mod prune;
 pub mod recommend;
@@ -71,6 +72,10 @@ pub use hide_consumed::hide_consumed_compress_calls;
 pub use host::{IdScheme, project, render};
 pub use nudge::{NudgeDecision, decide_nudge, reset_after_compression, stamp_nudge};
 pub use nudge_text::render_nudge;
+pub use output_steering::{
+    decide as decide_output_steering, project as project_for_steering, Decision as SteeringDecision,
+    Effort, OutputSteeringConfig, TurnKind,
+};
 pub use pipeline::{process_turn, process_turn_with_store};
 pub use protected::{Protection, compute_protection};
 pub use prune::{PruneOptions, prune};
