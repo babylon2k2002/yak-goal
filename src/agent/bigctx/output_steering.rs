@@ -192,11 +192,11 @@ pub fn render_steering_block(level: u8, sentinel: &str) -> Option<String> {
     Some(format!("{sentinel}\n{text}\n{closing}"))
 }
 
-/// `</name` derived from `<name>`.
+/// `</name>` derived from `<name>`.
 ///
-/// Returns the opening half of the closing tag without its `>`, matching the
-/// upstream's slicing: the caller searches for it and consumes through the
-/// `>`, which also finds a malformed unclosed block's end.
+/// The sentinel includes its own `>`, so the result does too — matching the
+/// upstream's `</${sentinel.slice(1)}`. The closing tag is therefore matched
+/// and consumed whole, in one step.
 fn closing_tag(sentinel: &str) -> String {
     let name = sentinel.strip_prefix('<').unwrap_or(sentinel);
     format!("</{name}")
@@ -223,16 +223,12 @@ pub fn apply_to_prompt(existing: &str, block: &str, sentinel: &str) -> Placement
     let closing = closing_tag(sentinel);
     match existing.find(sentinel) {
         Some(start) => {
-            // Consume through the closing tag's `>`, or to the end when the
-            // block was never closed.
+            // Consume through the closing tag, or to the end when the block was
+            // never closed. `closing` already ends in `>`, so this consumes it
+            // whole — searching for a further `>` here would swallow whatever
+            // text followed the block.
             let end = match existing[start..].find(&closing) {
-                Some(rel) => {
-                    let after = start + rel + closing.len();
-                    match existing[after..].find('>') {
-                        Some(gt) => after + gt + 1,
-                        None => existing.len(),
-                    }
-                }
+                Some(rel) => start + rel + closing.len(),
                 None => existing.len(),
             };
             let prefix = existing[..start].trim_end();
