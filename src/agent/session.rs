@@ -390,7 +390,14 @@ pub fn maybe_auto_fold(
     // after this, but the ledger entry has to carry the size the fold left
     // behind — that is the offset the next request's prefix diverges from, and
     // the report charges the re-payment against it.
-    let view_after = token_count
+    //
+    // Same shape as the tool-driven fold in `bigctx/tools.rs`: `view_after` is
+    // the post-fold size, and the divergence point sits `folded_tokens` back
+    // from it. The two fields are not interchangeable — `decompose` reads the
+    // divergence as the earliest offset a later request can still match, so
+    // passing the post-fold size there would overstate the prefix that is
+    // still cached and undercharge the fold.
+    let after = token_count
         .saturating_sub(folded_tokens)
         .saturating_add(summary_tokens);
     (
@@ -401,8 +408,8 @@ pub fn maybe_auto_fold(
             event: crate::agent::bigctx::FoldEvent {
                 tokens_compressed: folded_tokens,
                 summary_tokens,
-                first_fold_start_tokens: Some(view_after),
-                view_after: Some(view_after),
+                first_fold_start_tokens: Some(after.saturating_sub(folded_tokens)),
+                view_after: Some(after),
             },
         }),
     )
