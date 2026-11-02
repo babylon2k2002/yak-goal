@@ -28,6 +28,7 @@
 //!    so a change here is a deliberate, announced cache bust — not a wording
 //!    tweak.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// What kind of turn the model is about to take.
@@ -311,7 +312,7 @@ pub fn clamp_effort_to_floor(current: Option<&str>, floor: Effort) -> Option<Eff
 }
 
 /// Resolved steering configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputSteeringConfig {
     /// Master switch. Off by default — both levers are inert until asked for.
     pub enabled: bool,
