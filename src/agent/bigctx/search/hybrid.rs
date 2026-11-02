@@ -133,7 +133,7 @@ mod tests {
     /// target. Retrieval has no notion of negation, and the upstream TS with
     /// the same k1=1.2 / b=0.75 does the same.)
     #[test]
-    fn the_target_ranks_first_over_a_distractor_corpus() {
+    fn the_target_outranks_every_distractor() {
         let mut docs = vec![
             doc("target", "身份验证流程 was rewritten: the login flow now refreshes tokens"),
             doc("d1", "database migration plan for the billing schema"),
@@ -144,40 +144,39 @@ mod tests {
             docs.push(doc(&format!("noise{i}"), "unrelated chatter about nothing"));
         }
 
-        let ranked = crate::agent::bigctx::search::search(
-            &docs,
-            "authentication login tokens",
-            &crate::agent::bigctx::search::SearchOptions::default(),
-        );
+        // min_score 0 so the comparison sees every doc, including the ones a
+        // real search would filter out.
+        let opts = crate::agent::bigctx::search::SearchOptions {
+            min_score: 0.0,
+            limit: docs.len(),
+            ..Default::default()
+        };
+        let ranked = crate::agent::bigctx::search::search(&docs, "authentication login tokens", &opts);
         assert_eq!(
             ranked.first().map(|r| r.ref_id.as_str()),
             Some("target"),
             "ranked: {:?}",
-            ranked.iter().map(|r| (&r.ref_id, r.score)).collect::<Vec<_>>()
+            ranked
+                .iter()
+                .take(5)
+                .map(|r| (&r.ref_id, r.score))
+                .collect::<Vec<_>>()
         );
-        // The other real topics must sit below it, or ranking is not ranking.
-        let target_at = ranked.iter().position(|r| r.ref_id == "target").unwrap();
-        for other in ["d1", "d2", "d3"] {
-            let at = ranked.iter().position(|r| r.ref_id == other).unwrap();
-            assert!(at > target_at, "{other} must rank below the target");
+        let target_score = ranked[0].score;
+        for hit in &ranked[1..] {
+            assert!(
+                hit.score < target_score,
+                "{} scored {} which is not below the target's {}",
+                hit.ref_id,
+                hit.score,
+                target_score
+            );
         }
     }
 
-    /// The bigram fallback has a noise floor: unrelated text still shares
-    /// short character bigrams (`nothing` and `authentication` both contain
-    /// `th` and `in`). This is the accepted cost of replacing ICU segmentation
-    /// with bigrams — recall over precision — so the floor is pinned here to
-    /// catch a change that makes it much worse, not to assert it stays at zero.
-    #[test]
-    fn the_bigram_noise_floor_stays_low() {
-        let docs = [doc("noise", "unrelated chatter about nothing")];
-        let s = score_of(&docs, "authentication login tokens", "noise");
-        assert!(s > 0.0, "bigrams do overlap — the floor is not zero");
-        assert!(s < 0.25, "the noise floor must stay well below one, got {s}");
-    }
-
     /// The CJK side of the same question: a query with no verbatim overlap
-    /// with the target text must still find it via bigrams.
+    /// with the target text must still find it via bigrams. `验证实现` is not a
+    /// substring of `重构了身份验证的实现方式`, but the bigrams 验证 and 实现 are.
     #[test]
     fn a_cjk_query_finds_its_target_without_verbatim_overlap() {
         let docs = [
@@ -191,5 +190,28 @@ mod tests {
             &crate::agent::bigctx::search::SearchOptions::default(),
         );
         assert_eq!(ranked.first().map(|r| r.ref_id.as_str()), Some("target"));
+    }
+
+    /// The bigram fallback has a noise floor: unrelated text still shares
+    /// short character bigrams with the query (`nothing` and `authentication`
+    /// both contain `th` and `in`). Scores are max-normalized, so an absolute
+    /// bound is meaningless — the only claim worth pinning is *relative*: an
+    /// unrelated doc must stay far below a genuinely matching one.
+    ///
+    /// This is the accepted cost of replacing ICU segmentation with bigrams —
+    /// recall over precision.
+    #[test]
+    fn unrelated_text_scores_far_below_a_real_match() {
+        let docs = [
+            doc("match", "authentication login tokens"),
+            doc("noise", "unrelated chatter about nothing"),
+        ];
+        let matched = score_of(&docs, "authentication login tokens", "match");
+        let noise = score_of(&docs, "authentication login tokens", "noise");
+        assert!(noise > 0.0, "bigrams do overlap — the floor is not zero");
+        assert!(
+            noise < matched * 0.5,
+            "noise {noise} must stay well below the real match {matched}"
+        );
     }
 }
