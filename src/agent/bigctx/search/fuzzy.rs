@@ -47,8 +47,10 @@ impl SearchAlgorithm for Fuzzy {
                 .collect::<Vec<_>>()
         };
 
-        let query_terms: Vec<&str> = query
-            .to_lowercase()
+        // Bound first: the iterator below borrows this string, and a temporary
+        // in the chain would be dropped before the filter closure runs.
+        let lowered = query.to_lowercase();
+        let query_terms: Vec<&str> = lowered
             .split([' ', ',', '\t', '\n'])
             .map(str::trim)
             .filter(|t| !t.is_empty())
