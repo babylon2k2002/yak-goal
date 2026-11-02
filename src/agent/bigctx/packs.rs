@@ -224,7 +224,12 @@ impl DirSource {
 fn read_pack_file(path: &Path) -> Option<serde_json::Value> {
     let text = std::fs::read_to_string(path).ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&text).ok()?;
-    parsed.as_object().map(|_| parsed)
+    // A pack body must be an object. Returning early keeps the value owned, so
+    // the caller's `get(..)` lookups do not borrow across a move.
+    if !parsed.is_object() {
+        return None;
+    }
+    Some(parsed)
 }
 
 impl PackSource for DirSource {
