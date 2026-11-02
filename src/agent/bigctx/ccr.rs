@@ -64,7 +64,18 @@ pub const MAX_HEAD_CHARS: usize = 96;
 /// makes the report unreadable exactly when it matters — `acp_status` answers
 /// "what is in the context?" and would then answer with a placeholder. It also
 /// feeds back: every status call would be a new oversized result.
-pub const NEVER_STORE_TOOLS: [&str; 4] = ["acp_status", "compress", "decompress", "acp_retrieve"];
+///
+/// `search_context` belongs here for a sharper reason: its whole output is a
+/// list of refs. Replacing that list with a placeholder ref would defeat the
+/// tool — the model would have to retrieve a document in order to learn which
+/// document to retrieve.
+pub const NEVER_STORE_TOOLS: [&str; 5] = [
+    "acp_status",
+    "compress",
+    "decompress",
+    "acp_retrieve",
+    "search_context",
+];
 
 /// True when a tool's output is exempt from storing.
 pub fn is_never_stored(tool_name: Option<&str>) -> bool {

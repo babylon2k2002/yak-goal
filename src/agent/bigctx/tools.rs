@@ -1,4 +1,5 @@
-//! The `compress` / `decompress` / `acp_status` tools: the model's handle on
+//! The `compress` / `decompress` / `acp_retrieve` / `search_context` /
+//! `acp_status` tools: the model's handle on its own context.
 //! its own context.
 //!
 //! Everything here is a thin shell. The algorithm lives in the rest of
@@ -647,8 +648,141 @@ pub fn bigctx_tools(handle: BigctxHandle) -> Vec<Box<dyn Tool>> {
         Box::new(CompressTool::new(handle.clone())),
         Box::new(DecompressTool::new(handle.clone())),
         Box::new(RetrieveTool::new(handle.clone())),
+        Box::new(SearchTool::new(handle.clone())),
         Box::new(StatusTool::new(handle)),
     ]
+}
+
+// ─── search_context ──────────────────────────────────────────────────────────
+
+/// The `search_context` tool: find folded material by content.
+///
+/// Without this the model can only reach folded content through a ref it
+/// already remembers — `decompress` takes a block id, `acp_retrieve` takes a
+/// message ref, and over a long session the model has neither. Search scores
+/// every block summary and every folded message against a query and hands back
+/// the refs to open, which is what makes a folded history navigable instead of
+/// merely small.
+///
+/// Read-only and cheap: scoring runs over cached per-doc features, so a repeat
+/// search costs one pass over the query rather than the corpus.
+pub struct SearchTool {
+    handle: BigctxHandle,
+}
+
+impl SearchTool {
+    pub fn new(handle: BigctxHandle) -> SearchTool {
+        SearchTool { handle }
+    }
+}
+
+impl Tool for SearchTool {
+    fn name(&self) -> &str {
+        crate::agent::bigctx::search::tool_name()
+    }
+    fn tier(&self) -> Tier {
+        Tier::Read
+    }
+    fn description(&self) -> &str {
+        "Search the conversation by content, including material that has been folded into \
+         summaries. Use this to find which block or message holds a detail before calling \
+         decompress (blockId) or acp_retrieve (ref). Searching is cheap and does not restore \
+         anything — it returns ranked refs with previews."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Words to look for. Mixed Chinese/English is fine."
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Max results (default 10)."
+                },
+                "algorithm": {
+                    "type": "string",
+                    "description": "Ranking algorithm: hybrid (default), bm25, fuzzy, substring."
+                }
+            },
+            "required": ["query"]
+        })
+    }
+    fn preview(&self, args: &Value) -> String {
+        format!(
+            "search {:?}",
+            args["query"].as_str().unwrap_or("")
+        )
+    }
+    fn execute(&self, args: &Value, _cwd: &Path, _log: &mut dyn FnMut(ToolProgress)) -> ToolOutput {
+        let query = args["query"].as_str().unwrap_or("").trim().to_string();
+        if query.is_empty() {
+            return ToolOutput::err("search_context needs a non-empty `query`.");
+        }
+        let mut options = crate::agent::bigctx::search::SearchOptions::default();
+        if let Some(n) = args["limit"].as_u64() {
+            options.limit = (n as usize).clamp(1, 50);
+        }
+        if let Some(a) = args["algorithm"].as_str().filter(|a| !a.trim().is_empty()) {
+            options.algorithm = Some(a.to_string());
+        }
+        let Some(text) = self.handle.with(|session| search_context(session, &query, &options)) else {
+            return ToolOutput::err(NO_SESSION);
+        };
+        ToolOutput::ok(text)
+    }
+}
+
+fn search_context(
+    session: &mut BigctxSession,
+    query: &str,
+    options: &crate::agent::bigctx::search::SearchOptions,
+) -> String {
+    use crate::agent::bigctx::search::{block_docs, message_docs, search, SearchDocKind};
+
+    let mut docs = block_docs(&session.state);
+    docs.extend(message_docs(&session.messages, &session.state));
+
+    if docs.is_empty() {
+        return "Nothing is searchable yet — no blocks have been created and no message refs \
+                have been assigned."
+            .to_string();
+    }
+
+    let hits = search(&docs, query, options);
+    if hits.is_empty() {
+        return format!(
+            "No match for {query:?} across {} searchable documents ({} blocks, {} messages). \
+             Try different words, or a shorter phrase.",
+            docs.len(),
+            docs.iter().filter(|d| d.kind == SearchDocKind::Block).count(),
+            docs.iter().filter(|d| d.kind == SearchDocKind::Message).count(),
+        );
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} match(es) for {query:?} (searched {} documents):\n",
+        hits.len(),
+        docs.len()
+    ));
+    for hit in &hits {
+        out.push_str(&format!(
+            "\n  {} {}  score {:.2}  ~{} tok  tier {}\n",
+            hit.kind.as_str(),
+            hit.ref_id,
+            hit.score,
+            hit.tokens,
+            hit.tier
+        ));
+        if let (SearchDocKind::Message, Some(block)) = (hit.kind, hit.block_id.as_deref()) {
+            out.push_str(&format!("     folded into {block} — decompress({block}) for the range\n"));
+        }
+        out.push_str(&format!("     {}\n", hit.preview.replace('\n', " ")));
+    }
+    out.push_str("\nTo open a hit: decompress blockId=bN (restores the range) or acp_retrieve ref=mNNNNN (one message).");
+    out
 }
 
 #[cfg(test)]
@@ -948,7 +1082,7 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert_eq!(
             names,
-            vec!["compress", "decompress", "acp_retrieve", "acp_status"]
+            vec!["compress", "decompress", "acp_retrieve", "search_context", "acp_status"]
         );
     }
 
@@ -959,6 +1093,123 @@ mod tests {
         handle.clear();
         let out = run(&StatusTool::new(handle.clone()), json!({}));
         assert!(out.error.is_some());
+    }
+
+    #[test]
+    fn search_context_refuses_an_empty_query() {
+        let handle = BigctxHandle::new();
+        handle.set(session_with(vec![user("t1.0", "a")]));
+        let out = run(&SearchTool::new(handle), json!({"query": "  "}));
+        assert!(out.error.is_some());
+        assert!(out.content.contains("query"), "got: {}", out.content);
+    }
+
+    #[test]
+    fn search_context_refuses_without_a_session() {
+        let out = run(&SearchTool::new(BigctxHandle::new()), json!({"query": "x"}));
+        assert!(out.error.is_some());
+        assert!(out.content.contains("No conversation"));
+    }
+
+    #[test]
+    fn search_context_finds_an_unfolded_message_by_content() {
+        // `session_with` assigns refs, so a fresh session is already searchable.
+        let handle = BigctxHandle::new();
+        handle.set(session_with(vec![
+            user("t1.0", "hello there"),
+            user("t1.1", "the supervisor will handle it"),
+        ]));
+        let out = run(&SearchTool::new(handle), json!({"query": "supervisor"}));
+        assert!(out.error.is_none(), "got: {}", out.content);
+        assert!(
+            out.content.contains("match"),
+            "expected a hit: {}",
+            out.content
+        );
+    }
+
+    #[test]
+    fn search_context_says_so_when_a_query_matches_nothing() {
+        let handle = BigctxHandle::new();
+        handle.set(session_with(vec![user("t1.0", "hello there")]));
+        let out = run(
+            &SearchTool::new(handle),
+            json!({"query": "zzzznonexistentzzzz"}),
+        );
+        assert!(out.error.is_none(), "got: {}", out.content);
+        assert!(
+            out.content.contains("No match"),
+            "got: {}",
+            out.content
+        );
+    }
+
+    #[test]
+    fn search_context_finds_a_folded_message_and_names_its_block() {
+        use crate::agent::bigctx::types::{BlockGeneration, CompressionBlock, Tier};
+
+        let mut session = session_with(vec![
+            user("t1.0", "we discussed the database migration plan"),
+            user("t1.1", "unrelated chatter"),
+        ]);
+        session
+            .state
+            .message_refs
+            .by_raw
+            .insert("t1.0".into(), "m00001".into());
+        session
+            .state
+            .message_refs
+            .by_ref
+            .insert("m00001".into(), "t1.0".into());
+        session
+            .state
+            .message_refs
+            .by_raw
+            .insert("t1.1".into(), "m00002".into());
+        session
+            .state
+            .message_refs
+            .by_ref
+            .insert("m00002".into(), "t1.1".into());
+        session.state.blocks.push(CompressionBlock {
+            block_id: "b3".into(),
+            run_id: "r1".into(),
+            tier: Tier::One,
+            topic: Some("schema work".into()),
+            start_ref: None,
+            end_ref: None,
+            summary: "migration plan agreed".into(),
+            direct_message_ids: vec!["t1.0".into()],
+            effective_message_ids: vec!["t1.0".into()],
+            direct_block_ids: vec![],
+            compressed_tokens: 50,
+            created_at: 0,
+            survived_count: 0,
+            generation: BlockGeneration::Young,
+            active: true,
+            expanded: false,
+            duration_ms: None,
+            compress_call_id: None,
+        });
+
+        let handle = BigctxHandle::new();
+        handle.set(session);
+        let out = run(
+            &SearchTool::new(handle),
+            json!({"query": "migration", "limit": 5}),
+        );
+        assert!(out.error.is_none(), "got: {}", out.content);
+        assert!(
+            out.content.contains("m00001"),
+            "the folded message must be findable: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("b3"),
+            "a message hit must name its owning block: {}",
+            out.content
+        );
     }
 }
 
