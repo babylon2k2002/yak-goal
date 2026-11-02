@@ -139,30 +139,45 @@ SIZE TARGET: 30-60 tokens per source block (including header). For a batch of N 
 pub const LANGUAGE_PRESERVATION_RULE: &str = "\
 Preserve the source conversation's primary language. Do not translate a monolingual conversation without a user request. For mixed-language source, preserve each segment's language. Keep code, commands, identifiers, and quoted text verbatim when the tier's fidelity rules retain them.";
 
-/// The four load-bearing texts, resolved once.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The four load-bearing texts.
+///
+/// `Cow<'static, str>` rather than `&'static str`: the built-in set is borrowed
+/// and costs nothing, while a prompt pack loaded from disk overrides individual
+/// texts with owned strings. A `&'static str` here would force every pack file
+/// to be leaked.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prompts {
-    pub compress_philosophy: &'static str,
-    pub how_to_compress_rules: &'static str,
-    pub tier2_distill_rules: &'static str,
-    pub tier3_condense_rules: &'static str,
+    pub compress_philosophy: std::borrow::Cow<'static, str>,
+    pub how_to_compress_rules: std::borrow::Cow<'static, str>,
+    pub tier2_distill_rules: std::borrow::Cow<'static, str>,
+    pub tier3_condense_rules: std::borrow::Cow<'static, str>,
 }
 
-/// The canonical set.
-pub const DEFAULT_PROMPTS: Prompts = Prompts {
-    compress_philosophy: COMPRESS_PHILOSOPHY,
-    how_to_compress_rules: HOW_TO_COMPRESS_RULES,
-    tier2_distill_rules: TIER2_DISTILL_RULES,
-    tier3_condense_rules: TIER3_CONDENSE_RULES,
-};
+/// The canonical set. Not a `const`: `Cow::Borrowed` is not const-constructible
+/// for a struct field in a way callers can use, so this is the cheap function
+/// every call site already treats as a constant.
+pub fn default_prompts() -> Prompts {
+    Prompts {
+        compress_philosophy: std::borrow::Cow::Borrowed(COMPRESS_PHILOSOPHY),
+        how_to_compress_rules: std::borrow::Cow::Borrowed(HOW_TO_COMPRESS_RULES),
+        tier2_distill_rules: std::borrow::Cow::Borrowed(TIER2_DISTILL_RULES),
+        tier3_condense_rules: std::borrow::Cow::Borrowed(TIER3_CONDENSE_RULES),
+    }
+}
+
+impl Default for Prompts {
+    fn default() -> Prompts {
+        default_prompts()
+    }
+}
 
 impl Prompts {
     /// The rules for one tier.
-    pub fn rules_for(&self, tier: crate::agent::bigctx::types::Tier) -> &'static str {
+    pub fn rules_for(&self, tier: crate::agent::bigctx::types::Tier) -> &str {
         match tier {
-            crate::agent::bigctx::types::Tier::One => self.how_to_compress_rules,
-            crate::agent::bigctx::types::Tier::Two => self.tier2_distill_rules,
-            crate::agent::bigctx::types::Tier::Three => self.tier3_condense_rules,
+            crate::agent::bigctx::types::Tier::One => &self.how_to_compress_rules,
+            crate::agent::bigctx::types::Tier::Two => &self.tier2_distill_rules,
+            crate::agent::bigctx::types::Tier::Three => &self.tier3_condense_rules,
         }
     }
 }
@@ -220,9 +235,9 @@ mod tests {
 
     #[test]
     fn rules_for_picks_the_right_tier() {
-        assert_eq!(DEFAULT_PROMPTS.rules_for(Tier::One), HOW_TO_COMPRESS_RULES);
-        assert_eq!(DEFAULT_PROMPTS.rules_for(Tier::Two), TIER2_DISTILL_RULES);
-        assert_eq!(DEFAULT_PROMPTS.rules_for(Tier::Three), TIER3_CONDENSE_RULES);
+        assert_eq!(default_prompts().rules_for(Tier::One), HOW_TO_COMPRESS_RULES);
+        assert_eq!(default_prompts().rules_for(Tier::Two), TIER2_DISTILL_RULES);
+        assert_eq!(default_prompts().rules_for(Tier::Three), TIER3_CONDENSE_RULES);
     }
 
     #[test]

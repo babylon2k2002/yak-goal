@@ -35,6 +35,7 @@ pub mod protected;
 pub mod nudge;
 pub mod nudge_text;
 pub mod output_steering;
+pub mod packs;
 pub mod pipeline;
 pub mod prune;
 pub mod recommend;
@@ -80,6 +81,9 @@ pub use output_steering::{
 };
 pub use pipeline::{process_turn, process_turn_with_store};
 pub use protected::{Protection, compute_protection};
+pub use packs::{
+    resolve_prompts as resolve_prompt_pack, Pack, PackSource, Resolver as PackResolver,
+};
 pub use prune::{PruneOptions, prune};
 pub use recommend::{ContextRanges, screen};
 pub use render_refs::{RenderStrategy, render_refs};

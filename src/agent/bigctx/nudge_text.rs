@@ -19,7 +19,7 @@
 use crate::agent::bigctx::config::BigctxConfig;
 use crate::agent::bigctx::nudge::NudgeDecision;
 use crate::agent::bigctx::recommend::ContextRanges;
-use crate::agent::bigctx::rules::{DEFAULT_PROMPTS, Prompts};
+use crate::agent::bigctx::rules::{Prompts, default_prompts};
 use crate::agent::bigctx::types::{CompressionState, Tier};
 
 /// Which register the nudge speaks in.
@@ -77,7 +77,7 @@ pub fn render_nudge(
 
     Some(RenderedNudge {
         voice,
-        text: render(decision, ranges, state, config, voice, DEFAULT_PROMPTS),
+        text: render(decision, ranges, state, config, voice, &default_prompts()),
     })
 }
 
@@ -96,7 +96,7 @@ fn render(
     state: &CompressionState,
     config: &BigctxConfig,
     voice: NudgeVoice,
-    prompts: Prompts,
+    prompts: &Prompts,
 ) -> String {
     let mut out: Vec<String> = Vec::new();
 
@@ -191,7 +191,7 @@ fn render_ranges(ranges: &ContextRanges) -> String {
     out.trim_end().to_string()
 }
 
-fn render_distillation(tier: Tier, state: &CompressionState, prompts: Prompts) -> String {
+fn render_distillation(tier: Tier, state: &CompressionState, prompts: &Prompts) -> String {
     let targets: Vec<&crate::agent::bigctx::types::CompressionBlock> = state
         .blocks
         .iter()
