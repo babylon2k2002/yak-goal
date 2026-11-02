@@ -54,6 +54,75 @@ pub struct BigctxSession {
     pub store: Option<std::sync::Arc<std::sync::Mutex<crate::agent::bigctx::ContentStore>>>,
 }
 
+impl BigctxSession {
+    /// Apply output steering to the system prompt this round will send.
+    ///
+    /// Returns the prompt to send, or `None` when steering is off or decides
+    /// nothing — in which case the caller keeps its own prompt untouched. That
+    /// `None` is deliberate: the disabled path must not rewrite the prompt
+    /// byte-for-byte into an identical string, and it must not allocate.
+    ///
+    /// Why here and not in the pipeline: steering is a function of the *final*
+    /// turn and the config, both of which this struct already holds. Keeping it
+    /// out of `process_turn` means the message pipeline stays free of
+    /// prompt-level concerns.
+    pub fn steered_system_prompt(&self, system: Option<&str>) -> Option<String> {
+        use crate::agent::bigctx::output_steering;
+
+        let config = self.config.output_steering;
+        if !config.enabled {
+            return None;
+        }
+        // Classify from the *view*: the model is sent the folded array, and a
+        // tool-result tail that survived a fold is still the real final turn.
+        let decision = output_steering::decide(&project_cores(&self.view), config);
+        if decision.verbosity_level == 0 {
+            return None;
+        }
+        let block = output_steering::render_steering_block(
+            decision.verbosity_level,
+            output_steering::DEFAULT_STEERING_SENTINEL,
+        )?;
+        let existing = system.unwrap_or("");
+        let placed = output_steering::apply_to_prompt(
+            existing,
+            &block,
+            output_steering::DEFAULT_STEERING_SENTINEL,
+        );
+        placed.changed.then_some(placed.updated)
+    }
+}
+
+/// Project bigctx cores onto the structural view output steering classifies.
+///
+/// A trailing run of tool results folds into ONE synthetic user message, which
+/// is what makes a tool round read as a continuation rather than an unknown
+/// turn — the same rule as `providers::Msg`, applied to the folded view the
+/// model is actually sent.
+fn project_cores(messages: &[CoreMessage]) -> Vec<crate::agent::bigctx::output_steering::StructuralMessage> {
+    use crate::agent::bigctx::output_steering::{BlockKind, StructuralMessage};
+    use crate::agent::bigctx::types::MessageRole;
+
+    let mut tail: Vec<BlockKind> = Vec::new();
+    for core in messages.iter().rev() {
+        if core.role != MessageRole::Tool {
+            break;
+        }
+        tail.push(BlockKind::ToolResult { is_error: false });
+    }
+    if !tail.is_empty() {
+        tail.reverse();
+        return vec![StructuralMessage::user_blocks(tail)];
+    }
+
+    match messages.last() {
+        Some(core) if core.role == MessageRole::User => {
+            vec![StructuralMessage::user_text(core.text_or_empty().to_string())]
+        }
+        _ => Vec::new(),
+    }
+}
+
 impl BigctxHandle {
     pub fn new() -> BigctxHandle {
         BigctxHandle::default()

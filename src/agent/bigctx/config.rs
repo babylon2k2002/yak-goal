@@ -113,6 +113,8 @@ pub struct BigctxConfig {
     pub promotion_threshold: u32,
     pub crush: CrushConfig,
     pub ccr: CcrConfig,
+    /// Output-side steering: how much prose the model should emit.
+    pub output_steering: crate::agent::bigctx::output_steering::OutputSteeringConfig,
 }
 
 /// Content-cached retrieval: keeping oversized tool results out of the context.
@@ -225,6 +227,11 @@ pub fn config_from_json(
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
     }
+    // The steering block is nested, so it resolves through its own validator —
+    // which returns warnings rather than failing, and keeps the omitted-field
+    // vs out-of-range distinction.
+    (config.output_steering, _) =
+        crate::agent::bigctx::output_steering::resolve_config(object.get("output_steering"));
     config
 }
 
@@ -277,6 +284,9 @@ pub fn default_config(model_context_limit: u64) -> BigctxConfig {
             min_tool_tokens: 4_000,
             retrieve_inline_tokens: 4_000,
         },
+        // Off by default: this is the only lever that changes what the model
+        // *says*, not what it reads, so it is opt-in.
+        output_steering: crate::agent::bigctx::output_steering::OutputSteeringConfig::default(),
     }
 }
 
