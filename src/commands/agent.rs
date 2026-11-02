@@ -341,6 +341,44 @@ fn execute_mode(args: &ParsedArgs) -> Result<i32, String> {
         conv_system.as_deref(),
         &extensions.system_sections(),
     );
+    // Output steering is decided ONCE, here, and fixed for the session.
+    //
+    // It has to be once. The system prompt is the head of every request, and
+    // providers cache by input prefix — `src/agent/mod.rs:617` goes out of its
+    // way to keep it byte-identical every round precisely so the whole history
+    // is not re-billed at cache-miss price. The directive depends only on the
+    // configured level, never on the turn, so computing it per round would buy
+    // nothing and risk shifting those head bytes.
+    //
+    // The effort-routing half of steering IS per-turn (it depends on whether
+    // the final message is a mechanical continuation) and is decided
+    // separately at request time; it does not touch the prompt.
+    let system = {
+        let (steering, warnings) = crate::agent::bigctx::output_steering::resolve_config(
+            settings.bigctx.as_ref().and_then(|v| v.get("output_steering")),
+        );
+        for warning in warnings {
+            let p = crate::theme::err();
+            eprintln!("{}warning: {warning}{}", p.dim, p.reset);
+        }
+        match crate::agent::bigctx::output_steering::render_steering_block(
+            steering.verbosity_level,
+            crate::agent::bigctx::output_steering::DEFAULT_STEERING_SENTINEL,
+        ) {
+            Some(block) if steering.enabled => {
+                Some(
+                    crate::agent::bigctx::output_steering::apply_to_prompt(
+                        system.as_deref().unwrap_or(""),
+                        &block,
+                        crate::agent::bigctx::output_steering::DEFAULT_STEERING_SENTINEL,
+                    )
+                    .updated,
+                )
+            }
+            // Disabled, or level 0: leave the prompt exactly as built.
+            _ => system,
+        }
+    };
 
     // the goal file's key: the thread id when there is one, else the cwd
     let cwd_key = crate::agent::goal::cwd_key(&cwd);
