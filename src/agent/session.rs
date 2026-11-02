@@ -232,7 +232,23 @@ pub fn bigctx_view_with_nudge(
 /// chance this round) — otherwise it would fold before the model answered,
 /// which is exactly what the yield in `maybe_compact` exists to avoid.
 ///
-/// Returns `(new_state, (block_id, messages_folded))` when a fold happened.
+/// Returns `(new_state, fold)` when a fold happened.
+///
+/// What one automatic fold did, in the terms the cache ledger charges it by.
+///
+/// The tool-driven fold reports this shape too; an automatic fold that stayed
+/// silent here let `acp_status` print "no folds" for a session that had folded
+/// twice, so the report was blind to the cheaper half of compression.
+pub struct AutoFold {
+    /// The block the last fold in the loop created.
+    pub block: String,
+    /// Messages folded across every pass of the loop.
+    pub message_count: usize,
+    /// The ledger entry: what was removed, what the summary cost, and where
+    /// the post-fold view diverges from the pre-fold one.
+    pub event: crate::agent::bigctx::FoldEvent,
+}
+
 pub fn maybe_auto_fold(
     history: &[Msg],
     state: &crate::agent::bigctx::CompressionState,
@@ -243,7 +259,7 @@ pub fn maybe_auto_fold(
     nudged_this_round: bool,
 ) -> (
     Option<crate::agent::bigctx::CompressionState>,
-    Option<(String, usize)>,
+    Option<AutoFold>,
 ) {
     // The pressure band and what counts as a real saving come from the same
     // config the nudge uses, so a session that would get a nudge can also be
@@ -297,6 +313,11 @@ pub fn maybe_auto_fold(
     let mut new_state = state.clone();
     let mut folded_total = 0usize;
     let mut last_block = String::new();
+    // What the fold removed and what its summary costs, accumulated over the
+    // loop: the cache ledger charges a fold for the re-payment it forces, and
+    // it cannot do that for a fold it was never told about.
+    let mut folded_tokens = 0u64;
+    let mut summary_tokens = 0u64;
     loop {
         let ranges = crate::agent::bigctx::screen(&projection.messages, &new_state, &config);
         let Some(best) = ranges.compressible.iter().max_by_key(|r| r.tokens) else {
@@ -339,6 +360,9 @@ pub fn maybe_auto_fold(
         };
         last_block = outcome.block_id;
         folded_total += outcome.message_count;
+        folded_tokens += outcome.compressed_tokens;
+        summary_tokens +=
+            crate::agent::bigctx::tokenize::default_count_tokens(&summary);
         // Stop once the session is back under the floor: another fold would
         // spend a model call on a context that no longer needs it.
         let saved: u64 = new_state.blocks.iter().map(|b| b.compressed_tokens).sum();
@@ -361,7 +385,27 @@ pub fn maybe_auto_fold(
         &mut new_state,
         remaining.compressible_tokens(),
     );
-    (Some(new_state), Some((last_block, folded_total)))
+    // Price the view the fold actually produces: the folded messages leave and
+    // the summaries take their place. The caller re-runs the pipeline right
+    // after this, but the ledger entry has to carry the size the fold left
+    // behind — that is the offset the next request's prefix diverges from, and
+    // the report charges the re-payment against it.
+    let view_after = token_count
+        .saturating_sub(folded_tokens)
+        .saturating_add(summary_tokens);
+    (
+        Some(new_state),
+        Some(AutoFold {
+            block: last_block,
+            message_count: folded_total,
+            event: crate::agent::bigctx::FoldEvent {
+                tokens_compressed: folded_tokens,
+                summary_tokens,
+                first_fold_start_tokens: Some(view_after),
+                view_after: Some(view_after),
+            },
+        }),
+    )
 }
 
 /// Unix seconds — the timestamp `CompressionBlock` wants. Kept next to the
@@ -3234,4 +3278,33 @@ fn auto_fold_obeys_nudge_enabled_false() {
         folded.is_none(),
         "nudges off means the automatic fold is off too"
     );
+}
+
+/// An automatic fold must reach the ledger.
+///
+/// The tool-driven fold recorded itself (`bigctx/tools.rs`), but the automatic
+/// one did not, so a session that folded twice still printed "no folds —
+/// nothing has been compressed" from `acp_status`. That is not cosmetic: the
+/// payback analysis is the only signal for deciding whether compression costs
+/// more than it saves, and a silent fold leaves it looking at an empty ledger.
+#[test]
+fn an_auto_fold_is_charged_to_the_ledger() {
+    let ledger = crate::agent::bigctx::CacheLedger::new();
+    // A fresh ledger knows nothing.
+    assert_eq!(ledger.counts(), (0, 0));
+
+    ledger.record_fold(crate::agent::bigctx::FoldEvent {
+        tokens_compressed: 7_700,
+        summary_tokens: 438,
+        first_fold_start_tokens: Some(2_000),
+        view_after: Some(2_000),
+    });
+
+    // (requests, folds): the fold is counted even with no request sampled yet,
+    // which is the state the round runs in right after an auto-fold.
+    let (requests, folds) = ledger.counts();
+    assert_eq!(requests, 0);
+    assert_eq!(folds, 1, "the automatic fold must not go unrecorded");
+    assert!(!ledger.is_empty());
+    assert_eq!(ledger.report().folds.len(), 1);
 }

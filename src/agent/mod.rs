@@ -473,7 +473,17 @@ pub fn run_agent(
                 opts.bigctx_config.as_ref(),
                 nudged_this_round,
             );
-            if let (Some(folded_state), Some((block, removed))) = (folded_state, folded) {
+            if let (Some(folded_state), Some(fold)) = (folded_state, folded) {
+                // Record the fold before the round is sent, so the ledger has
+                // it in place when the request that pays for it is sampled. The
+                // tool-driven fold (`bigctx/tools.rs`) already did this; the
+                // automatic one did not, so `acp_status` reported "no folds"
+                // for a session that had folded — and the payback analysis,
+                // which is the only signal for turning compression off, saw
+                // none of it.
+                if let Some(ledger) = opts.cache_ledger.as_ref() {
+                    ledger.record_fold(fold.event);
+                }
                 // Re-run the pipeline over the folded state so the round is
                 // sent the view a fold actually produces (summary injected,
                 // folded messages gone) rather than the pre-fold one.
@@ -498,8 +508,8 @@ pub fn run_agent(
                     opts.ccr_store.as_ref(),
                 ));
                 on_update(AgentUpdate::AutoFolded {
-                    block: block.clone(),
-                    removed,
+                    block: fold.block.clone(),
+                    removed: fold.message_count,
                 });
             }
 
