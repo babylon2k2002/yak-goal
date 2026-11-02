@@ -190,7 +190,7 @@ pub fn reject_reason(
             message.tool_name.as_deref().unwrap_or("that tool")
         ));
     }
-    if protection.is_protected(message) {
+    if protection.is_tool_protected(message) {
         return Some(format!(
             "{} is protected, so its results must stay visible",
             message.tool_name.as_deref().unwrap_or("that tool")
@@ -726,6 +726,107 @@ mod tests {
         let state = crate::agent::bigctx::create_initial_state();
         let out = append_prompts(&messages, &state, &enabled(), &Protection::default(), 0);
         assert_eq!(out.prompted_count, 0);
+    }
+
+    // ── the test that proves the feature is alive ───────────────────────────
+
+    /// The regression this module was missing.
+    ///
+    /// Absorb's target is by definition a *freshly arrived* tool result, which
+    /// always sits inside `preserve_recent_messages` / `preserve_recent_tokens`.
+    /// While the candidate check consulted `Protection::is_protected`, every
+    /// candidate was skipped as "protected" and `prompted_count` was pinned at
+    /// 0 for the life of the session. The unit tests above did not catch it
+    /// because they passed `Protection::default()` — an empty set, which real
+    /// `process_turn` never produces.
+    ///
+    /// So this drives the real pipeline, with the real defaults.
+    #[test]
+    fn a_fresh_result_is_prompted_through_the_real_pipeline() {
+        let mut config = default_config(200_000);
+        config.absorb = Some(serde_json::json!({"enabled": true, "min_tool_tokens": 10}));
+
+        let messages = vec![
+            user("t1.0", "run the build"),
+            tool_call("t1.1", "c1", "bash"),
+            tool_result("t1.2", "c1", "bash", &"compiler output ".repeat(40)),
+        ];
+
+        // The real defaults protect the recent window; the result is inside it.
+        assert!(config.preserve_recent_messages > 0);
+
+        let turn = crate::agent::bigctx::process_turn(
+            &messages,
+            &crate::agent::bigctx::create_initial_state(),
+            &config,
+        );
+
+        assert_eq!(
+            turn.prompted_for_absorb, 1,
+            "the recent zone must not disqualify a fresh result from absorption"
+        );
+        let result = turn
+            .messages
+            .iter()
+            .find(|m| m.id.starts_with("t1.2"))
+            .expect("the result must still be in the view");
+        assert!(
+            result
+                .text
+                .as_deref()
+                .unwrap_or("")
+                .contains(ABSORB_PROMPT_MARKER),
+            "the forced prompt must reach the view the model is sent"
+        );
+    }
+
+    /// The complement: a *content*-protected tool must still be skipped even
+    /// though it also sits in the recent zone. Separating the two kinds of
+    /// protection must not have opened the door to absorbing what config says
+    /// is the source of truth.
+    #[test]
+    fn a_content_protected_tool_is_still_skipped_by_the_real_pipeline() {
+        let mut config = default_config(200_000);
+        config.absorb = Some(serde_json::json!({"enabled": true, "min_tool_tokens": 10}));
+        config.protected_tools = vec!["bash".to_string()];
+
+        let messages = vec![
+            user("t1.0", "run the build"),
+            tool_call("t1.1", "c1", "bash"),
+            tool_result("t1.2", "c1", "bash", &"compiler output ".repeat(40)),
+        ];
+        let turn = crate::agent::bigctx::process_turn(
+            &messages,
+            &crate::agent::bigctx::create_initial_state(),
+            &config,
+        );
+        assert_eq!(turn.prompted_for_absorb, 0);
+    }
+
+    /// And the fold gate must keep respecting the recent zone: absorption and
+    /// folding consult different questions, and loosening one must not loosen
+    /// the other.
+    #[test]
+    fn the_recent_zone_still_blocks_folding() {
+        let config = default_config(200_000);
+        let messages = vec![
+            user("t1.0", "run the build"),
+            tool_call("t1.1", "c1", "bash"),
+            tool_result("t1.2", "c1", "bash", &"compiler output ".repeat(40)),
+        ];
+        let protection = crate::agent::bigctx::compute_protection(
+            &messages,
+            &crate::agent::bigctx::create_initial_state(),
+            &config,
+        );
+        assert!(
+            protection.is_protected(&messages[2]),
+            "positional protection must still apply to the fold gate"
+        );
+        assert!(
+            !protection.is_tool_protected(&messages[2]),
+            "bash is not content-protected, so absorb may act on it"
+        );
     }
 
     // ── apply ───────────────────────────────────────────────────────────────

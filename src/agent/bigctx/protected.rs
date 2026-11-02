@@ -25,6 +25,21 @@ use crate::agent::bigctx::tokenize::count_message_tokens;
 use crate::agent::bigctx::types::{CompressionState, CoreMessage, MessageContentType, base_id_of};
 
 /// Which messages must stay visible this pass.
+///
+/// Two answers are needed, not one, because the reasons differ in kind:
+///
+/// - [`is_protected`] — every reason, including the positional recent zone.
+///   This is what a *fold* must respect: folding away the message the model is
+///   currently working on is always wrong.
+/// - [`is_tool_protected`] — only the content reasons: a protected tool, the
+///   latest instance of a cumulative-snapshot tool, or a host-pinned message.
+///   This is what *absorption* must respect. An absorb target is by definition
+///   a freshly arrived result, which sits inside the recent zone every time —
+///   so gating absorb on `is_protected` would skip every candidate and the
+///   feature could never fire.
+///
+/// Keeping them apart is the difference between a working feature and one that
+/// passes its tests against an empty protection set and is inert in production.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Protection {
     /// Base ids that may not be folded.
@@ -32,18 +47,29 @@ pub struct Protection {
     /// `tool_call_id`s whose exchange is protected, so a result projected
     /// without a tool name is still covered.
     protected_calls: BTreeSet<String>,
+    /// The subset protected for a *content* reason rather than by position.
+    /// Absorb consults this one.
+    content_bases: BTreeSet<String>,
+    content_calls: BTreeSet<String>,
 }
 
 impl Protection {
     /// Mark a base id as unfoldable. The host uses this to add its own rules
     /// (a pinned message, a user-marked range) on top of the computed set.
+    ///
+    /// A host rule is a content reason, so it also blocks absorption: a message
+    /// the host pinned must not be hidden by the model distilling it.
     pub fn protect_base(&mut self, base_id: impl Into<String>) {
-        self.protected_bases.insert(base_id.into());
+        let base_id = base_id.into();
+        self.content_bases.insert(base_id.clone());
+        self.protected_bases.insert(base_id);
     }
 
     /// Mark a whole tool exchange as unfoldable by its call id.
     pub fn protect_call(&mut self, call_id: impl Into<String>) {
-        self.protected_calls.insert(call_id.into());
+        let call_id = call_id.into();
+        self.content_calls.insert(call_id.clone());
+        self.protected_calls.insert(call_id);
     }
 
     /// True when this base id is protected.
@@ -59,6 +85,27 @@ impl Protection {
             .tool_call_id
             .as_deref()
             .is_some_and(|id| self.protected_calls.contains(id))
+    }
+
+    /// True when the message is protected for a content reason — a protected
+    /// tool, the latest of a latest-only tool, or a host pin — ignoring the
+    /// positional recent zone.
+    ///
+    /// This is the gate absorption consults. See the type docs for why the
+    /// recent zone must not apply.
+    pub fn is_tool_protected(&self, message: &CoreMessage) -> bool {
+        if self.content_bases.contains(base_id_of(&message.id)) {
+            return true;
+        }
+        message
+            .tool_call_id
+            .as_deref()
+            .is_some_and(|id| self.content_calls.contains(id))
+    }
+
+    /// How many messages carry a content-level protection, for reporting.
+    pub fn content_len(&self) -> usize {
+        self.content_bases.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -89,8 +136,11 @@ pub fn compute_protection(
             continue;
         };
         if config.is_tool_protected(tool) {
-            out.protected_bases.insert(base_id_of(&message.id).to_string());
+            let base = base_id_of(&message.id).to_string();
+            out.content_bases.insert(base.clone());
+            out.protected_bases.insert(base);
             if let Some(call_id) = message.tool_call_id.as_deref() {
+                out.content_calls.insert(call_id.to_string());
                 out.protected_calls.insert(call_id.to_string());
             }
         }
@@ -106,9 +156,11 @@ pub fn compute_protection(
                     .is_some_and(|tool| tool_matches(tool, pattern))
         });
         if let Some(message) = newest {
-            out.protected_bases
-                .insert(base_id_of(&message.id).to_string());
+            let base = base_id_of(&message.id).to_string();
+            out.content_bases.insert(base.clone());
+            out.protected_bases.insert(base);
             if let Some(call_id) = message.tool_call_id.as_deref() {
+                out.content_calls.insert(call_id.to_string());
                 out.protected_calls.insert(call_id.to_string());
             }
         }
