@@ -278,7 +278,7 @@ pub fn hide_absorbed(
 }
 
 /// What [`append_prompts`] did.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Prompted {
     pub messages: Vec<CoreMessage>,
     /// How many results received a prompt this turn. Zero means absorb is

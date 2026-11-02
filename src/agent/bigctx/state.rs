@@ -21,6 +21,7 @@ pub fn create_initial_state() -> CompressionState {
         token_snapshot: Default::default(),
         nudge: Default::default(),
         stats: Default::default(),
+        absorbed: Vec::new(),
         next_block_id: 1,
         next_run_id: 1,
         next_ref_index: 1,
