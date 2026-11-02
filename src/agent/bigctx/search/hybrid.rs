@@ -121,4 +121,49 @@ mod tests {
         let refs: Vec<&str> = scored.iter().map(|s| s.ref_id.as_str()).collect();
         assert_eq!(refs, vec!["a", "b", "c"], "order must follow the input");
     }
+
+    /// Retrieval quality against a corpus shaped like real folded history:
+    /// many near-miss distractors, one true target, mixed EN/CJK, and a query
+    /// that does not appear verbatim in the target.
+    #[test]
+    fn the_target_ranks_first_over_a_distractor_corpus() {
+        let mut docs = vec![
+            doc("target", "身份验证流程 was rewritten: the login flow now refreshes tokens"),
+            doc("d1", "database migration plan for the billing schema"),
+            doc("d2", "we discussed login performance but not tokens"),
+            doc("d3", "the tokenizer splits words into bigrams"),
+        ];
+        for i in 0..30 {
+            docs.push(doc(&format!("noise{i}"), "unrelated chatter about nothing"));
+        }
+
+        let ranked = crate::agent::bigctx::search::search(
+            &docs,
+            "authentication login tokens",
+            &crate::agent::bigctx::search::SearchOptions::default(),
+        );
+        assert_eq!(
+            ranked.first().map(|r| r.ref_id.as_str()),
+            Some("target"),
+            "ranked: {:?}",
+            ranked.iter().map(|r| (&r.ref_id, r.score)).collect::<Vec<_>>()
+        );
+    }
+
+    /// The CJK side of the same question: a query with no verbatim overlap
+    /// with the target text must still find it via bigrams.
+    #[test]
+    fn a_cjk_query_finds_its_target_without_verbatim_overlap() {
+        let docs = [
+            doc("target", "重构了身份验证的实现方式"),
+            doc("other", "数据库迁移计划"),
+            doc("noise", "今天天气很好"),
+        ];
+        let ranked = crate::agent::bigctx::search::search(
+            &docs,
+            "验证实现",
+            &crate::agent::bigctx::search::SearchOptions::default(),
+        );
+        assert_eq!(ranked.first().map(|r| r.ref_id.as_str()), Some("target"));
+    }
 }
