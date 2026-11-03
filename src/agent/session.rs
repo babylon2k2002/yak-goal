@@ -1394,6 +1394,199 @@ impl Session {
     }
 }
 
+
+    /// `--json`: the same task, with a line-delimited JSON event stream as
+    /// the output surface instead of the terminal UI. Every [`AgentUpdate`]
+    /// becomes one object and the closing `result` object carries the final
+    /// answer — the shape a supervising process parses (the `subagent`
+    /// example extension, an editor plugin, CI). Approvals still work: their
+    /// prompt goes to stderr, so stdout stays parseable.
+    fn run_task_json(
+        &mut self,
+        prompt: &str,
+        attachments: Vec<crate::providers::Attachment>,
+    ) -> Result<(crate::agent::AgentOutcome, String), String> {
+        let Some(model) = self.model.as_ref() else {
+            return Err(
+                "No model configured. Run /login to add a provider, then /model to pick one."
+                    .to_string(),
+            );
+        };
+        let opts = agent_opts(
+            self.max_request_bytes,
+            self.system.as_deref(),
+            &self.cwd,
+            self.stream,
+            &self.compact,
+            self.thinking.as_deref(),
+            &self.extensions,
+            &self.cache_key,
+            self.cache_anchor(),
+            self.cache_ttl,
+            self.goal.as_ref(),
+            self.bigctx_handle.clone(),
+            self.bigctx_config.clone(),
+            self.bigctx_round,
+            self.cache_ledger.clone(),
+            Some(self.ccr_store.clone()),
+        );
+        // the terminal path renders the reasoning trace through TaskView;
+        // here it is only carried into the stored turn
+        let mut reasoning = String::new();
+        let mut round_reasoning = String::new();
+        let mut round_started = std::time::Instant::now();
+        let mut total = crate::core::http::Usage::default();
+        let mut last_usage: Option<crate::core::http::Usage> = None;
+        let identity = TaskIdentity {
+            model,
+            cwd: &self.cwd,
+            system: self.system.as_deref(),
+        };
+        // the json path sends the compressed view too, so a --json session gets
+        // the same folding as the terminal one
+        let ((mut view_seed, bigctx_state), nudge) = bigctx_view_with_nudge(
+            &self.seed,
+            self.bigctx.as_ref(),
+            self.bigctx_round,
+            self.model.as_ref().and_then(|m| m.context_window),
+            self.bigctx_config.as_ref(),
+            None,
+        );
+        // The nudge rides the tail of the view: the head is the provider's
+        // cached prefix, and rewriting it would cost a full cache miss.
+        if let Some(text) = nudge.as_deref() {
+            inject_nudge(&mut view_seed, text);
+        }
+        let mut on_update = |u: AgentUpdate| {
+            match &u {
+                AgentUpdate::ReasoningDelta(text) => {
+                    reasoning.push_str(text);
+                    round_reasoning.push_str(text);
+                }
+                // same accounting as the terminal path, so the session totals
+                // and /status agree in both modes
+                AgentUpdate::TurnEnd { usage: Some(usage) } => {
+                    total.add(*usage);
+                    last_usage = Some(*usage);
+                }
+                // the round lands in the thread file here and is not emitted:
+                // the event stream stays the UI surface, persistence is not
+                // part of the contract
+                AgentUpdate::RoundEnd { messages, usage } => {
+                    persist_round(
+                        self.store.as_ref(),
+                        &mut self.conversation_id,
+                        &mut self.branch_parent,
+                        &mut self.persist_error,
+                        &identity,
+                        messages,
+                        *usage,
+                        &round_reasoning,
+                        round_started,
+                    );
+                    round_reasoning.clear();
+                    round_started = std::time::Instant::now();
+                    return;
+                }
+                _ => {}
+            }
+            emit_event(&event_json(&u));
+        };
+        // --approval allow answers the ask-list prompt instead of failing
+        // closed: a subagent child runs with stdin closed, and a hard deny
+        // would just send the model looking for unlisted ways to do the same
+        // thing. The hardcoded refusals never consult an approval prompt at
+        // all, so they still deny under this flag.
+        let unattended_allow = self.unattended_allow;
+        let mut on_approval = |req: ApprovalRequest| {
+            if unattended_allow {
+                emit_event(&serde_json::json!({
+                    "type": "approval",
+                    "tool": req.tool,
+                    "preview": req.preview,
+                    "pattern": req.pattern,
+                    "answer": "allow",
+                }));
+                return ApprovalResponse::Allow;
+            }
+            approval::prompt_approval(&req)
+        };
+        // no KeyWatcher here: stdin belongs to the caller (usually a pipe),
+        // and ctrl-c kills this process like any other child
+        let result = run_agent(
+            RunRequest {
+                model,
+                tools: &self.tools,
+                prompt,
+                attachments,
+                seed: std::mem::take(&mut view_seed),
+                opts: &opts,
+            },
+            &mut self.approval,
+            RunCallbacks {
+                on_update: &mut on_update,
+                on_approval: &mut on_approval,
+            },
+        );
+        crate::core::http::clear_interrupt();
+        // see the interactive path: the handle holds whatever the tools wrote
+        self.bigctx = self.bigctx_handle.with(|s| s.state.clone()).or(bigctx_state);
+        self.bigctx_handle.clear();
+        self.usage.add(total);
+        self.last_usage = last_usage;
+        match result {
+            Ok(mut outcome) => {
+                emit_event(&serde_json::json!({
+                    "type": "result",
+                    "text": &outcome.final_text,
+                    "usage": usage_json(outcome.usage.as_ref()),
+                    "interrupted": outcome.interrupted,
+                }));
+                // the history moves into the seed (no clone of the whole
+                // conversation per task); every round is already on disk
+                let history = std::mem::take(&mut outcome.history);
+                self.seed = history;
+                Ok((outcome, reasoning))
+            }
+            // a failed round still saw real work: the stream reports it and
+            // the round in flight persists, exactly as in the terminal path
+            Err(failure) => {
+                emit_event(&serde_json::json!({
+                    "type": "error",
+                    "message": &failure.message,
+                    "text": &failure.final_text,
+                }));
+                persist_round(
+                    self.store.as_ref(),
+                    &mut self.conversation_id,
+                    &mut self.branch_parent,
+                    &mut self.persist_error,
+                    &TaskIdentity {
+                        model,
+                        cwd: &self.cwd,
+                        system: self.system.as_deref(),
+                    },
+                    &failure.history[failure.round_start.min(failure.history.len())..],
+                    // the failed round's own bill: the tokens it spent before
+                    // breaking are real, and dropping them made the footer
+                    // understate every recovered or failed round
+                    failure.usage,
+                    &round_reasoning,
+                    round_started,
+                );
+                // the round never reached `TurnEnd`, so the session totals
+                // never saw it: charge it here or the running total drifts
+                // low by one round per failure
+                if let Some(usage) = failure.usage {
+                    self.usage.add(usage);
+                    self.last_usage = Some(usage);
+                }
+                self.seed = failure.history;
+                Err(failure.message)
+            }
+        }
+    }
+
 /// The per-task facts every round line carries.
 struct TaskIdentity<'a> {
     model: &'a crate::providers::ResolvedModel,
