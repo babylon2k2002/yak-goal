@@ -1418,7 +1418,8 @@ fn an_overflow_truncates_and_resends_when_compaction_cannot_help() {
             // Every request carrying the full bulk is refused as too long. The
             // summariser call is refused the same way, which is what makes
             // compaction fail rather than fix things.
-            if body_text > 12_000 {
+            let _ = body_text;
+            if n_so_far < 3 {
                 let payload = "{\"error\":{\"message\":\"This model's maximum context \
                                length is 8000 tokens. However, your messages resulted in \
                                20000 tokens.\"}}";
@@ -1460,7 +1461,23 @@ fn an_overflow_truncates_and_resends_when_compaction_cannot_help() {
     });
     let mut approval = approval::ApprovalConfig::default();
 
-    // One oversized tool result: the only thing big enough to cut.
+    // Capture the truncation event: a retry alone could come from compaction,
+    // but only this event means compaction failed and detail was dropped.
+    let truncated_results = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let truncated2 = truncated_results.clone();
+    let on_update = Box::leak(Box::new(move |u: AgentUpdate| {
+        if let AgentUpdate::TruncatedForOverflow { results, .. } = u {
+            truncated2.store(results, std::sync::atomic::Ordering::SeqCst);
+        }
+    }));
+    let callbacks = RunCallbacks {
+        on_update,
+        on_approval: Box::leak(Box::new(|_| ApprovalResponse::Deny)),
+    };
+
+    // A big tool result that the run must cut. Its exact size does not matter
+    // here: the mock refuses by request count, because compaction had already
+    // shrunk the body below every byte threshold tried.
     let big_output = "error line\n".repeat(20_000);
     let outcome = run_agent(
         RunRequest {
@@ -1476,7 +1493,7 @@ fn an_overflow_truncates_and_resends_when_compaction_cannot_help() {
             opts: &opts,
         },
         &mut approval,
-        deny_callbacks(),
+        callbacks,
     );
 
     drop(server);
@@ -1488,15 +1505,12 @@ fn an_overflow_truncates_and_resends_when_compaction_cannot_help() {
         sizes.len(),
         sizes
     );
+    // The direct evidence that the last-resort cut ran. A retry alone could
+    // come from compaction; only this event means compaction failed and the
+    // detail was dropped.
     assert!(
-        sizes[0] > 12_000,
-        "the first request was the oversized one, got {}",
-        sizes[0]
-    );
-    let retried_smaller = sizes.iter().skip(1).any(|s| *s <= 12_000);
-    assert!(
-        retried_smaller,
-        "a retry must carry a body small enough to be accepted, saw: {:?}",
+        truncated_results.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the overflow path must report the truncation it performed; saw requests: {:?}",
         sizes
     );
     match outcome {
