@@ -717,9 +717,9 @@ mod tests {
     #[test]
     fn listing_a_missing_directory_is_empty_not_an_error() {
         let resolver = Resolver::with_dirs(Some(PathBuf::from("/nonexistent/yak/packs")), vec![]);
-        // Only the builtin remains.
+        // Only the builtins remain.
         let names: Vec<String> = resolver.list().into_iter().map(|p| p.name).collect();
-        assert_eq!(names, vec!["default".to_string()]);
+        assert_eq!(names, vec!["default".to_string(), "lean".to_string()]);
     }
 
     // ── end to end ──────────────────────────────────────────────────────────
@@ -842,6 +842,143 @@ mod tests {
             Some("PROJECT_RULE")
         );
         std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn the_lean_builtin_resolves_and_changes_the_surface() {
+        let resolver = Resolver::with_dirs(None, Vec::new());
+        let pack = resolver.resolve("lean").expect("the lean pack is built in");
+        assert_eq!(pack.source, "builtin:lean");
+        // It is a pack, so it is expressed purely as overrides.
+        let rules = pack
+            .surface
+            .prompts
+            .how_to_compress_rules
+            .as_deref()
+            .expect("lean supplies its own contract");
+        assert!(
+            rules.contains("KEEP VERBATIM"),
+            "the condensed contract must keep the load-bearing classes"
+        );
+        assert!(
+            rules.contains("INTEGRITY"),
+            "the condensed contract must keep the integrity rule"
+        );
+        assert!(
+            rules.len() < crate::agent::bigctx::rules::HOW_TO_COMPRESS_RULES.len(),
+            "lean must actually be leaner than the default"
+        );
+        assert!(
+            pack.surface.tool_prompts.contains_key("compress"),
+            "lean overrides tool descriptions"
+        );
+    }
+
+    #[test]
+    fn a_pack_section_reaches_the_rendered_system_prompt() {
+        // The gap that mattered most: the model had never been told what its
+        // citation refs mean.
+        let cwd = temp_cwd("sysprompt");
+        std::fs::write(
+            cwd.join(".yak").join("packs").join("team.json"),
+            r#"{"prompt_sections":{"tools":"TEAM_TOOLS_SENTINEL"}}"#,
+        )
+        .unwrap();
+        let config = crate::agent::bigctx::config_from_json_in(
+            200_000,
+            Some(&json!({"prompt_pack":"team"})),
+            &cwd,
+        );
+        let prompts = config.prompts.clone().expect("resolved");
+        let text = crate::agent::bigctx::sysprompt::render(&prompts, &config.prompt_sections);
+        assert!(text.contains("TEAM_TOOLS_SENTINEL"));
+        assert!(text.contains("ACP TAGS"), "untouched sections survive");
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn a_pack_can_drop_a_nudge_section() {
+        let cwd = temp_cwd("nudge-section");
+        std::fs::write(
+            cwd.join(".yak").join("packs").join("team.json"),
+            r#"{"nudge_sections":{"efficiency_note":null}}"#,
+        )
+        .unwrap();
+        let config = crate::agent::bigctx::config_from_json_in(
+            200_000,
+            Some(&json!({"prompt_pack":"team"})),
+            &cwd,
+        );
+        let rendered = config.nudge_sections.render(&[
+            ("efficiency_note", "DEFAULT_NOTE"),
+            ("philosophy", "PHILOSOPHY"),
+        ]);
+        assert_eq!(
+            rendered,
+            vec!["PHILOSOPHY"],
+            "a null section must be dropped, not blanked"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn param_descriptions_reach_the_nested_schema() {
+        // `compress`'s arguments are not flat; a model gets startId/endId wrong,
+        // and those live two levels down.
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("startId".to_string(), "TEAM_START".to_string());
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "content": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "object", "properties": {
+                            "startId": {"type": "string"},
+                            "endId": {"type": "string"}
+                        }}
+                    ]
+                }
+            }
+        });
+        let out = apply_param_descriptions(&schema, &overrides);
+        let text = serde_json::to_string(&out).unwrap();
+        assert!(text.contains("TEAM_START"), "nested override must apply");
+        // The sibling it did not name is untouched.
+        assert!(!text.contains("TEAM_END"));
+        // And the input is not mutated: the schema is a shared constant.
+        assert!(!serde_json::to_string(&schema).unwrap().contains("TEAM_START"));
+    }
+
+    #[test]
+    fn a_lean_compressschema_params_override_reaches_parameters() {
+        let tools = crate::agent::bigctx::bigctx_tools_with(
+            crate::agent::bigctx::BigctxHandle::new(),
+            &crate::agent::bigctx::lean::pack().surface.tool_prompts,
+        );
+        let compress = tools.iter().find(|t| t.name() == "compress").unwrap();
+        let schema = serde_json::to_string(&compress.parameters()).unwrap();
+        assert!(
+            schema.contains("Inclusive first mNNNNN"),
+            "the lean param override must reach the schema the model sees"
+        );
+    }
+
+    #[test]
+    fn adapters_pass_through_untouched() {
+        // Host-specific keys are opaque to the kernel, which validates only the
+        // shape — anything more would need a kernel change per host.
+        let raw = json!({"adapters": {"pi": {"delegate_prompt": "D"}}});
+        let surface = sanitize(Some(&raw));
+        let adapters = surface.adapters.expect("adapters carried");
+        assert_eq!(adapters["pi"]["delegate_prompt"], json!("D"));
+    }
+
+    #[test]
+    fn a_non_object_adapters_block_is_dropped() {
+        for bad in [json!("text"), json!([1, 2]), json!(3)] {
+            assert!(sanitize(Some(&json!({"adapters": bad}))).adapters.is_none());
+        }
     }
 
     #[test]
