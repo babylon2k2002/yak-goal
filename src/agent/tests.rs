@@ -1414,22 +1414,20 @@ fn an_overflow_truncates_and_resends_when_compaction_cannot_help() {
             let raw = crate::core::testutil::read_request_bytes(&mut c);
             bodies2.lock().unwrap().push(raw.len());
 
-            // The provider sequence the overflow path needs:
-            //   0: the real request is refused as too long -> enter the path
-            //   1: the summariser call fails for an unrelated reason, so
-            //      compaction cannot help and truncation is the only move
-            //   2+: accepted
-            //
-            // Getting request 1 wrong is what makes this test lie: if the
-            // summariser succeeds, compaction "fixes" the overflow and the
-            // truncation branch is never reached at all.
-            if n_so_far == 0 {
-                let payload = "{\"error\":{\"message\":\"This model's maximum context \
-                               length is 8000 tokens. However, your messages resulted in \
-                               20000 tokens.\"}}";
+            // Classify by content, not by request order: the pre-request
+            // compaction pass can fire before the first real request, so a
+            // count-based sequence refuses the wrong thing. The summariser's
+            // own system prompt is the reliable marker.
+            let text = String::from_utf8_lossy(&raw).to_lowercase();
+            let is_summariser = text.contains("context summarization assistant");
+
+            if is_summariser {
+                // Compaction must fail for a reason the overflow path cannot
+                // recover from, so truncation is the only move left.
+                let payload = "{\"error\":{\"message\":\"internal server error\"}}";
                 let _ = c.write_all(
                     format!(
-                        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n\
+                        "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\n\
                          content-length: {}\r\n\r\n{payload}",
                         payload.len()
                     )
@@ -1437,11 +1435,15 @@ fn an_overflow_truncates_and_resends_when_compaction_cannot_help() {
                 );
                 continue;
             }
-            if n_so_far == 1 {
-                let payload = "{\"error\":{\"message\":\"internal server error\"}}";
+            if n_so_far < 2 {
+                // The real requests are refused as too long, which is what
+                // enters the overflow path in the first place.
+                let payload = "{\"error\":{\"message\":\"This model's maximum context \
+                               length is 8000 tokens. However, your messages resulted in \
+                               20000 tokens.\"}}";
                 let _ = c.write_all(
                     format!(
-                        "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\n\
+                        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n\
                          content-length: {}\r\n\r\n{payload}",
                         payload.len()
                     )
