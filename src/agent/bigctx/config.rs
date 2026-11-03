@@ -129,6 +129,14 @@ pub struct BigctxConfig {
     /// are actually needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_pack: Option<String>,
+    /// Append the language-preservation rule to every rule text.
+    ///
+    /// Off by default: turning it on changes the prompt surface, and the prompt
+    /// head is the provider's cached prefix. A session that flipped this mid-way
+    /// would re-bill its whole history at cache-miss price, so it belongs in
+    /// config read once at startup, never toggled per turn.
+    #[serde(default)]
+    pub language_preservation: bool,
     /// The resolved prompt set, filled in by whoever built this config with
     /// filesystem access.
     ///
@@ -286,6 +294,9 @@ pub fn config_from_json(
     if let Some(name) = object.get("prompt_pack").and_then(serde_json::Value::as_str) {
         config.prompt_pack = Some(name.to_string());
     }
+    if let Some(on) = bool_at("language_preservation") {
+        config.language_preservation = on;
+    }
     // Resolve the pack here, once, using the process working directory.
     //
     // Every caller builds its config right before rendering a nudge or running
@@ -380,6 +391,7 @@ pub fn default_config(model_context_limit: u64) -> BigctxConfig {
         output_steering: crate::agent::bigctx::output_steering::OutputSteeringConfig::default(),
         absorb: None,
         prompt_pack: None,
+        language_preservation: false,
         prompts: None,
         pack_found: false,
         prompt_sections: Default::default(),

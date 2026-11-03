@@ -172,6 +172,50 @@ impl Default for Prompts {
 }
 
 impl Prompts {
+    /// Append the language-preservation rule to all four texts.
+    ///
+    /// Opt-in, and additive only — this cannot remove or replace load-bearing
+    /// wording, which is why it needs no risk acknowledgement the way overriding
+    /// a rule does. Off by default so the prompt surface stays byte-identical and
+    /// the provider prefix cache cannot shift merely because this module gained
+    /// a feature.
+    ///
+    /// Applied to all four rather than to tier-1 alone: a translation can enter
+    /// at any tier, and a distilled summary that switched language is exactly as
+    /// unusable as a tier-1 one.
+    pub fn with_language_preservation(self) -> Prompts {
+        let append = |base: std::borrow::Cow<'static, str>, sep: &str| {
+            std::borrow::Cow::Owned(format!("{}{sep}{}", base.as_ref(), LANGUAGE_PRESERVATION_RULE))
+        };
+        Prompts {
+            // A bare `- ` keeps the philosophy a bullet, matching how the rule
+            // reads inside that list.
+            compress_philosophy: append(
+                self.compress_philosophy,
+                "
+- ",
+            ),
+            how_to_compress_rules: append(self.how_to_compress_rules, "
+
+"),
+            tier2_distill_rules: append(self.tier2_distill_rules, "
+
+"),
+            tier3_condense_rules: append(self.tier3_condense_rules, "
+
+"),
+        }
+    }
+
+    /// True when the rule is already baked in, so a second opt-in is a no-op
+    /// rather than a duplicate paragraph.
+    pub fn has_language_preservation(&self) -> bool {
+        self.how_to_compress_rules
+            .contains("Preserve the source conversation's primary language")
+    }
+}
+
+impl Prompts {
     /// The rules for one tier.
     pub fn rules_for(&self, tier: crate::agent::bigctx::types::Tier) -> &str {
         match tier {
@@ -205,6 +249,56 @@ mod tests {
                 text.len()
             );
         }
+    }
+
+    #[test]
+    fn the_language_rule_is_absent_by_default() {
+        // Off by default so the prompt surface stays byte-identical: turning it
+        // on moves the head of every request.
+        let prompts = default_prompts();
+        assert!(!prompts.has_language_preservation());
+        assert!(!prompts.how_to_compress_rules.contains("primary language"));
+    }
+
+    #[test]
+    fn opting_in_appends_the_rule_to_all_four_texts() {
+        // A translation can enter at any tier, so all four need it.
+        let prompts = default_prompts().with_language_preservation();
+        for (name, text) in [
+            ("philosophy", prompts.compress_philosophy.as_ref()),
+            ("how-to", prompts.how_to_compress_rules.as_ref()),
+            ("tier2", prompts.tier2_distill_rules.as_ref()),
+            ("tier3", prompts.tier3_condense_rules.as_ref()),
+        ] {
+            assert!(
+                text.contains("primary language"),
+                "`{name}` is missing the rule"
+            );
+        }
+        assert!(prompts.has_language_preservation());
+    }
+
+    #[test]
+    fn opting_in_keeps_the_original_rules_intact() {
+        // Additive only: the load-bearing wording must survive untouched.
+        let base = default_prompts();
+        let with = default_prompts().with_language_preservation();
+        assert!(with.how_to_compress_rules.starts_with(base.how_to_compress_rules.as_ref()));
+        assert!(with.how_to_compress_rules.contains("KEEP VERBATIM"));
+    }
+
+    #[test]
+    fn opting_in_twice_does_not_duplicate_the_rule() {
+        // The guard lives in the caller, but the predicate it uses has to be
+        // accurate or a resumed session would append the paragraph again.
+        let once = default_prompts().with_language_preservation();
+        assert!(once.has_language_preservation());
+        assert_eq!(
+            once.how_to_compress_rules
+                .matches("primary language")
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -444,6 +444,22 @@ pub fn resolve_prompts(resolver: &Resolver, name: Option<&str>) -> (Prompts, Opt
     }
 }
 
+/// Apply the additive options that sit on top of whichever prompt set won.
+///
+/// Kept in one place so the pack path and the no-pack path cannot diverge: a
+/// rule that applied only when a pack was configured would look like a pack
+/// feature and silently do nothing for most sessions.
+fn finish_prompts(
+    prompts: crate::agent::bigctx::rules::Prompts,
+    language_preservation: bool,
+) -> crate::agent::bigctx::rules::Prompts {
+    if language_preservation && !prompts.has_language_preservation() {
+        prompts.with_language_preservation()
+    } else {
+        prompts
+    }
+}
+
 /// Fill in `config.prompts` from `config.prompt_pack`.
 ///
 /// Called once, where a config is built with filesystem access. Returns any
@@ -452,11 +468,18 @@ pub fn resolve_prompts(resolver: &Resolver, name: Option<&str>) -> (Prompts, Opt
 /// unable to compress.
 pub fn apply_prompt_pack(config: &mut crate::agent::bigctx::config::BigctxConfig, cwd: &Path) -> Option<String> {
     let Some(name) = config.prompt_pack.clone() else {
+        // No pack, but the language rule is independent of packs: applying it
+        // only when a pack happens to be configured would make the feature
+        // silently inert for everyone who never made one.
+        if config.language_preservation {
+            let base = crate::agent::bigctx::rules::default_prompts();
+            config.prompts = Some(finish_prompts(base, true));
+        }
         return None;
     };
     let resolver = default_resolver(cwd);
     let (prompts, warning) = resolve_prompts(&resolver, Some(&name));
-    config.prompts = Some(prompts);
+    config.prompts = Some(finish_prompts(prompts, config.language_preservation));
     // The tool descriptions travel with the rule texts: a pack that sets one
     // and not the other would be applied halfway, which reads as a broken file
     // rather than a partial override.
@@ -980,6 +1003,54 @@ mod tests {
         for bad in [json!("text"), json!([1, 2]), json!(3)] {
             assert!(sanitize(Some(&json!({"adapters": bad}))).adapters.is_none());
         }
+    }
+
+    #[test]
+    fn language_preservation_takes_effect_without_a_pack() {
+        // The rule is independent of packs. Applying it only on the pack path
+        // would make the feature silently inert for everyone who never made one.
+        let cwd = temp_cwd("lang-nopack");
+        let config = crate::agent::bigctx::config_from_json_in(
+            200_000,
+            Some(&json!({"language_preservation": true})),
+            &cwd,
+        );
+        let prompts = config.prompts.expect("resolved");
+        assert!(prompts.has_language_preservation());
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn language_preservation_composes_with_a_pack() {
+        let cwd = temp_cwd("lang-pack");
+        std::fs::write(
+            cwd.join(".yak").join("packs").join("team.json"),
+            r#"{"prompts":{"how_to_compress_rules":"TEAM_RULES"}}"#,
+        )
+        .unwrap();
+        let config = crate::agent::bigctx::config_from_json_in(
+            200_000,
+            Some(&json!({"prompt_pack":"team","language_preservation":true})),
+            &cwd,
+        );
+        let prompts = config.prompts.expect("resolved");
+        assert!(
+            prompts.how_to_compress_rules.starts_with("TEAM_RULES"),
+            "the pack's rule must win"
+        );
+        assert!(
+            prompts.has_language_preservation(),
+            "then the additive rule applies on top"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn language_preservation_is_off_by_default() {
+        let cwd = temp_cwd("lang-off");
+        let config = crate::agent::bigctx::config_from_json_in(200_000, None, &cwd);
+        assert!(config.prompts.is_none(), "no work done when nothing is configured");
+        std::fs::remove_dir_all(&cwd).ok();
     }
 
     #[test]

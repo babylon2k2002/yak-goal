@@ -720,6 +720,113 @@ cache:
     text
 }
 
+// ─── acp_cache ───────────────────────────────────────────────────────────────
+
+/// The `acp_cache` tool: what compression has actually cost.
+///
+/// `acp_status` reports the context; this reports the *price*. A fold removes
+/// tokens but rewrites the prompt head, so it can cost more in cache misses than
+/// it saves — and nothing else in the toolset can tell the model that. Without
+/// it the model optimises for the number it can see (context size) and cannot
+/// see the one that decides whether compressing helped.
+pub struct CacheTool {
+    handle: BigctxHandle,
+    description_override: Option<String>,
+    param_overrides: std::collections::BTreeMap<String, String>,
+}
+
+impl CacheTool {
+    pub fn new(handle: BigctxHandle) -> CacheTool {
+        CacheTool {
+            handle,
+            description_override: None,
+            param_overrides: Default::default(),
+        }
+    }
+
+    pub fn with_description(handle: BigctxHandle, description: Option<String>) -> CacheTool {
+        CacheTool {
+            handle,
+            description_override: description,
+            param_overrides: Default::default(),
+        }
+    }
+}
+
+impl Tool for CacheTool {
+    fn name(&self) -> &str {
+        "acp_cache"
+    }
+    fn tier(&self) -> Tier {
+        Tier::Read
+    }
+    fn description(&self) -> &str {
+        if let Some(text) = self.description_override.as_deref() {
+            return text;
+        }
+        "Prompt-cache reconciliation: how many input tokens were billed, how many hit the cache,          and whether the folds paid for themselves. Use when asked what compression costs, or to          decide whether folding more is worth it."
+    }
+    fn parameters(&self) -> Value {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "detail": {
+                    "type": "string",
+                    "enum": ["summary", "full"],
+                    "description": "summary (default) reports totals and verdicts; full adds every fold."
+                }
+            }
+        });
+        crate::agent::bigctx::packs::apply_param_descriptions(&schema, &self.param_overrides)
+    }
+    fn preview(&self, _args: &Value) -> String {
+        "cache report".to_string()
+    }
+    fn execute(&self, args: &Value, _cwd: &Path, _log: &mut dyn FnMut(ToolProgress)) -> ToolOutput {
+        let full = args
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|d| d == "full");
+        let Some(text) = self.handle.with(|session| {
+            let Some(ledger) = session.ledger.as_ref() else {
+                return "No cache ledger for this session — it is recorded only when the caller                         asked for cache accounting."
+                    .to_string();
+            };
+            if ledger.is_empty() {
+                return "No requests recorded yet. The ledger fills as turns complete.".to_string();
+            }
+            let report = ledger.report();
+            let mut text = crate::agent::bigctx::render_cache_report(&report);
+            if !full {
+                // The default stays compact: the verdict and the totals are what
+                // a decision needs, and every fold listed is a wall of numbers
+                // the model will spend tokens reading and then not use.
+                while text.contains("
+fold ") {
+                    match text.find("
+fold ") {
+                        Some(i) => {
+                            let tail = text[i + 1..].to_string();
+                            let end = tail
+                                .find("
+
+")
+                                .map(|e| i + 1 + e)
+                                .unwrap_or(text.len());
+                            text.replace_range(i..end, "");
+                        }
+                        None => break,
+                    }
+                }
+            }
+            text
+        }) else {
+            return ToolOutput::err(NO_SESSION);
+        };
+        ToolOutput::ok(text)
+    }
+}
+
 /// Every bigctx tool, bound to one handle, with the built-in descriptions.
 pub fn bigctx_tools(handle: BigctxHandle) -> Vec<Box<dyn Tool>> {
     bigctx_tools_with(handle, &std::collections::BTreeMap::new())
@@ -755,8 +862,10 @@ pub fn bigctx_tools_with(
     search.param_overrides = params("search_context");
     let mut absorb = AbsorbTool::with_description(handle.clone(), describe("absorb"));
     absorb.param_overrides = params("absorb");
-    let mut status = StatusTool::with_description(handle, describe("acp_status"));
+    let mut status = StatusTool::with_description(handle.clone(), describe("acp_status"));
     status.param_overrides = params("acp_status");
+    let mut cache = CacheTool::with_description(handle, describe("acp_cache"));
+    cache.param_overrides = params("acp_cache");
 
     vec![
         Box::new(compress),
@@ -765,6 +874,7 @@ pub fn bigctx_tools_with(
         Box::new(search),
         Box::new(absorb),
         Box::new(status),
+        Box::new(cache),
     ]
 }
 
@@ -1359,7 +1469,8 @@ mod tests {
                 "acp_retrieve",
                 "search_context",
                 "absorb",
-                "acp_status"
+                "acp_status",
+                "acp_cache"
             ]
         );
     }
