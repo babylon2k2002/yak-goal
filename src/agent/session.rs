@@ -1297,8 +1297,6 @@ impl Session {
             }
             _ => {}
         };
-        emit_event(&event_json(&u));
-    };
         // --approval allow answers the ask-list prompt instead of failing
         // closed: a subagent child runs with stdin closed, and a hard deny
         // would just send the model looking for unlisted ways to do the same
