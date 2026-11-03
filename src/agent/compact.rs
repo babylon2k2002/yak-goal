@@ -138,13 +138,19 @@ const RESERVE_MAX_PCT: f64 = 0.25;
 /// misconfigured limit cannot reserve the whole window, and an unknown limit
 /// behaves exactly as before.
 pub fn reserve_tokens(window: u64, max_output: Option<u64>) -> u64 {
+    if window == 0 {
+        return 0;
+    }
     let cap = (window as f64 * RESERVE_MAX_PCT) as u64;
     let sized = max_output.unwrap_or(0).max(RESERVE_TOKENS);
-    // The floor wins over the cap when the window is small: a reserve smaller
-    // than the floor would leave the summariser no room, and a window that
-    // cannot fit the floor is a window this cannot help with anyway.
     let reserve = sized.min(cap).max(RESERVE_TOKENS);
-    reserve.min(window.saturating_sub(1))
+    // A window smaller than the floor cannot honour it. Taking the floor anyway
+    // would leave a window's-width minus one byte for the conversation, pinning
+    // the trigger at 1 — compaction would then fire on every request, including
+    // the very first, against a context that was never sent. Half the window is
+    // the most a reserve may claim in that case, so a small-window model still
+    // gets to hold a real conversation between folds.
+    reserve.min(window / 2).max(1)
 }
 
 /// [`effective_trigger`] with the model's output limit taken into account.
@@ -612,6 +618,50 @@ fn prune_matching(history: &mut [Msg], threshold: usize, up_to: usize) -> Pruned
 
 #[cfg(test)]
 mod tests {
+    /// The last-resort truncation the overflow path runs when compaction fails.
+    ///
+    /// It is the one move left after the provider has refused the prompt and the
+    /// summariser could not shrink it, so the two things that must hold are:
+    /// it actually removes bulk, and it says how much.
+    #[test]
+    fn the_last_resort_truncation_actually_shrinks_the_history() {
+        use crate::providers::Msg;
+        let big = "x".repeat(PRUNE_THRESHOLD_CHARS * 3);
+        let mut history = vec![
+            Msg::user("do the thing"),
+            Msg::tool_result("call_1", "bash", &big),
+            Msg::assistant("ok"),
+        ];
+        let before = estimate_tokens(&history, None);
+        let pruned = prune_tool_results(&mut history);
+        let after = estimate_tokens(&history, None);
+
+        assert!(pruned.count > 0, "the oversized result must be cut");
+        assert!(
+            after < before,
+            "the history must be smaller: {before} -> {after}"
+        );
+        assert_eq!(
+            pruned.freed_tokens,
+            before.saturating_sub(after),
+            "the reported saving must match what actually happened"
+        );
+    }
+
+    #[test]
+    fn truncation_leaves_a_small_history_alone() {
+        // If nothing is over the threshold, the overflow path has no move left —
+        // and must say so by reporting zero rather than pretending it acted.
+        use crate::providers::Msg;
+        let mut history = vec![
+            Msg::user("hi"),
+            Msg::tool_result("c1", "bash", "small output"),
+        ];
+        let pruned = prune_tool_results(&mut history);
+        assert_eq!(pruned.count, 0);
+        assert_eq!(pruned.freed_tokens, 0);
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -799,6 +849,124 @@ mod tests {
         assert!(should_compact(64_000, 64_000));
         // off: there is no line to cross
         assert!(!should_compact(u64::MAX, 0));
+    }
+
+    #[test]
+    fn an_unknown_output_limit_reserves_the_floor() {
+        // No `max_tokens` configured is the common case: the reserve must be
+        // exactly what it was before this was sized, or every existing session
+        // would change behaviour on upgrade.
+        assert_eq!(reserve_tokens(200_000, None), RESERVE_TOKENS);
+        assert_eq!(
+            effective_trigger_for(None, Some(200_000), None),
+            effective_trigger(None, Some(200_000)),
+            "an unknown output limit must not change the trigger at all"
+        );
+    }
+
+    #[test]
+    fn a_larger_output_limit_reserves_more() {
+        // The reserve exists to hold the answer the model may write. A model
+        // permitted 32K must not be reserved 16K, or the request is sized for an
+        // answer half as long as the provider will actually allow.
+        let small = reserve_tokens(200_000, Some(4_096));
+        let large = reserve_tokens(200_000, Some(32_768));
+        assert!(large > small, "{large} must exceed {small}");
+        assert_eq!(large, 32_768);
+        assert!(
+            effective_trigger_for(None, Some(200_000), Some(32_768))
+                < effective_trigger_for(None, Some(200_000), Some(4_096)),
+            "a bigger answer budget must lower the compaction trigger"
+        );
+    }
+
+    #[test]
+    fn a_small_output_limit_never_reserves_less_than_the_floor() {
+        // A 4K-output model still needs room for the summariser call that runs
+        // when compaction fires, and that call's input is the context itself.
+        assert_eq!(reserve_tokens(200_000, Some(1)), RESERVE_TOKENS);
+        assert_eq!(reserve_tokens(200_000, Some(0)), RESERVE_TOKENS);
+    }
+
+    #[test]
+    fn the_reserve_is_capped_at_a_share_of_the_window() {
+        // A misconfigured limit must not reserve the whole window and leave
+        // nothing to work in.
+        let reserve = reserve_tokens(200_000, Some(1_000_000));
+        assert_eq!(reserve, 50_000, "capped at 25% of the window");
+        assert!(reserve < 200_000);
+    }
+
+    #[test]
+    fn a_small_window_still_leaves_room_to_send_something() {
+        // The degenerate case: a reserve could otherwise equal the window and
+        // pin the trigger at zero, which would fire compaction on every request
+        // against a context that has not even been sent once.
+        for window in [1_000u64, 8_000, 20_000, RESERVE_TOKENS + 1] {
+            let reserve = reserve_tokens(window, None);
+            let trigger = window.saturating_sub(reserve);
+            assert!(
+                trigger > window / 4,
+                "a {window} window must keep room for a conversation,                  got reserve {reserve} and trigger {trigger}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_trigger_is_still_only_tightened() {
+        // The sizing must not turn a user's number into a suggestion: a value
+        // under the derived ceiling wins, one above it is capped.
+        let window = Some(200_000u64);
+        let ceiling = 200_000 - reserve_tokens(200_000, Some(32_768));
+        assert_eq!(
+            effective_trigger_for(Some(10_000), window, Some(32_768)),
+            10_000
+        );
+        assert_eq!(
+            effective_trigger_for(Some(999_999), window, Some(32_768)),
+            ceiling
+        );
+        assert_eq!(
+            effective_trigger_for(Some(0), window, Some(32_768)),
+            0,
+            "off stays off"
+        );
+    }
+
+    #[test]
+    fn an_unknown_window_leaves_the_trigger_off() {
+        // No window to anchor to: this must never invent a threshold.
+        assert_eq!(effective_trigger_for(None, None, Some(32_768)), 0);
+        assert_eq!(effective_trigger_for(Some(50_000), None, Some(32_768)), 0);
+    }
+
+    #[test]
+    fn the_output_limit_is_read_from_the_model_options() {
+        use crate::providers::ResolvedModel;
+        let model = |options: Vec<(&str, &str)>| ResolvedModel {
+            provider_name: "t".into(),
+            kind: "openai".into(),
+            base_url: String::new(),
+            api_key: None,
+            model_id: "m".into(),
+            context_window: Some(200_000),
+            options: options
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        assert_eq!(max_output_of(&model(vec![("max_tokens", "32768")])), Some(32_768));
+        assert_eq!(
+            max_output_of(&model(vec![("max_completion_tokens", "8192")])),
+            Some(8_192),
+            "the OpenAI Responses spelling must be honoured too"
+        );
+        assert_eq!(max_output_of(&model(vec![])), None);
+        // A typo leaves the previous behaviour rather than shriking the reserve
+        // to the floor.
+        assert_eq!(max_output_of(&model(vec![("max_tokens", "lots")])), None);
+        assert_eq!(max_output_of(&model(vec![("max_tokens", "0")])), None);
+        assert_eq!(max_output_of(&model(vec![("temperature", "0.2")])), None);
     }
 
     /// A known window anchors the trigger at `window - reserve`; an unknown
