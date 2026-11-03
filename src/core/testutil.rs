@@ -34,6 +34,13 @@ pub fn scratch_path(tag: &str) -> PathBuf {
 /// the tree (the agent-loop SSE servers, the session persistence tests).
 #[cfg(test)]
 pub fn read_request(c: &mut std::net::TcpStream) {
+    let _ = read_request_bytes(c);
+}
+
+/// As [`read_request`], returning the bytes of the whole request (head plus
+/// body) so a test can assert on the payload it actually sent.
+#[cfg(test)]
+pub fn read_request_bytes(c: &mut std::net::TcpStream) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     loop {
@@ -55,6 +62,7 @@ pub fn read_request(c: &mut std::net::TcpStream) {
             }
         }
     }
+    buf
 }
 
 #[cfg(test)]

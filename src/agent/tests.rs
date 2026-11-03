@@ -1386,3 +1386,124 @@ fn an_oversized_result_is_stored_before_the_pruners_shrink_it() {
     let pruned = compact::prune_tool_results(&mut history);
     assert_eq!(pruned.count, 0, "a placeholder is not a pruning candidate");
 }
+
+/// The last-resort truncation, driven end to end.
+///
+/// The provider refuses the prompt as too long. `force_compact` then tries to
+/// summarise — but this mock refuses the summariser call too, so compaction
+/// fails and the only move left is to cut the bulk and resend. The test proves
+/// three things that a unit test of `prune_tool_results` cannot:
+///
+/// 1. the refusal is recognised and the overflow path is entered at all,
+/// 2. the retry carries a smaller body than the request that was refused,
+/// 3. the run finishes instead of dying on the second identical refusal.
+#[test]
+fn an_overflow_truncates_and_resends_when_compaction_cannot_help() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+    let bodies2 = bodies.clone();
+    let server = std::thread::spawn(move || {
+        use std::io::Write as _;
+        for conn in listener.incoming().flatten() {
+            let n_so_far = {
+                let g = bodies2.lock().unwrap();
+                g.len()
+            };
+            let mut c = conn;
+            let raw = crate::core::testutil::read_request_bytes(&mut c);
+            let body_text = raw.len();
+            bodies2.lock().unwrap().push(body_text);
+
+            // Every request carrying the full bulk is refused as too long. The
+            // summariser call is refused the same way, which is what makes
+            // compaction fail rather than fix things.
+            if body_text > 12_000 {
+                let payload = "{\"error\":{\"message\":\"This model's maximum context \
+                               length is 8000 tokens. However, your messages resulted in \
+                               20000 tokens.\"}}";
+                let _ = c.write_all(
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\n\r\n{payload}",
+                        payload.len()
+                    )
+                    .as_bytes(),
+                );
+                continue;
+            }
+            // Small enough at last: answer.
+            let _ = n_so_far;
+            let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n\
+                        data: [DONE]\n\n";
+            let _ = c.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                     content-length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+
+    let mut model = mock_model(port);
+    // A window small enough that the seed is far over it, and a trigger that
+    // the pre-request check cannot satisfy by summarising (the summariser is
+    // refused too).
+    model.context_window = Some(8_000);
+    let tools: Vec<Box<dyn tools::Tool>> = vec![];
+    let mut opts = test_opts();
+    opts.compact = Some(compact::CompactConfig {
+        trigger_tokens: Some(1_000),
+        keep_recent_tokens: 0,
+    });
+    let mut approval = approval::ApprovalConfig::default();
+
+    // One oversized tool result: the only thing big enough to cut.
+    let big_output = "error line\n".repeat(3_000);
+    let outcome = run_agent(
+        RunRequest {
+            model: &model,
+            tools: &tools,
+            prompt: "go",
+            attachments: vec![],
+            seed: vec![
+                Msg::user("the task"),
+                Msg::tool_result("call_1", "bash", &big_output),
+            ],
+            opts: &opts,
+        },
+        &mut approval,
+        deny_callbacks(),
+    );
+
+    drop(server);
+    let sizes = bodies.lock().unwrap().clone();
+
+    assert!(
+        sizes.len() >= 2,
+        "the run must have retried after the refusal, saw {} request(s): {:?}",
+        sizes.len(),
+        sizes
+    );
+    assert!(
+        sizes[0] > 12_000,
+        "the first request was the oversized one, got {}",
+        sizes[0]
+    );
+    let retried_smaller = sizes.iter().skip(1).any(|s| *s <= 12_000);
+    assert!(
+        retried_smaller,
+        "a retry must carry a body small enough to be accepted, saw: {:?}",
+        sizes
+    );
+    match outcome {
+        Ok(outcome) => assert_eq!(outcome.final_text, "ok", "the retry must answer"),
+        Err(e) => panic!(
+            "the run must survive an overflow it can cut its way out of, got: {e}\n\
+             request sizes were: {:?}",
+            sizes
+        ),
+    }
+}
