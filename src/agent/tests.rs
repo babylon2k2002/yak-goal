@@ -1496,20 +1496,33 @@ fn an_overflow_truncates_and_resends_when_compaction_cannot_help() {
         on_approval: Box::leak(Box::new(|_| ApprovalResponse::Deny)),
     };
 
-    // A big tool result that the run must cut. Its exact size does not matter:
-    // the mock refuses on content, so the body only has to survive to the wire.
+    // A big tool result the run must cut, in a shape the wire accepts: a tool
+    // result with no preceding assistant tool_call is an orphan, and the
+    // serializer drops its content — which is why earlier attempts sent 3.7KB
+    // bodies instead of the 180KB payload they were supposed to carry.
     let big_output = "error line\n".repeat(20_000);
+    let seed = vec![
+        Msg::user("the task"),
+        Msg::Assistant {
+            text: String::new(),
+            tool_calls: vec![crate::providers::ToolCall {
+                id: "call_1".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"cmd": "make"}),
+            }],
+            reasoning: None,
+            reasoning_meta: None,
+        },
+        Msg::tool_result("call_1", "bash", &big_output),
+        Msg::assistant("done"),
+    ];
     let outcome = run_agent(
         RunRequest {
             model: &model,
             tools: &tools,
             prompt: "go",
             attachments: vec![],
-            seed: vec![
-                Msg::user("the task"),
-                Msg::tool_result("call_1", "bash", &big_output),
-                Msg::assistant("done"),
-            ],
+            seed,
             opts: &opts,
         },
         &mut approval,
