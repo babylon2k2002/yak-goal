@@ -1433,6 +1433,7 @@ fn an_overflow_truncates_and_resends_when_compaction_cannot_help() {
                 let _ = c.write_all(
                     format!(
                         "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n\
+                        connection: close\r\n\
                          content-length: {}\r\n\r\n{payload}",
                         payload.len()
                     )
@@ -1449,6 +1450,7 @@ fn an_overflow_truncates_and_resends_when_compaction_cannot_help() {
                 let _ = c.write_all(
                     format!(
                         "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n\
+                        connection: close\r\n\
                          content-length: {}\r\n\r\n{payload}",
                         payload.len()
                     )
@@ -1462,6 +1464,7 @@ fn an_overflow_truncates_and_resends_when_compaction_cannot_help() {
             let _ = c.write_all(
                 format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                    connection: close\r\n\
                      content-length: {}\r\n\r\n{body}",
                     body.len()
                 )
