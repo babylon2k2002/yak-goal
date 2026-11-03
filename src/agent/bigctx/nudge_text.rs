@@ -334,6 +334,7 @@ mod tests {
     use super::*;
     use crate::agent::bigctx::config::default_config;
     use crate::agent::bigctx::recommend::CompressibleRange;
+    use crate::agent::bigctx::sections::SectionOverrides;
     use crate::agent::bigctx::state::create_initial_state;
     use crate::agent::bigctx::types::{BlockGeneration, CompressionBlock};
 
