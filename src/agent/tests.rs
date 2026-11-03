@@ -1412,14 +1412,18 @@ fn an_overflow_truncates_and_resends_when_compaction_cannot_help() {
             };
             let mut c = conn;
             let raw = crate::core::testutil::read_request_bytes(&mut c);
-            let body_text = raw.len();
-            bodies2.lock().unwrap().push(body_text);
+            bodies2.lock().unwrap().push(raw.len());
 
-            // Every request carrying the full bulk is refused as too long. The
-            // summariser call is refused the same way, which is what makes
-            // compaction fail rather than fix things.
-            let _ = body_text;
-            if n_so_far < 3 {
+            // The provider sequence the overflow path needs:
+            //   0: the real request is refused as too long -> enter the path
+            //   1: the summariser call fails for an unrelated reason, so
+            //      compaction cannot help and truncation is the only move
+            //   2+: accepted
+            //
+            // Getting request 1 wrong is what makes this test lie: if the
+            // summariser succeeds, compaction "fixes" the overflow and the
+            // truncation branch is never reached at all.
+            if n_so_far == 0 {
                 let payload = "{\"error\":{\"message\":\"This model's maximum context \
                                length is 8000 tokens. However, your messages resulted in \
                                20000 tokens.\"}}";
@@ -1433,8 +1437,19 @@ fn an_overflow_truncates_and_resends_when_compaction_cannot_help() {
                 );
                 continue;
             }
+            if n_so_far == 1 {
+                let payload = "{\"error\":{\"message\":\"internal server error\"}}";
+                let _ = c.write_all(
+                    format!(
+                        "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\n\r\n{payload}",
+                        payload.len()
+                    )
+                    .as_bytes(),
+                );
+                continue;
+            }
             // Small enough at last: answer.
-            let _ = n_so_far;
             let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n\
                         data: [DONE]\n\n";
             let _ = c.write_all(
