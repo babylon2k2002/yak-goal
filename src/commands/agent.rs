@@ -427,9 +427,6 @@ fn execute_mode(args: &ParsedArgs) -> Result<i32, String> {
         }
         system
     };
-        }
-        system
-    };
 
     // the goal file's key: the thread id when there is one, else the cwd
     let cwd_key = crate::agent::goal::cwd_key(&cwd);
