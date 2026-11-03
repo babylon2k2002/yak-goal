@@ -114,8 +114,7 @@ pub const SECTION_KEYS: &[&str] = &[
     "tier3_guidance",
 ];
 
-const DEFAULT_EFFICIENCY_NOTE: &str =
-    "This is an efficiency nudge to compress early and keep context lean — not an      overflow warning. A separate, stronger alert will appear if the context is      actually full.";
+const DEFAULT_EFFICIENCY_NOTE: &str = "This is an efficiency nudge to compress early and keep context lean — not an overflow warning. A separate, stronger alert will appear if the context is actually full.";
 
 const DEFAULT_EMERGENCY_HEADER: &str =
     "⚠️ Context limit reached — compress now. Prioritize consumed tool outputs.";
