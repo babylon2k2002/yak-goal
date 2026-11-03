@@ -82,6 +82,15 @@ pub struct Report {
     pub tokens_saved: u64,
     /// How many compressions ran.
     pub compression_count: u64,
+    /// Tokens reclaimed by absorption.
+    ///
+    /// Reported separately from `tokens_saved` because the two are not the same
+    /// bargain: a fold leaves behind a block the model can decompress, while an
+    /// absorption leaves only the model's own summary. Summing them would tell
+    /// the model its savings are recoverable when half of them are not.
+    pub absorbed_tokens: u64,
+    /// How many tool results were absorbed.
+    pub absorbed_count: usize,
     /// The model's window, when known.
     pub window: Option<u64>,
     /// What is still foldable.
@@ -100,7 +109,10 @@ impl Report {
 
     /// True when nothing is folded.
     pub fn is_idle(&self) -> bool {
-        self.blocks.is_empty() && self.folded_messages == 0
+        // Absorption counts as activity: a session that has absorbed results
+        // but not yet folded a range has done real work, and reporting "no
+        // compression yet" would hide it.
+        self.blocks.is_empty() && self.folded_messages == 0 && self.absorbed_count == 0
     }
 
     /// True when every problem found is cosmetic.
@@ -151,6 +163,8 @@ pub fn build_report(
         blocks,
         tokens_saved: state.stats.tokens_compressed,
         compression_count: state.stats.compression_count,
+        absorbed_tokens: crate::agent::bigctx::absorb::reclaimed_tokens(state),
+        absorbed_count: state.absorbed.len(),
         window,
         compressible,
         problems: Vec::new(),
@@ -418,7 +432,8 @@ pub fn status_line(report: &Report) -> String {
         return "no compression yet".to_string();
     }
     let mut parts = vec![format!("{} block(s)", report.blocks.len())];
-    parts.push(format!("{} saved", format_tokens(report.tokens_saved)));
+    let saved = report.tokens_saved + report.absorbed_tokens;
+    parts.push(format!("{} saved", format_tokens(saved)));
     if let Some(usage) = report.usage() {
         parts.push(format!("{:.0}% used", usage * 100.0));
     }
@@ -519,6 +534,39 @@ mod tests {
         assert_eq!(report.folded_messages, 1);
         assert_eq!(report.tokens_saved, 9_000);
         assert!(!report.is_idle());
+    }
+
+    #[test]
+    fn an_absorbed_session_is_not_idle_and_reports_separately() {
+        // Absorption reclaims tokens without folding a range. Reporting it as
+        // "no compression yet" would hide work that actually happened, and
+        // summing it into `tokens_saved` would claim the savings are
+        // recoverable when an absorption leaves only the model's summary.
+        let messages = vec![user("t1.0", "hi")];
+        let mut state = create_initial_state();
+        state.absorbed.push(crate::agent::bigctx::AbsorbRecord {
+            tool_call_id: "c1".into(),
+            call_message_id: "t1.1".into(),
+            result_message_id: "t1.2".into(),
+            absorb_call_id: Some("call_x".into()),
+            summary: "s".into(),
+            tokens_reclaimed: 4_000,
+            created_at: 0,
+        });
+        let report = build_report(&messages, &messages, &state, &cfg(100_000));
+        assert_eq!(report.absorbed_tokens, 4_000);
+        assert_eq!(report.absorbed_count, 1);
+        assert!(!report.is_idle(), "an absorption is activity");
+        assert_eq!(
+            report.tokens_saved, 0,
+            "absorbed tokens must not be folded into the compression counter"
+        );
+        let rendered = render_report(&report);
+        assert!(rendered.contains("absorbed"), "got: {rendered}");
+        assert!(
+            rendered.contains("not recoverable"),
+            "the report must say an absorption is not decompressible"
+        );
     }
 
     #[test]

@@ -361,6 +361,12 @@ pub fn append_prompts(
 pub struct ParsedCall {
     pub reference: String,
     pub summary: String,
+    /// The provider's id for *this* call, when the host knows it.
+    ///
+    /// Recorded on the absorption so the distillate can be traced back to the
+    /// call that produced it. Not used for pairing — the hidden pair is the
+    /// absorbed tool's, not this one.
+    pub call_id: Option<String>,
 }
 
 /// Leniently parse an `absorb` argument object.
@@ -491,7 +497,7 @@ pub fn apply(
         tool_call_id,
         call_message_id,
         result_message_id: target.id.clone(),
-        absorb_call_id: None,
+        absorb_call_id: call.call_id.clone(),
         summary: summary.to_string(),
         tokens_reclaimed: tokens,
         created_at: 0,
@@ -525,6 +531,11 @@ pub fn apply(
 }
 
 /// Total tokens reclaimed by absorption, for the status report.
+///
+/// Derived from the records rather than read from
+/// `stats.absorbed_tokens`: the records are the durable truth, and a counter
+/// that can drift from them would make `acp_status` disagree with the
+/// absorption list it reports alongside.
 pub fn reclaimed_tokens(state: &CompressionState) -> u64 {
     state.absorbed.iter().map(|r| r.tokens_reclaimed).sum()
 }
@@ -835,6 +846,7 @@ mod tests {
         ParsedCall {
             reference: reference.into(),
             summary: summary.into(),
+            call_id: None,
         }
     }
 
@@ -1060,6 +1072,65 @@ mod tests {
         assert_eq!(format_token_count(500), "500");
         assert_eq!(format_token_count(5_000), "5.0K");
         assert_eq!(format_token_count(50_000), "50K");
+    }
+
+    #[test]
+    fn the_absorb_call_id_is_recorded() {
+        // Without it the distillate cannot be traced back to the call that
+        // produced it, and the field would sit permanently None.
+        let messages = [
+            user("t1.0", "go"),
+            tool_call("t1.1", "c1", "bash"),
+            tool_result("t1.2", "c1", "bash", &"x".repeat(400)),
+        ];
+        let state = state_for(&messages);
+        let reference = state.message_refs.ref_for("t1.2").unwrap().to_string();
+        let mut parsed = call(&reference, "distilled");
+        parsed.call_id = Some("call_abc123".into());
+        let out = apply(
+            &state,
+            &messages,
+            &enabled(),
+            &Protection::default(),
+            &parsed,
+        );
+        assert!(out.ok, "got: {}", out.text);
+        assert_eq!(
+            out.state.absorbed[0].absorb_call_id.as_deref(),
+            Some("call_abc123")
+        );
+    }
+
+    #[test]
+    fn reclaimed_tokens_sums_the_records() {
+        let mut state = crate::agent::bigctx::create_initial_state();
+        assert_eq!(reclaimed_tokens(&state), 0);
+        for (i, tokens) in [100u64, 250, 50].into_iter().enumerate() {
+            state.absorbed.push(AbsorbRecord {
+                tool_call_id: format!("c{i}"),
+                call_message_id: String::new(),
+                result_message_id: format!("t1.{i}"),
+                absorb_call_id: None,
+                summary: "s".into(),
+                tokens_reclaimed: tokens,
+                created_at: 0,
+            });
+        }
+        assert_eq!(reclaimed_tokens(&state), 400);
+    }
+
+    #[test]
+    fn the_system_prompt_section_explains_the_protocol() {
+        // The forced prompt alone reads as a one-off demand; the section is
+        // what makes the session follow it as a rule.
+        let section = build_system_prompt(ABSORB_TOOL_NAME);
+        assert!(section.contains(ABSORB_TOOL_NAME));
+        assert!(section.contains(ABSORB_PROMPT_MARKER));
+        assert!(section.contains("IMMEDIATE next action"));
+        assert!(
+            section.contains("regular compression system"),
+            "the section must say absorb calls are ordinary context"
+        );
     }
 
     #[test]

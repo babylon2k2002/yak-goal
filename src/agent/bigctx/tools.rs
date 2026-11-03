@@ -706,11 +706,30 @@ impl Tool for AbsorbTool {
         format!("absorb {}", args["ref"].as_str().unwrap_or(""))
     }
     fn execute(&self, args: &Value, _cwd: &Path, _log: &mut dyn FnMut(ToolProgress)) -> ToolOutput {
-        let Some(parsed) = crate::agent::bigctx::absorb::parse_call(args) else {
+        self.run(args, None)
+    }
+
+    /// Absorb overrides `execute_call` because the absorption record stores the
+    /// id of the call that produced the distillate, and only the full call
+    /// carries it.
+    fn execute_call(
+        &self,
+        call: &crate::providers::ToolCall,
+        _cwd: &Path,
+        _log: &mut dyn FnMut(ToolProgress),
+    ) -> ToolOutput {
+        self.run(&call.arguments, Some(call.id.clone()))
+    }
+}
+
+impl AbsorbTool {
+    fn run(&self, args: &Value, call_id: Option<String>) -> ToolOutput {
+        let Some(mut parsed) = crate::agent::bigctx::absorb::parse_call(args) else {
             return ToolOutput::err(
                 "absorb needs both `ref` (the message ref) and `summary` (the distilled text).",
             );
         };
+        parsed.call_id = call_id;
 
         let result = self.handle.with(|session| {
             // The protection set is recomputed here rather than carried on the

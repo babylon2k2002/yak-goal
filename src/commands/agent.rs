@@ -361,23 +361,41 @@ fn execute_mode(args: &ParsedArgs) -> Result<i32, String> {
             let p = crate::theme::err();
             eprintln!("{}warning: {warning}{}", p.dim, p.reset);
         }
-        match crate::agent::bigctx::output_steering::render_steering_block(
+        let mut system = match crate::agent::bigctx::output_steering::render_steering_block(
             steering.verbosity_level,
             crate::agent::bigctx::output_steering::DEFAULT_STEERING_SENTINEL,
         ) {
-            Some(block) if steering.enabled => {
-                Some(
-                    crate::agent::bigctx::output_steering::apply_to_prompt(
-                        system.as_deref().unwrap_or(""),
-                        &block,
-                        crate::agent::bigctx::output_steering::DEFAULT_STEERING_SENTINEL,
-                    )
-                    .updated,
+            Some(block) if steering.enabled => Some(
+                crate::agent::bigctx::output_steering::apply_to_prompt(
+                    system.as_deref().unwrap_or(""),
+                    &block,
+                    crate::agent::bigctx::output_steering::DEFAULT_STEERING_SENTINEL,
                 )
-            }
+                .updated,
+            ),
             // Disabled, or level 0: leave the prompt exactly as built.
             _ => system,
+        };
+
+        // Absorption's protocol section, also fixed once for the session.
+        //
+        // Only the forced prompt on a tool result reaches the model otherwise,
+        // and a demand with no explanation of the protocol behind it reads as a
+        // one-off instruction rather than a rule the session follows. Both are
+        // head bytes, so both are decided here and never recomputed.
+        let absorb_cfg = crate::agent::bigctx::absorb::resolve_config(
+            &crate::agent::bigctx::config_from_json(0, settings.bigctx.as_ref()),
+        );
+        if absorb_cfg.enabled {
+            let section = crate::agent::bigctx::absorb::build_system_prompt(
+                crate::agent::bigctx::absorb::ABSORB_TOOL_NAME,
+            );
+            let base = system.as_deref().unwrap_or("");
+            system = Some(format!("{base}
+
+{section}"));
         }
+        system
     };
 
     // the goal file's key: the thread id when there is one, else the cwd
