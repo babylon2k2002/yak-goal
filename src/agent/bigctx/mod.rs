@@ -92,7 +92,7 @@ pub use report::{Report, build_report, render_report, status_line, tool_share};
 pub use refs::assign_refs;
 pub use search::{block_docs, message_docs, search, tool_name as search_tool_name};
 pub use state::{CompressionStateExt, create_initial_state};
-pub use tools::{BigctxHandle, BigctxSession, bigctx_tools};
+pub use tools::{BigctxHandle, BigctxSession, bigctx_tools, bigctx_tools_with};
 pub use truncate::{TruncateOptions, TruncateResult, truncate_large_outputs};
 pub use types::{
     AbsorbRecord, BlockGeneration, CompressionBlock, CompressionState, CoreMessage, MessageContentType,
