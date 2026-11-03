@@ -545,7 +545,7 @@ mod tests {
                 },
             ],
             measured_folds: 2,
-            unpaid_folds: 1,
+            unpaid_folds: 2,
         }
     }
 
