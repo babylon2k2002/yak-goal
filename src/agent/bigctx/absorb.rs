@@ -395,6 +395,9 @@ pub fn parse_call(args: &serde_json::Value) -> Option<ParsedCall> {
     Some(ParsedCall {
         reference: reference.trim().to_string(),
         summary,
+        // The transport id is not in the arguments; the caller sets it from the
+        // full call. `parse_call` deliberately does not invent one.
+        call_id: None,
     })
 }
 
