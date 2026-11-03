@@ -257,6 +257,24 @@ pub struct AutoFold {
     pub stalled: Option<String>,
 }
 
+/// What one pass of the automatic backstop did.
+///
+/// Three states, not two. The old `(Option<state>, Option<AutoFold>)` pair could
+/// not express "tried and failed": a loop that folded nothing returned
+/// `(None, None)`, so the `stalled` reason was dropped on the floor exactly when
+/// the backstop had failed completely — the one case a user most needs told
+/// about. A partial fold reported, a total failure did not.
+pub enum AutoFoldOutcome {
+    /// The backstop declined for a reason that is not a failure: no pressure,
+    /// no model, or the user turned it off.
+    Declined,
+    /// Folds were applied. `stalled` is set when the loop stopped before the
+    /// pressure was relieved.
+    Folded(AutoFold),
+    /// The loop tried and could not fold anything.
+    Stalled(String),
+}
+
 pub fn maybe_auto_fold(
     history: &[Msg],
     state: &crate::agent::bigctx::CompressionState,
@@ -267,7 +285,7 @@ pub fn maybe_auto_fold(
     nudged_this_round: bool,
 ) -> (
     Option<crate::agent::bigctx::CompressionState>,
-    Option<AutoFold>,
+    AutoFoldOutcome,
 ) {
     // The pressure band and what counts as a real saving come from the same
     // config the nudge uses, so a session that would get a nudge can also be
@@ -284,7 +302,7 @@ pub fn maybe_auto_fold(
     // and the backstop is part of that feature — not a separate one. Folding
     // anyway would spend model calls against an explicit "don't".
     if !config.nudge.enabled {
-        return (None, None);
+        return (None, AutoFoldOutcome::Declined);
     }
     // Below the nudge's floor there is no pressure: the fold would save
     // little and cost a model call plus a cache miss.
@@ -294,7 +312,7 @@ pub fn maybe_auto_fold(
         0.0
     };
     if usage < config.nudge.min_context_limit_pct {
-        return (None, None);
+        return (None, AutoFoldOutcome::Declined);
     }
     // Give the model exactly one round.
     //
@@ -304,11 +322,11 @@ pub fn maybe_auto_fold(
     // counter the loop carries (`bigctx_round`) never advances, so comparing
     // against it would yield on every round and the backstop would never fire.
     if nudged_this_round {
-        return (None, None);
+        return (None, AutoFoldOutcome::Declined);
     }
     // The summary needs the model; without one, nothing to fold with.
     let Some(model) = model else {
-        return (None, None);
+        return (None, AutoFoldOutcome::Declined);
     };
     // Fold until the pressure is relieved, not just once.
     //
@@ -405,7 +423,18 @@ pub fn maybe_auto_fold(
         }
     }
     if folded_total == 0 {
-        return (None, None);
+        // Nothing was folded. If the loop recorded why, that is the whole point
+        // of this arm: a total failure has to reach the caller, not vanish
+        // alongside the fold it was attached to.
+        return (
+            None,
+            match stalled {
+                Some(reason) => AutoFoldOutcome::Stalled(reason),
+                // No reason and nothing folded means there was nothing worth
+                // folding after all — a legitimate decline, not a failure.
+                None => AutoFoldOutcome::Declined,
+            },
+        );
     }
     // The folds are the response the nudge asked for, so that nudge is spent:
     // clear the mark and re-arm from the new size. Without this the session
@@ -433,7 +462,7 @@ pub fn maybe_auto_fold(
         .saturating_add(summary_tokens);
     (
         Some(new_state),
-        Some(AutoFold {
+        AutoFoldOutcome::Folded(AutoFold {
             block: last_block,
             message_count: folded_total,
             event: crate::agent::bigctx::FoldEvent {
@@ -3352,11 +3381,39 @@ fn a_failed_summary_is_reported_rather_than_swallowed() {
         context_window: Some(2_000),
         options: Vec::new(),
     };
-    let (folded, fold) = maybe_auto_fold(&seed, &state, Some(&model), 1, Some(2_000), None, false);
+    let (folded, outcome) =
+        maybe_auto_fold(&seed, &state, Some(&model), 1, Some(2_000), None, false);
     assert!(folded.is_none(), "nothing could be folded");
-    assert!(
-        fold.is_none(),
-        "a loop that folded nothing reports no fold, not an empty one"
+    match outcome {
+        AutoFoldOutcome::Stalled(reason) => {
+            assert!(
+                reason.contains("summary"),
+                "the reason must name what failed: {reason}"
+            );
+        }
+        AutoFoldOutcome::Folded(_) => panic!("nothing was folded"),
+        AutoFoldOutcome::Declined => panic!(
+            "a failed summariser is not a decline — reporting it as one is how              a broken backstop goes unnoticed"
+        ),
+    }
+}
+
+/// A decline must stay distinguishable from a failure.
+///
+/// The whole point of the three-state outcome: "there is no pressure" and "I
+/// tried and could not" reach the user as different things, because only the
+/// second one means the session is heading for a rejected request.
+#[test]
+fn a_decline_is_not_reported_as_a_stall() {
+    let seed = vec![Msg::user("a short question"), Msg::assistant("a short answer")];
+    let state = crate::agent::bigctx::create_initial_state();
+    let (folded, outcome) =
+        maybe_auto_fold(&seed, &state, None, 1, Some(40_000), None, false);
+    assert!(folded.is_none());
+    assert_eq!(
+        matches!(outcome, AutoFoldOutcome::Declined),
+        true,
+        "no pressure must be a decline, not a stall"
     );
 }
 

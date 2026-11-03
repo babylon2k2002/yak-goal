@@ -483,7 +483,10 @@ pub fn run_agent(
                 opts.bigctx_config.as_ref(),
                 nudged_this_round,
             );
-            if let (Some(folded_state), Some(fold)) = (folded_state, folded) {
+            if let (
+                Some(folded_state),
+                crate::agent::session::AutoFoldOutcome::Folded(fold),
+            ) = (folded_state, folded) {
                 // Record the fold before the round is sent, so the ledger has
                 // it in place when the request that pays for it is sampled. The
                 // tool-driven fold (`bigctx/tools.rs`) already did this; the
@@ -531,6 +534,13 @@ pub fn run_agent(
                         reason: reason.to_string(),
                     });
                 }
+            } else if let crate::agent::session::AutoFoldOutcome::Stalled(reason) = folded {
+                // Nothing was folded at all. Previously this case was
+                // indistinguishable from a deliberate decline — the loop broke
+                // on an error and the pair came back empty — so a backstop that
+                // had stopped working reported nothing while the context kept
+                // growing.
+                on_update(AgentUpdate::AutoFoldStalled { reason });
             }
 
             if let Some(text) = nudge {
