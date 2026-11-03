@@ -386,7 +386,28 @@ pub fn build_cache_report(
 }
 
 /// Render the report.
+/// How much of the ledger to render.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheDetail {
+    /// Totals and verdicts — what a decision needs.
+    Summary,
+    /// Also every fold, line by line.
+    Full,
+}
+
+/// Render the ledger, folds and all.
 pub fn render_cache_report(report: &CacheReport) -> String {
+    render_cache_report_at(report, CacheDetail::Full)
+}
+
+/// Render the ledger at the requested detail.
+///
+/// The detail level is decided here rather than by stripping the full output
+/// afterwards. The fold list sits in the middle of the document, so removing it
+/// textually means guessing where it ends from surrounding prose — and a guess
+/// that misses returns the whole report to a caller that asked for the short
+/// one, with nothing to indicate the parameter did nothing.
+pub fn render_cache_report_at(report: &CacheReport, detail: CacheDetail) -> String {
     let t = &report.totals;
     let mut out = String::new();
 
@@ -408,6 +429,17 @@ pub fn render_cache_report(report: &CacheReport) -> String {
 
     if report.folds.is_empty() {
         out.push_str("\nno folds — nothing has been compressed.\n");
+        return out.trim_end().to_string();
+    }
+
+    if detail == CacheDetail::Summary {
+        // Still state the count: a summary that omitted it would read as if
+        // nothing had been folded, contradicting the totals above.
+        out.push_str(&format!(
+            "\nfolds: {} (detail=\"full\" lists each one)\n",
+            report.folds.len()
+        ));
+        append_verdicts(&mut out, report);
         return out.trim_end().to_string();
     }
 
@@ -433,11 +465,22 @@ pub fn render_cache_report(report: &CacheReport) -> String {
         }
     }
 
+    append_verdicts(&mut out, report);
+    out.trim_end().to_string()
+}
+
+/// The warnings both detail levels must carry.
+///
+/// Shared rather than duplicated because they are the actionable part: a
+/// summary that dropped them would be the one view in which a losing session
+/// looks fine.
+fn append_verdicts(out: &mut String, report: &CacheReport) {
     if report.compression_is_losing() {
         out.push_str(&format!(
             "\n⚠ {} of {} folds have not paid back — this session may be cheaper \
              with compression off.\n",
-            report.unpaid_folds, report.measured_folds
+            report.unpaid_folds,
+            report.measured_folds
         ));
     }
 
@@ -445,11 +488,9 @@ pub fn render_cache_report(report: &CacheReport) -> String {
         out.push_str(&format!(
             "\n⚠ the ledger does not balance (residual {}). This is an accounting \
              bug, not a provider quirk.\n",
-            t.residual()
+            report.totals.residual()
         ));
     }
-
-    out.trim_end().to_string()
 }
 
 fn format_tokens(n: u64) -> String {
@@ -467,6 +508,95 @@ pub fn summary_tokens(text: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// A report with folds, so summary and full can differ.
+    fn report_with_folds() -> CacheReport {
+        CacheReport {
+            totals: CacheTotals {
+                requests: 4,
+                input: 10_000,
+                cached: 4_000,
+                new_content: 3_000,
+                output: 500,
+                comp_repay: 2_000,
+                ttl_repay: 1_000,
+            },
+            folds: vec![
+                FoldEconomics {
+                    seq: 1,
+                    saved: 5_000,
+                    summary: 200,
+                    repay: 1_200,
+                    breakeven_turns: Some(1.4),
+                    paid_back: Some(true),
+                    requests_after: 3,
+                },
+                FoldEconomics {
+                    seq: 2,
+                    saved: 3_000,
+                    summary: 150,
+                    repay: 900,
+                    breakeven_turns: Some(2.0),
+                    paid_back: Some(false),
+                    requests_after: 1,
+                },
+            ],
+            measured_folds: 2,
+            unpaid_folds: 1,
+        }
+    }
+
+    #[test]
+    fn the_detail_level_actually_changes_the_output() {
+        // The regression this covers: an earlier version asked for a summary and
+        // stripped the fold list back out of the full render by string search.
+        // The search string never matched, so `detail` did nothing at all and
+        // nothing failed — the parameter was silently inert.
+        let report = report_with_folds();
+        let summary = render_cache_report_at(&report, CacheDetail::Summary);
+        let full = render_cache_report_at(&report, CacheDetail::Full);
+
+        assert_ne!(summary, full, "the detail level must change the output");
+        assert!(
+            !summary.contains("  #1  "),
+            "the summary must not list individual folds: {summary}"
+        );
+        assert!(
+            full.contains("  #1  "),
+            "the full render must list individual folds: {full}"
+        );
+        assert!(
+            summary.contains("folds: 2"),
+            "the summary must still state how many folds there were: {summary}"
+        );
+        assert!(
+            summary.len() < full.len(),
+            "summary must be the shorter of the two"
+        );
+    }
+
+    #[test]
+    fn the_summary_keeps_the_actionable_verdict() {
+        // A summary that dropped the warnings would be the one view where a
+        // losing session looks healthy.
+        let report = report_with_folds();
+        assert!(report.compression_is_losing(), "fixture must be losing");
+        let summary = render_cache_report_at(&report, CacheDetail::Summary);
+        assert!(
+            summary.contains("have not paid back"),
+            "the losing verdict must survive the short view: {summary}"
+        );
+    }
+
+    #[test]
+    fn the_default_entry_point_keeps_the_full_render() {
+        // Callers that never asked for a detail level keep the previous output.
+        let report = report_with_folds();
+        assert_eq!(
+            render_cache_report(&report),
+            render_cache_report_at(&report, CacheDetail::Full)
+        );
+    }
+
     use super::*;
 
     fn sample(input: u64, cached: u64) -> CacheSample {

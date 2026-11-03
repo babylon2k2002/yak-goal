@@ -787,43 +787,29 @@ impl Tool for CacheTool {
             .get("detail")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|d| d == "full");
-        let Some(text) = self.handle.with(|session| {
+        let detail = if full {
+            crate::agent::bigctx::CacheDetail::Full
+        } else {
+            // The default stays compact: the totals and the verdict are what a
+            // decision needs. Every fold listed is a wall of numbers the model
+            // would read and then not act on.
+            crate::agent::bigctx::CacheDetail::Summary
+        };
+        let text = self.handle.with(|session| {
             let Some(ledger) = session.ledger.as_ref() else {
-                return "No cache ledger for this session — it is recorded only when the caller                         asked for cache accounting."
+                return "No cache ledger for this session — it is recorded only when the caller asked for cache accounting."
                     .to_string();
             };
             if ledger.is_empty() {
-                return "No requests recorded yet. The ledger fills as turns complete.".to_string();
+                return "No requests recorded yet. The ledger fills as turns complete."
+                    .to_string();
             }
-            let report = ledger.report();
-            let mut text = crate::agent::bigctx::render_cache_report(&report);
-            if !full {
-                // The default stays compact: the verdict and the totals are what
-                // a decision needs, and every fold listed is a wall of numbers
-                // the model will spend tokens reading and then not use.
-                while text.contains("
-fold ") {
-                    match text.find("
-fold ") {
-                        Some(i) => {
-                            let tail = text[i + 1..].to_string();
-                            let end = tail
-                                .find("
-
-")
-                                .map(|e| i + 1 + e)
-                                .unwrap_or(text.len());
-                            text.replace_range(i..end, "");
-                        }
-                        None => break,
-                    }
-                }
-            }
-            text
-        }) else {
-            return ToolOutput::err(NO_SESSION);
-        };
-        ToolOutput::ok(text)
+            crate::agent::bigctx::render_cache_report_at(&ledger.report(), detail)
+        });
+        match text {
+            Some(text) => ToolOutput::ok(text),
+            None => ToolOutput::err(NO_SESSION),
+        }
     }
 }
 
