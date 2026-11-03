@@ -465,6 +465,7 @@ pub fn apply_prompt_pack(config: &mut crate::agent::bigctx::config::BigctxConfig
         config.prompt_sections = pack.surface.prompt_sections;
         config.nudge_sections = pack.surface.nudge_sections;
         config.adapters = pack.surface.adapters;
+        config.pack_found = true;
     }
     warning
 }

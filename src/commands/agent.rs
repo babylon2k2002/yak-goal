@@ -377,32 +377,23 @@ fn execute_mode(args: &ParsedArgs) -> Result<i32, String> {
             _ => system,
         };
 
-        // Absorption's protocol section, also fixed once for the session.
-        //
-        // Only the forced prompt on a tool result reaches the model otherwise,
-        // and a demand with no explanation of the protocol behind it reads as a
-        // one-off instruction rather than a rule the session follows. Both are
-        // head bytes, so both are decided here and never recomputed.
         // The compression protocol section: what <acp> refs mean, the five
-        // tools, and that summaries are history rather than live instructions.
+        // tools, and that summaries are history rather than live
+        // instructions. It also carries a pack's rule texts, so a pack reaches
+        // the system prompt and not only the nudge.
         //
         // Missing this was the largest gap against the reference kernel. The
         // model saw citation markup on every message and had never been told
-        // what it was, so the natural response — reproduce it — would put the
-        // tags into its own output and then into the next turn's history. The
-        // section also carries a pack's rule texts, so a pack's rules reach the
-        // system prompt and not only the nudge.
+        // what it was, and the natural response to unexplained markup is to
+        // reproduce it — which puts the tags into the next turn's history.
         //
         // Appended once, like steering: these are head bytes.
-        let bigctx_cfg = crate::agent::bigctx::config_from_json_in(
-            0,
-            settings.bigctx.as_ref(),
-            &cwd,
-        );
-        //
-        // A pack's rules when one is configured, the built-ins otherwise. Either
-        // way the protocol section is rendered: a session without a pack still
-        // needs to know what its citation refs mean.
+        let bigctx_cfg =
+            crate::agent::bigctx::config_from_json_in(0, settings.bigctx.as_ref(), &cwd);
+
+        // A pack's rules when one is configured, the built-ins otherwise.
+        // Either way the protocol section renders: a session without a pack
+        // still needs to know what its citation refs mean.
         let prompts = bigctx_cfg
             .prompts
             .clone()
@@ -410,9 +401,21 @@ fn execute_mode(args: &ParsedArgs) -> Result<i32, String> {
         let protocol =
             crate::agent::bigctx::sysprompt::render(&prompts, &bigctx_cfg.prompt_sections);
         let base = system.as_deref().unwrap_or("");
-        system = Some(format!("{base}
+        system = Some(format!("{base}\n\n{protocol}"));
 
-{protocol}"));
+        // A pack name that resolves to nothing falls back to the built-ins,
+        // which is the right behaviour but an invisible one: the session keeps
+        // working and the user never learns their config did not take. Said
+        // here, once, because this is the one place that runs once per session.
+        if bigctx_cfg.prompt_pack.is_some() && !bigctx_cfg.pack_found {
+            let p = crate::theme::err();
+            if let Some(name) = bigctx_cfg.prompt_pack.as_deref() {
+                eprintln!(
+                    "{}warning: prompt pack `{name}` was not found in .yak/packs or ~/.yak/packs — using built-in prompts{}",
+                    p.dim, p.reset
+                );
+            }
+        }
 
         let absorb_cfg = crate::agent::bigctx::absorb::resolve_config(&bigctx_cfg);
         if absorb_cfg.enabled {
@@ -420,9 +423,10 @@ fn execute_mode(args: &ParsedArgs) -> Result<i32, String> {
                 crate::agent::bigctx::absorb::ABSORB_TOOL_NAME,
             );
             let base = system.as_deref().unwrap_or("");
-            system = Some(format!("{base}
-
-{section}"));
+            system = Some(format!("{base}\n\n{section}"));
+        }
+        system
+    };
         }
         system
     };

@@ -138,6 +138,14 @@ pub struct BigctxConfig {
     /// resolved a pack, and every renderer falls back to the built-ins.
     #[serde(skip)]
     pub prompts: Option<crate::agent::bigctx::rules::Prompts>,
+    /// Whether the named pack was actually found.
+    ///
+    /// Distinct from `prompts.is_some()`, which is true after a fallback too:
+    /// the fallback installs the built-in set so rendering has something to
+    /// use, and without this flag a typo in the pack name would be
+    /// indistinguishable from a pack that loaded.
+    #[serde(skip)]
+    pub pack_found: bool,
     /// System-prompt section overrides from the pack.
     #[serde(skip)]
     pub prompt_sections: crate::agent::bigctx::sections::SectionOverrides,
@@ -373,6 +381,7 @@ pub fn default_config(model_context_limit: u64) -> BigctxConfig {
         absorb: None,
         prompt_pack: None,
         prompts: None,
+        pack_found: false,
         prompt_sections: Default::default(),
         nudge_sections: Default::default(),
         adapters: None,
