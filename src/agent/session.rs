@@ -1049,8 +1049,8 @@ impl Session {
                     view.borrow_mut().resume_wait();
                 }
                 AgentUpdate::TruncatedForOverflow { .. } => {
-                    // Same: the retry is about to be sent, and the line must
-                    // not be swallowed by the next progress update.
+                    // The retry is about to be sent; settle the line so the
+                    // warning is not swallowed by the next progress update.
                     view.borrow_mut().pause();
                     view.borrow_mut().resume_wait();
                 }
