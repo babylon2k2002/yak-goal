@@ -348,6 +348,18 @@ pub fn maybe_auto_fold(
     loop {
         let ranges = crate::agent::bigctx::screen(&projection.messages, &new_state, &config);
         let Some(best) = ranges.compressible.iter().max_by_key(|r| r.tokens) else {
+            // Over the threshold with nothing foldable left is the backstop
+            // failing, not declining: the session is heading for a rejected
+            // request and no amount of waiting will change that. Reported only
+            // when the loop has already folded nothing — once something was
+            // folded the pressure may simply be gone, and the post-loop check
+            // decides that.
+            if folded_total == 0 {
+                stalled = Some(
+                    "no compressible range is left — everything over the threshold is                      protected or too small to fold"
+                        .to_string(),
+                );
+            }
             break;
         };
         let resolved = match crate::agent::bigctx::resolve_boundaries(
@@ -3384,17 +3396,56 @@ fn a_failed_summary_is_reported_rather_than_swallowed() {
     let (folded, outcome) =
         maybe_auto_fold(&seed, &state, Some(&model), 1, Some(2_000), None, false);
     assert!(folded.is_none(), "nothing could be folded");
+    // Whether the loop stopped because no range was foldable or because the
+    // summariser failed, it must NOT be reported as a decline: both mean the
+    // session stays over its window with no help coming.
     match outcome {
-        AutoFoldOutcome::Stalled(reason) => {
-            assert!(
-                reason.contains("summary"),
-                "the reason must name what failed: {reason}"
-            );
-        }
+        AutoFoldOutcome::Stalled(reason) => assert!(
+            reason.contains("summary") || reason.contains("compressible range"),
+            "the reason must name what failed: {reason}"
+        ),
         AutoFoldOutcome::Folded(_) => panic!("nothing was folded"),
         AutoFoldOutcome::Declined => panic!(
-            "a failed summariser is not a decline — reporting it as one is how              a broken backstop goes unnoticed"
+            "a backstop that could not act is not a decline — reporting it as one              is how a broken backstop goes unnoticed"
         ),
+    }
+}
+
+/// Over the threshold with nothing foldable is a stall, not a decline.
+///
+/// This is a real end state: everything still visible is either protected (the
+/// recent window) or too small to be worth a summary. The loop has no move
+/// left, and the session keeps growing — exactly what the user must be told.
+#[test]
+fn nothing_foldable_over_the_threshold_is_a_stall() {
+    // A single huge user message: over any small window, but the recent-window
+    // protection covers it, so there is no range to fold.
+    let seed = vec![
+        Msg::user("x".repeat(20_000)),
+        Msg::assistant("ack"),
+    ];
+    let state = crate::agent::bigctx::create_initial_state();
+    let model = crate::providers::ResolvedModel {
+        provider_name: "test".to_string(),
+        kind: "openai".to_string(),
+        base_url: "http://127.0.0.1:1".to_string(),
+        api_key: None,
+        model_id: "test-model".to_string(),
+        context_window: Some(2_000),
+        options: Vec::new(),
+    };
+    let (folded, outcome) =
+        maybe_auto_fold(&seed, &state, Some(&model), 1, Some(2_000), None, false);
+    assert!(folded.is_none());
+    match outcome {
+        AutoFoldOutcome::Stalled(reason) => assert!(
+            reason.contains("compressible range"),
+            "expected the no-range reason, got: {reason}"
+        ),
+        AutoFoldOutcome::Declined => panic!(
+            "a session over its window with nothing to fold is stalled, not declined"
+        ),
+        AutoFoldOutcome::Folded(_) => panic!("nothing was folded"),
     }
 }
 
