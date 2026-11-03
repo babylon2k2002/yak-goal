@@ -906,22 +906,31 @@ mod tests {
         // re-wraps a long JSON chunk does exactly this, and handling each line
         // on its own turned every such event into an unparsable-data warning.
         let mut frame = SseFrame::default();
-        let mut got: Vec<(String, String)> = Vec::new();
+        // interior mutability so the test can read the buffer while the
+        // closure that fills it is still in scope (a plain `Vec` capture
+        // holds a mutable borrow across the assertions)
+        let got = std::cell::RefCell::new(Vec::<(String, String)>::new());
         let mut feed = |ev: &str, data: &str| -> bool {
-            got.push((ev.to_string(), data.to_string()));
+            got.borrow_mut().push((ev.to_string(), data.to_string()));
             false
         };
         assert!(!frame.line("event: message", &mut feed));
         assert!(!frame.line("data: {\"a\":1,", &mut feed));
         assert!(!frame.line("data: \"b\":2}", &mut feed));
-        assert!(got.is_empty(), "nothing is delivered before the blank line");
+        assert!(
+            got.borrow().is_empty(),
+            "nothing is delivered before the blank line"
+        );
         assert!(!frame.line("", &mut feed));
-        assert_eq!(got, vec![("message".to_string(), "{\"a\":1,\n\"b\":2}".to_string())]);
+        assert_eq!(
+            *got.borrow(),
+            vec![("message".to_string(), "{\"a\":1,\n\"b\":2}".to_string())]
+        );
         // the frame resets, so the next event carries only its own data
         assert!(!frame.line("data: next", &mut feed));
         assert!(!frame.line("", &mut feed));
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[1], ("".to_string(), "next".to_string()));
+        assert_eq!(got.borrow().len(), 2);
+        assert_eq!(got.borrow()[1], ("".to_string(), "next".to_string()));
     }
 
     #[test]
