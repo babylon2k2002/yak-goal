@@ -114,6 +114,21 @@ fn tool_prompts() -> BTreeMap<String, ToolPromptOverride> {
             ..Default::default()
         },
     );
+    // The fifth tool. It was missing here while the default prompt still named
+    // it, so the lean pack kept one full-length description and the saving was
+    // smaller than the pack claims — with nothing to indicate it. The test
+    // above reads the tool list out of the default prompt precisely so a sixth
+    // tool cannot be added without this being noticed.
+    out.insert(
+        "absorb".to_string(),
+        ToolPromptOverride {
+            description: Some(
+                "Distil one large tool result now so its original stops being re-sent."
+                    .to_string(),
+            ),
+            ..Default::default()
+        },
+    );
     out
 }
 
@@ -143,5 +158,129 @@ pub fn pack() -> Pack {
             adapters: None,
         },
         source: "builtin:lean".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every tool the default system prompt tells the model about must have a
+    /// lean description, or the lean pack silently leaves one tool verbose.
+    ///
+    /// The pack's whole claim is "same machinery, less prose". A tool missing
+    /// from `tool_prompts` keeps its full description, so the token saving is
+    /// smaller than advertised and — worse — nothing says so. `absorb` was
+    /// missing in exactly this way.
+    ///
+    /// The names are written out here, and each one is then checked against the
+    /// rendered prompt: a hard-coded list that nobody cross-checks drifts in
+    /// both directions — a tool the builder stopped naming, or one it started
+    /// naming and this test never heard about.
+    #[test]
+    fn every_tool_the_default_prompt_lists_has_a_lean_description() {
+        let prompts = crate::agent::bigctx::rules::default_prompts();
+        let pack = pack();
+        let listed = [
+            "compress",
+            "decompress",
+            "search_context",
+            "acp_status",
+            "absorb",
+        ];
+        // The tools live in the rendered TOOLS section, not in the rule text,
+        // so read them from what the model actually receives. A test that
+        // hard-coded the list could not notice a tool the builder stopped
+        // naming, or one it started naming.
+        let rendered = crate::agent::bigctx::sysprompt::render(
+            &prompts,
+            &SectionOverrides::default(),
+        );
+        for tool in listed {
+            assert!(
+                rendered.contains(&format!("`{tool}`")),
+                "`{tool}` is not named by the default prompt — the list in this \
+                 test has drifted from the prompt it is meant to track"
+            );
+            assert!(
+                pack.surface.tool_prompts.contains_key(tool),
+                "`{tool}` has no lean description, so the lean pack leaves it \
+                 verbose while claiming to be lean"
+            );
+        }
+    }
+
+    /// The condensed contract must keep every load-bearing class from the full
+    /// one. Length alone is not equivalence: a shorter text that dropped the
+    /// DROP rules would pass a `len()` comparison and lose real guidance.
+    #[test]
+    fn the_condensed_contract_keeps_every_rule_class() {
+        let full = crate::agent::bigctx::rules::default_prompts()
+            .how_to_compress_rules
+            .to_string();
+        let lean = LEAN_HOW_TO_COMPRESS;
+
+        assert!(
+            lean.len() < full.len(),
+            "the lean contract must actually be shorter: {} vs {}",
+            lean.len(),
+            full.len()
+        );
+
+        // The headings are the rule classes. Each one the full text carries
+        // must survive, whatever the wording inside.
+        for heading in ["KEEP VERBATIM", "DROP", "PRIORITY"] {
+            assert!(
+                full.contains(heading),
+                "the default contract should carry {heading}; the assertion below \
+                 would be vacuous without it"
+            );
+            assert!(
+                lean.contains(heading),
+                "the lean contract dropped the {heading} class"
+            );
+        }
+
+        // The integrity rule is the one added after a real failure — a summary
+        // that invented a user turn. Losing it trades correctness for tokens.
+        assert!(
+            lean.contains("INTEGRITY"),
+            "the integrity rule must survive: a summary is the only record of \
+             what it replaces"
+        );
+        assert!(
+            lean.contains("PENDING"),
+            "an unsent answer must still be marked PENDING"
+        );
+
+        // The mechanics a summary is worthless without.
+        for mechanic in ["m00132", "TASK AS OF THIS BLOCK", "Open objectives"] {
+            assert!(
+                lean.contains(mechanic),
+                "the lean contract lost `{mechanic}`, which the summary format \
+                 depends on"
+            );
+        }
+    }
+
+    /// The pack is expressed purely as overrides: no second renderer, no
+    /// duplicated rule engine. If it ever grows a field the pack surface cannot
+    /// carry, it has stopped testing the same path a user's pack takes.
+    #[test]
+    fn the_lean_pack_is_only_overrides() {
+        let pack = pack();
+        assert_eq!(pack.source, "builtin:lean");
+        assert!(
+            pack.surface.prompts.how_to_compress_rules.is_some(),
+            "it must override the rule text"
+        );
+        assert!(
+            !pack.surface.tool_prompts.is_empty(),
+            "it must override tool descriptions"
+        );
+        assert!(
+            pack.surface.prompt_sections.names("philosophy"),
+            "it drops the philosophy section, which is its largest saving"
+        );
     }
 }

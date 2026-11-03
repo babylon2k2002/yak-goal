@@ -107,11 +107,25 @@ fn decision_pressure(decision: &NudgeDecision) -> f64 {
 }
 
 /// The nudge sections a pack may override, in render order.
+///
+/// This list gates `SectionOverrides::from_json`: a key it does not name is
+/// dropped, silently, before any renderer sees it. So it must name every key
+/// [`render`] and [`render_distillation`] actually pass to
+/// `nudge_sections.render` — `philosophy` was missing here while the gentle
+/// and emergency voices both render it, which made a pack's
+/// `{"nudge_sections":{"philosophy":null}}` parse cleanly, resolve, store, and
+/// then do nothing. That is the worst shape a config bug takes: no error, no
+/// warning, and a pack author left believing their edit was overridden by
+/// something else.
+///
+/// `a_pack_can_override_every_rendered_nudge_section` holds this list to the
+/// renderer.
 pub const SECTION_KEYS: &[&str] = &[
     "efficiency_note",
     "emergency_header",
     "tier2_guidance",
     "tier3_guidance",
+    "philosophy",
 ];
 
 const DEFAULT_EFFICIENCY_NOTE: &str = "This is an efficiency nudge to compress early and keep context lean — not an overflow warning. A separate, stronger alert will appear if the context is actually full.";
@@ -600,4 +614,109 @@ mod tests {
             "the assembly can leave gaps; they must be collapsed"
         );
     }
+
+    /// Every key a renderer passes to `nudge_sections.render` must appear in
+    /// [`SECTION_KEYS`], or `from_json` drops a pack's override before it is
+    /// ever read.
+    ///
+    /// This is a guard against the shape of bug that hid here: `philosophy`
+    /// was rendered by both voices and named by neither the list nor any test,
+    /// so `{"nudge_sections":{"philosophy":null}}` resolved, parsed, stored and
+    /// did nothing. A config that silently has no effect is worse than one that
+    /// fails, because the pack author looks everywhere except the allow-list.
+    #[test]
+    fn every_rendered_section_is_overridable() {
+        // The keys the two renderers name, spelled out rather than derived:
+        // there is no registry to read, and a test that listed only what the
+        // renderer currently passes could not notice a key the renderer forgot.
+        for key in [
+            "efficiency_note",
+            "emergency_header",
+            "tier2_guidance",
+            "tier3_guidance",
+            "philosophy",
+        ] {
+            assert!(
+                SECTION_KEYS.contains(&key),
+                "`{key}` is rendered but not in SECTION_KEYS, so a pack cannot \
+                 override it: from_json would drop it silently"
+            );
+        }
+    }
+
+    /// The removal case end to end: a pack's `null` must reach the text.
+    ///
+    /// `every_rendered_section_is_overridable` proves the key is allowed; this
+    /// proves the allow-list entry actually changes what the model reads rather
+    /// than being merely present.
+    #[test]
+    fn a_pack_can_drop_the_philosophy_section_from_the_nudge() {
+        let config = cfg(100_000);
+        // `render_nudge` falls back to the built-ins when the config carries no
+        // prompt set, which is the case for `default_config`. Read the same
+        // text it will read.
+        let philosophy = crate::agent::bigctx::rules::default_prompts()
+            .compress_philosophy
+            .to_string();
+        assert!(
+            !philosophy.trim().is_empty(),
+            "the sentinel below is meaningless if the default is empty"
+        );
+
+        // Unoverridden: the philosophy is in the text.
+        let plain = render_nudge(
+            &decision(true, 0.70, Some(Tier::One)),
+            &ranges(),
+            &create_initial_state(),
+            &config,
+        )
+        .unwrap();
+        assert!(
+            plain.text.contains(philosophy.trim()),
+            "the philosophy should render by default, or the removal below proves nothing"
+        );
+
+        // Removed: it is gone, and the rest of the nudge survives.
+        let mut removed = cfg(100_000);
+        removed.nudge_sections = SectionOverrides::from_json(
+            Some(&serde_json::json!({"philosophy": null})),
+            SECTION_KEYS,
+        );
+        assert!(removed.nudge_sections.names("philosophy"), "the null must be accepted");
+        let text = render_nudge(
+            &decision(true, 0.70, Some(Tier::One)),
+            &ranges(),
+            &create_initial_state(),
+            &removed,
+        )
+        .unwrap();
+        assert!(
+            !text.text.contains(philosophy.trim()),
+            "a null section must remove the text, not merely fail to replace it"
+        );
+        assert!(
+            text.text.contains("Context:"),
+            "only the named section goes; the rest of the nudge stays"
+        );
+    }
+
+    /// A replaced section is the other tri-state: a string wins over the
+    /// default without the default leaking through.
+    #[test]
+    fn a_pack_can_replace_the_philosophy_section() {
+        let mut config = cfg(100_000);
+        config.nudge_sections = SectionOverrides::from_json(
+            Some(&serde_json::json!({"philosophy": "PACK_PHILOSOPHY_SENTINEL"})),
+            SECTION_KEYS,
+        );
+        let text = render_nudge(
+            &decision(true, 0.70, Some(Tier::One)),
+            &ranges(),
+            &create_initial_state(),
+            &config,
+        )
+        .unwrap();
+        assert!(text.text.contains("PACK_PHILOSOPHY_SENTINEL"));
+    }
+
 }
