@@ -1461,7 +1461,7 @@ fn an_overflow_truncates_and_resends_when_compaction_cannot_help() {
     let mut approval = approval::ApprovalConfig::default();
 
     // One oversized tool result: the only thing big enough to cut.
-    let big_output = "error line\n".repeat(3_000);
+    let big_output = "error line\n".repeat(20_000);
     let outcome = run_agent(
         RunRequest {
             model: &model,
@@ -1471,6 +1471,7 @@ fn an_overflow_truncates_and_resends_when_compaction_cannot_help() {
             seed: vec![
                 Msg::user("the task"),
                 Msg::tool_result("call_1", "bash", &big_output),
+                Msg::assistant("done"),
             ],
             opts: &opts,
         },
