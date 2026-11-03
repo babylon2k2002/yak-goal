@@ -1283,113 +1283,42 @@ impl Session {
                 view.borrow_mut().pause();
                 let p = crate::theme::err();
                 eprintln!(
-                    "{}! context fold stalled: {reason} — the context stays over the threshold and the next request may be rejected{}",
-                    p.red, p.reset
-                );
-            }
-            AgentUpdate::TruncatedForOverflow { results, saved_tokens } => {
-                view.borrow_mut().pause();
-                let p = crate::theme::err();
-                eprintln!(
-                    "{}! cut {results} tool result(s), {saved_tokens} tokens freed — summarising failed, so detail was dropped that cannot be restored{}",
+                    "{}! context fold stalled: {reason} — the context stays over the                      threshold and the next request may be rejected{}",
                     p.red, p.reset
                 );
             }
             _ => {}
         };
-        // --approval allow answers the ask-list prompt instead of failing
-        // closed: a subagent child runs with stdin closed, and a hard deny
-        // would just send the model looking for unlisted ways to do the same
-        // thing. The hardcoded refusals never consult an approval prompt at
-        // all, so they still deny under this flag.
-        let unattended_allow = self.unattended_allow;
-        let mut on_approval = |req: ApprovalRequest| {
-            if unattended_allow {
-                emit_event(&serde_json::json!({
-                    "type": "approval",
-                    "tool": req.tool,
-                    "preview": req.preview,
-                    "pattern": req.pattern,
-                    "answer": "allow",
-                }));
-                return ApprovalResponse::Allow;
-            }
-            approval::prompt_approval(&req)
-        };
-        // no KeyWatcher here: stdin belongs to the caller (usually a pipe),
-        // and ctrl-c kills this process like any other child
-        let result = run_agent(
-            RunRequest {
-                model,
-                tools: &self.tools,
-                prompt,
-                attachments,
-                seed: std::mem::take(&mut view_seed),
-                opts: &opts,
-            },
-            &mut self.approval,
-            RunCallbacks {
-                on_update: &mut on_update,
-                on_approval: &mut on_approval,
-            },
+        let result = crate::agent::compact_manual(
+            model,
+            &mut self.seed,
+            &self.compact,
+            focus,
+            &opts,
+            &mut on_update,
         );
+        view.borrow_mut().abort();
         crate::core::http::clear_interrupt();
-        // see the interactive path: the handle holds whatever the tools wrote
-        self.bigctx = self.bigctx_handle.with(|s| s.state.clone()).or(bigctx_state);
-        self.bigctx_handle.clear();
-        self.usage.add(total);
-        self.last_usage = last_usage;
-        match result {
-            Ok(mut outcome) => {
-                emit_event(&serde_json::json!({
-                    "type": "result",
-                    "text": &outcome.final_text,
-                    "usage": usage_json(outcome.usage.as_ref()),
-                    "interrupted": outcome.interrupted,
-                }));
-                // the history moves into the seed (no clone of the whole
-                // conversation per task); every round is already on disk
-                let history = std::mem::take(&mut outcome.history);
-                self.seed = history;
-                Ok((outcome, reasoning))
-            }
-            // a failed round still saw real work: the stream reports it and
-            // the round in flight persists, exactly as in the terminal path
-            Err(failure) => {
-                emit_event(&serde_json::json!({
-                    "type": "error",
-                    "message": &failure.message,
-                    "text": &failure.final_text,
-                }));
-                persist_round(
-                    self.store.as_ref(),
-                    &mut self.conversation_id,
-                    &mut self.branch_parent,
-                    &mut self.persist_error,
-                    &TaskIdentity {
-                        model,
-                        cwd: &self.cwd,
-                        system: self.system.as_deref(),
-                    },
-                    &failure.history[failure.round_start.min(failure.history.len())..],
-                    // the failed round's own bill: the tokens it spent before
-                    // breaking are real, and dropping them made the footer
-                    // understate every recovered or failed round
-                    failure.usage,
-                    &round_reasoning,
-                    round_started,
-                );
-                // the round never reached `TurnEnd`, so the session totals
-                // never saw it: charge it here or the running total drifts
-                // low by one round per failure
-                if let Some(usage) = failure.usage {
-                    self.usage.add(usage);
-                    self.last_usage = Some(usage);
-                }
-                self.seed = failure.history;
-                Err(failure.message)
-            }
-        }
+        result.map(|removed| {
+            // the folded conversation is one round: the summary message plus
+            // the kept tail, exactly the slice a resume rebuilds from
+            persist_round(
+                self.store.as_ref(),
+                &mut self.conversation_id,
+                &mut self.branch_parent,
+                &mut self.persist_error,
+                &identity,
+                &self.seed,
+                None,
+                "",
+                started,
+            );
+            let p = crate::theme::err();
+            eprintln!(
+                "{}compacted — {} messages folded into a summary{}",
+                p.dim, removed, p.reset
+            );
+        })
     }
 
 
