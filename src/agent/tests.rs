@@ -1501,9 +1501,9 @@ fn an_overflow_truncates_and_resends_when_compaction_cannot_help() {
     match outcome {
         Ok(outcome) => assert_eq!(outcome.final_text, "ok", "the retry must answer"),
         Err(e) => panic!(
-            "the run must survive an overflow it can cut its way out of, got: {e}\n\
+            "the run must survive an overflow it can cut its way out of, got: {}\n\
              request sizes were: {:?}",
-            sizes
+            e.message, sizes
         ),
     }
 }
