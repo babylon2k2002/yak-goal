@@ -1393,7 +1393,6 @@ impl Session {
             }
         }
     }
-}
 
 
     /// `--json`: the same task, with a line-delimited JSON event stream as
@@ -1587,6 +1586,7 @@ impl Session {
             }
         }
     }
+}
 
 /// The per-task facts every round line carries.
 struct TaskIdentity<'a> {
