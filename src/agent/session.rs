@@ -1584,6 +1584,7 @@ impl Session {
             }
         }
     }
+}
 
 /// The per-task facts every round line carries.
 struct TaskIdentity<'a> {
