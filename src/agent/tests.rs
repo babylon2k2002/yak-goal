@@ -1471,13 +1471,17 @@ fn an_overflow_truncates_and_resends_when_compaction_cannot_help() {
     model.context_window = Some(8_000);
     let tools: Vec<Box<dyn tools::Tool>> = vec![];
     let mut opts = test_opts();
-    // A trigger far above the window: the pre-request compaction pass must stay
-    // out of the way. With a low trigger it summarised the oversized result
-    // before the first request even left, so by the time the provider refused
-    // there was nothing left to cut and the branch under test never ran — the
-    // request log showed six identical 3.7KB bodies.
+    // Auto-compaction off (0 is "off", and any larger number is clamped to the
+    // window ceiling, so it cannot be used to mean "very late"). With it on,
+    // the pre-request pass summarised the oversized result before the first
+    // request left, and the truncation branch had nothing to cut — the log
+    // showed six identical 3.8KB bodies.
+    //
+    // The provider's refusal still triggers the overflow path, which is the
+    // path under test: it runs `force_compact` itself, and when that fails it
+    // truncates.
     opts.compact = Some(compact::CompactConfig {
-        trigger_tokens: Some(u64::MAX),
+        trigger_tokens: Some(0),
         keep_recent_tokens: 0,
     });
     let mut approval = approval::ApprovalConfig::default();
