@@ -428,11 +428,27 @@ pub fn default_resolver(cwd: &Path) -> Resolver {
 /// typo in a config file should cost a warning, not a session that cannot
 /// compress.
 pub fn resolve_prompts(resolver: &Resolver, name: Option<&str>) -> (Prompts, Option<String>) {
+    resolve_prompts_in(resolver, name, None)
+}
+
+/// As [`resolve_prompts`], reusing a resolved pack when `cwd` is given.
+///
+/// The directory is only used as a cache key; a caller without one still gets a
+/// correct answer, just at filesystem cost each time.
+pub fn resolve_prompts_in(
+    resolver: &Resolver,
+    name: Option<&str>,
+    cwd: Option<&Path>,
+) -> (Prompts, Option<String>) {
     let base = crate::agent::bigctx::rules::default_prompts();
     let Some(name) = name.filter(|n| !n.trim().is_empty()) else {
         return (base, None);
     };
-    match resolver.resolve(name.trim()) {
+    let resolved = match cwd {
+        Some(dir) => resolve_cached(resolver, name.trim(), dir),
+        None => resolver.resolve(name.trim()),
+    };
+    match resolved {
         Some(pack) => (pack.surface.prompts.apply_to(&base), None),
         None => (
             base,
@@ -460,6 +476,49 @@ fn finish_prompts(
     }
 }
 
+/// A resolved pack surface, cached per (pack name, pack directory).
+///
+/// Resolution reads the filesystem: `current_dir()`, one `read_dir` per source,
+/// and one `read_to_string` per hit. That is cheap once and wasteful per round,
+/// and `config_from_json` runs four times in a round on the auto-fold path
+/// alone. A pack file does not change mid-session — and if it did, honouring it
+/// would move the prompt head and cost a full cache miss, which is exactly what
+/// the caller's byte-identical-prompt discipline exists to avoid.
+///
+/// Keyed by directory as well as name so a session that changes project does not
+/// inherit the previous project's pack.
+fn pack_cache()
+-> &'static std::sync::Mutex<std::collections::BTreeMap<(String, String), Pack>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<(String, String), Pack>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+/// Resolve `name` through `resolver`, reusing a previous result when the same
+/// name was resolved against the same project directory.
+fn resolve_cached(resolver: &Resolver, name: &str, cwd: &Path) -> Option<Pack> {
+    let key = (cwd.display().to_string(), name.to_string());
+    if let Ok(cache) = pack_cache().lock()
+        && let Some(pack) = cache.get(&key)
+    {
+        return Some(pack.clone());
+    }
+    let pack = resolver.resolve(name)?;
+    if let Ok(mut cache) = pack_cache().lock() {
+        cache.insert(key, pack.clone());
+    }
+    Some(pack)
+}
+
+/// Drop the cache. Exists for tests that write a pack file after a previous
+/// resolution of the same name, and for a host that reloads config on SIGHUP.
+pub fn clear_pack_cache() {
+    if let Ok(mut cache) = pack_cache().lock() {
+        cache.clear();
+    }
+}
+
 /// Fill in `config.prompts` from `config.prompt_pack`.
 ///
 /// Called once, where a config is built with filesystem access. Returns any
@@ -478,12 +537,12 @@ pub fn apply_prompt_pack(config: &mut crate::agent::bigctx::config::BigctxConfig
         return None;
     };
     let resolver = default_resolver(cwd);
-    let (prompts, warning) = resolve_prompts(&resolver, Some(&name));
-    config.prompts = Some(finish_prompts(prompts, config.language_preservation));
+    let (base, warning) = resolve_prompts_in(&resolver, Some(&name), Some(cwd));
+    config.prompts = Some(finish_prompts(base, config.language_preservation));
     // The tool descriptions travel with the rule texts: a pack that sets one
     // and not the other would be applied halfway, which reads as a broken file
     // rather than a partial override.
-    if let Some(pack) = resolver.resolve(&name) {
+    if let Some(pack) = resolve_cached(&resolver, &name, cwd) {
         config.tool_prompts = pack.surface.tool_prompts;
         config.prompt_sections = pack.surface.prompt_sections;
         config.nudge_sections = pack.surface.nudge_sections;
@@ -1003,6 +1062,90 @@ mod tests {
         for bad in [json!("text"), json!([1, 2]), json!(3)] {
             assert!(sanitize(Some(&json!({"adapters": bad}))).adapters.is_none());
         }
+    }
+
+    #[test]
+    fn a_resolved_pack_is_reused_instead_of_re_read() {
+        // config_from_json runs several times per round on the auto-fold path
+        // alone; reading the pack file each time is pure waste, and worst in the
+        // long sessions this feature exists for.
+        let cwd = temp_cwd("cache-hit");
+        let path = cwd.join(".yak").join("packs").join("team.json");
+        std::fs::write(&path, r#"{"prompts":{"how_to_compress_rules":"FIRST"}}"#).unwrap();
+
+        let resolver = default_resolver(&cwd);
+        let first = resolve_cached(&resolver, "team", &cwd).expect("resolves");
+        assert_eq!(
+            first.surface.prompts.how_to_compress_rules.as_deref(),
+            Some("FIRST")
+        );
+
+        // Rewrite the file underneath. A cached lookup must keep serving the
+        // first answer: the prompt head is the provider's cached prefix, so
+        // picking up a mid-session edit would cost a full cache miss.
+        std::fs::write(&path, r#"{"prompts":{"how_to_compress_rules":"SECOND"}}"#).unwrap();
+        let second = resolve_cached(&resolver, "team", &cwd).expect("resolves from cache");
+        assert_eq!(
+            second.surface.prompts.how_to_compress_rules.as_deref(),
+            Some("FIRST"),
+            "the cached pack must not be re-read"
+        );
+
+        clear_pack_cache();
+        let third = resolve_cached(&resolver, "team", &cwd).expect("resolves after clear");
+        assert_eq!(
+            third.surface.prompts.how_to_compress_rules.as_deref(),
+            Some("SECOND"),
+            "clearing the cache must pick up the new file"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn the_cache_is_keyed_by_directory() {
+        // A session that changes project must not inherit the old project's
+        // pack just because the name matches.
+        let a = temp_cwd("cache-a");
+        let b = temp_cwd("cache-b");
+        for (dir, rule) in [(&a, "PROJECT_A"), (&b, "PROJECT_B")] {
+            std::fs::write(
+                dir.join(".yak").join("packs").join("team.json"),
+                format!(r#"{{"prompts":{{"how_to_compress_rules":"{rule}"}}}}"#),
+            )
+            .unwrap();
+        }
+        let pack_a = resolve_cached(&default_resolver(&a), "team", &a).unwrap();
+        let pack_b = resolve_cached(&default_resolver(&b), "team", &b).unwrap();
+        assert_eq!(
+            pack_a.surface.prompts.how_to_compress_rules.as_deref(),
+            Some("PROJECT_A")
+        );
+        assert_eq!(
+            pack_b.surface.prompts.how_to_compress_rules.as_deref(),
+            Some("PROJECT_B")
+        );
+        std::fs::remove_dir_all(&a).ok();
+        std::fs::remove_dir_all(&b).ok();
+    }
+
+    #[test]
+    fn a_missing_pack_is_not_cached_as_found() {
+        // A miss must stay a miss so a pack created later in the run is picked
+        // up; caching the absence would require a restart to see a new file.
+        let cwd = temp_cwd("cache-miss");
+        let resolver = default_resolver(&cwd);
+        assert!(resolve_cached(&resolver, "team", &cwd).is_none());
+        std::fs::write(
+            cwd.join(".yak").join("packs").join("team.json"),
+            r#"{"prompts":{"how_to_compress_rules":"LATER"}}"#,
+        )
+        .unwrap();
+        let after = resolve_cached(&resolver, "team", &cwd).expect("now it exists");
+        assert_eq!(
+            after.surface.prompts.how_to_compress_rules.as_deref(),
+            Some("LATER")
+        );
+        std::fs::remove_dir_all(&cwd).ok();
     }
 
     #[test]

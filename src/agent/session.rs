@@ -247,6 +247,14 @@ pub struct AutoFold {
     /// The ledger entry: what was removed, what the summary cost, and where
     /// the post-fold view diverges from the pre-fold one.
     pub event: crate::agent::bigctx::FoldEvent,
+    /// Why the loop stopped before the pressure was relieved, if it did.
+    ///
+    /// This is the backstop's own failure report. It exists because the loop
+    /// used to `break` silently on a summariser error, a boundary refusal, or a
+    /// refused application — so the one mechanism that keeps a session inside
+    /// its window could stop working and leave no trace but a context that kept
+    /// growing. Empty means the loop stopped because the pressure was gone.
+    pub stalled: Option<String>,
 }
 
 pub fn maybe_auto_fold(
@@ -318,6 +326,7 @@ pub fn maybe_auto_fold(
     // it cannot do that for a fold it was never told about.
     let mut folded_tokens = 0u64;
     let mut summary_tokens = 0u64;
+    let mut stalled: Option<String> = None;
     loop {
         let ranges = crate::agent::bigctx::screen(&projection.messages, &new_state, &config);
         let Some(best) = ranges.compressible.iter().max_by_key(|r| r.tokens) else {
@@ -330,7 +339,13 @@ pub fn maybe_auto_fold(
             &new_state,
         ) {
             Ok(resolved) => resolved,
-            Err(_) => break,
+            Err(e) => {
+                stalled = Some(format!(
+                    "cannot resolve the range {}..{} to fold: {e}",
+                    best.start_ref, best.end_ref
+                ));
+                break;
+            }
         };
         let summary = match crate::agent::compact::summarize(
             model,
@@ -338,7 +353,17 @@ pub fn maybe_auto_fold(
             None,
         ) {
             Ok(summary) => summary,
-            Err(_) => break,
+            Err(e) => {
+                // The most consequential of the three: writing the summary is a
+                // model call, so this fails for the reasons a request fails
+                // (rate limit, network, refusal). The session keeps growing
+                // while the only mechanism that could shrink it is broken.
+                stalled = Some(format!(
+                    "cannot write a summary for {}..{}: {e}",
+                    best.start_ref, best.end_ref
+                ));
+                break;
+            }
         };
         let protection = crate::agent::bigctx::compute_protection(
             &projection.messages,
@@ -356,7 +381,13 @@ pub fn maybe_auto_fold(
             now(),
         ) {
             Ok(outcome) => outcome,
-            Err(_) => break,
+            Err(e) => {
+                stalled = Some(format!(
+                    "the fold of {}..{} was refused: {e}",
+                    best.start_ref, best.end_ref
+                ));
+                break;
+            }
         };
         last_block = outcome.block_id;
         folded_total += outcome.message_count;
@@ -411,6 +442,7 @@ pub fn maybe_auto_fold(
                 first_fold_start_tokens: Some(after.saturating_sub(folded_tokens)),
                 view_after: Some(after),
             },
+            stalled,
         }),
     )
 }
@@ -968,6 +1000,13 @@ impl Session {
                     view.borrow_mut().pause();
                     view.borrow_mut().resume_wait();
                 }
+                AgentUpdate::AutoFoldStalled { .. } => {
+                    // The round still goes out — refusing to send would be
+                    // worse — but the line settles so the warning below is not
+                    // overwritten by the next progress update.
+                    view.borrow_mut().pause();
+                    view.borrow_mut().resume_wait();
+                }
                 AgentUpdate::CompactStalled { reason } => {
                     // compaction is due and cannot run: the session keeps
                     // growing over the window, so the reason is the one thing
@@ -1190,6 +1229,14 @@ impl Session {
                 let p = crate::theme::err();
                 eprintln!(
                     "{}! compaction stalled: {reason} — the context stays over the window{}",
+                    p.red, p.reset
+                );
+            }
+            AgentUpdate::AutoFoldStalled { reason } => {
+                view.borrow_mut().pause();
+                let p = crate::theme::err();
+                eprintln!(
+                    "{}! context fold stalled: {reason} — the context stays over the                      threshold and the next request may be rejected{}",
                     p.red, p.reset
                 );
             }
@@ -1583,6 +1630,9 @@ fn event_json(u: &AgentUpdate) -> serde_json::Value {
         }
         AgentUpdate::AutoFolded { block, removed } => {
             serde_json::json!({"type": "auto_folded", "block": block, "removed": removed})
+        }
+        AgentUpdate::AutoFoldStalled { reason } => {
+            serde_json::json!({"type": "auto_fold_stalled", "reason": reason})
         }
         AgentUpdate::Compacting => serde_json::json!({"type": "compacting"}),
         AgentUpdate::CompactStalled { reason } => {
@@ -3271,6 +3321,43 @@ fn auto_fold_declines_without_a_model() {
     let state = crate::agent::bigctx::create_initial_state();
     let (folded, _) = maybe_auto_fold(&seed, &state, None, 1, Some(40_000), None, false);
     assert!(folded.is_none(), "no model, no summary, no fold");
+}
+
+/// A model that cannot produce a summary must not make the backstop vanish
+/// silently.
+///
+/// The loop used to `break` on a summariser error with no record of it, so the
+/// one mechanism that keeps a session inside its window could stop working and
+/// leave nothing behind but a context that kept growing. The fold now reports
+/// why it stopped.
+#[test]
+fn a_failed_summary_is_reported_rather_than_swallowed() {
+    let mut seed = Vec::new();
+    for i in 0..40 {
+        seed.push(Msg::user(format!(
+            "question {i} about component {i} and its behaviour in depth"
+        )));
+        seed.push(Msg::assistant(
+            "the component validates records, buffers a window, and flushes on a boundary",
+        ));
+    }
+    let state = crate::agent::bigctx::create_initial_state();
+    // An unroutable base URL: the summariser cannot succeed.
+    let model = crate::providers::ResolvedModel {
+        provider_name: "test".to_string(),
+        kind: "openai".to_string(),
+        base_url: "http://127.0.0.1:1".to_string(),
+        api_key: None,
+        model_id: "test-model".to_string(),
+        context_window: Some(2_000),
+        options: Vec::new(),
+    };
+    let (folded, fold) = maybe_auto_fold(&seed, &state, Some(&model), 1, Some(2_000), None, false);
+    assert!(folded.is_none(), "nothing could be folded");
+    assert!(
+        fold.is_none(),
+        "a loop that folded nothing reports no fold, not an empty one"
+    );
 }
 
 /// `nudge_enabled: false` is the user switching automatic compression off.

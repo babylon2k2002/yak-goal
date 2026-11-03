@@ -69,6 +69,16 @@ pub enum AgentUpdate {
         block: String,
         removed: usize,
     },
+    /// The automatic fold ran but could not get the context back under its
+    /// floor, and says why.
+    ///
+    /// Distinct from [`AgentUpdate::AutoFolded`]: that reports work done, this
+    /// reports the backstop failing. A session that receives it is heading for
+    /// a rejected request, and the reason (a failing summariser, a refused
+    /// boundary) is the only thing that can tell the user what to do.
+    AutoFoldStalled {
+        reason: String,
+    },
     /// one agent round is complete: everything it added to the history is in
     /// place (the pending prompt, the assistant message, the tool results).
     /// The session persists the slice here — at each round boundary, not at
@@ -511,6 +521,16 @@ pub fn run_agent(
                     block: fold.block.clone(),
                     removed: fold.message_count,
                 });
+                if let Some(reason) = fold.stalled.as_deref() {
+                    // The backstop folded something but could not relieve the
+                    // pressure, so the next round will be sent an oversized
+                    // context and probably rejected. Said out loud because the
+                    // alternative is a session that keeps growing with no
+                    // indication that the mechanism meant to stop it has failed.
+                    on_update(AgentUpdate::AutoFoldStalled {
+                        reason: reason.to_string(),
+                    });
+                }
             }
 
             if let Some(text) = nudge {
