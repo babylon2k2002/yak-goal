@@ -69,7 +69,8 @@ pub use ccr::{
     project as ccr_project, retrieve as ccr_retrieve,
 };
 pub use cache_report::{
-    CacheLedger, CacheReport, CacheSample, FoldEvent, build_cache_report, render_cache_report,
+    CacheDetail, CacheLedger, CacheReport, CacheSample, FoldEvent, build_cache_report, render_cache_report,
+    render_cache_report_at,
 };
 pub use compress::{apply_compression, decompress_block};
 pub use config::{BigctxConfig, config_from_json, config_from_json_in, default_config};

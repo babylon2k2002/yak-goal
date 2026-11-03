@@ -529,6 +529,8 @@ mod tests {
                     breakeven_turns: Some(1.4),
                     paid_back: Some(true),
                     requests_after: 3,
+                    net_token_delta: -3_600,
+                    saved_so_far: 4_200,
                 },
                 FoldEconomics {
                     seq: 2,
@@ -538,6 +540,8 @@ mod tests {
                     breakeven_turns: Some(2.0),
                     paid_back: Some(false),
                     requests_after: 1,
+                    net_token_delta: 1_950,
+                    saved_so_far: 0,
                 },
             ],
             measured_folds: 2,
