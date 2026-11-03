@@ -278,6 +278,9 @@ pub struct CompressTool {
     /// A prompt pack's replacement description, when one is configured.
     /// `None` keeps the built-in text compiled into `description()`.
     description_override: Option<String>,
+    /// A prompt pack's per-parameter description overrides, applied to the
+    /// schema `parameters()` returns.
+    param_overrides: std::collections::BTreeMap<String, String>,
 }
 
 impl CompressTool {
@@ -285,6 +288,7 @@ impl CompressTool {
         CompressTool {
             handle,
             description_override: None,
+            param_overrides: Default::default(),
         }
     }
 
@@ -293,6 +297,7 @@ impl CompressTool {
         CompressTool {
             handle,
             description_override: description,
+            param_overrides: Default::default(),
         }
     }
 }
@@ -314,7 +319,7 @@ impl Tool for CompressTool {
          originals are kept and can be restored with `decompress`."
     }
     fn parameters(&self) -> Value {
-        json!({
+        let schema = json!({
             "type": "object",
             "properties": {
                 "content": {
@@ -338,7 +343,11 @@ impl Tool for CompressTool {
                 }
             },
             "required": ["content"]
-        })
+        });
+        crate::agent::bigctx::packs::apply_param_descriptions(
+            &schema,
+            &self.param_overrides,
+        )
     }
     fn preview(&self, args: &Value) -> String {
         match parse_compress_content(&args["content"]) {
@@ -505,6 +514,9 @@ pub struct DecompressTool {
     /// A prompt pack's replacement description, when one is configured.
     /// `None` keeps the built-in text compiled into `description()`.
     description_override: Option<String>,
+    /// A prompt pack's per-parameter description overrides, applied to the
+    /// schema `parameters()` returns.
+    param_overrides: std::collections::BTreeMap<String, String>,
 }
 
 impl DecompressTool {
@@ -512,6 +524,7 @@ impl DecompressTool {
         DecompressTool {
             handle,
             description_override: None,
+            param_overrides: Default::default(),
         }
     }
 
@@ -520,6 +533,7 @@ impl DecompressTool {
         DecompressTool {
             handle,
             description_override: description,
+            param_overrides: Default::default(),
         }
     }
 }
@@ -539,7 +553,7 @@ impl Tool for DecompressTool {
          summary turns out not to carry what you need. The block id comes from acp_status."
     }
     fn parameters(&self) -> Value {
-        json!({
+        let schema = json!({
             "type": "object",
             "properties": {
                 "blockId": {
@@ -548,7 +562,11 @@ impl Tool for DecompressTool {
                 }
             },
             "required": ["blockId"]
-        })
+        });
+        crate::agent::bigctx::packs::apply_param_descriptions(
+            &schema,
+            &self.param_overrides,
+        )
     }
     fn preview(&self, args: &Value) -> String {
         format!("restore {}", args["blockId"].as_str().unwrap_or("?"))
@@ -599,6 +617,9 @@ pub struct StatusTool {
     /// A prompt pack's replacement description, when one is configured.
     /// `None` keeps the built-in text compiled into `description()`.
     description_override: Option<String>,
+    /// A prompt pack's per-parameter description overrides, applied to the
+    /// schema `parameters()` returns.
+    param_overrides: std::collections::BTreeMap<String, String>,
 }
 
 impl StatusTool {
@@ -606,6 +627,7 @@ impl StatusTool {
         StatusTool {
             handle,
             description_override: None,
+            param_overrides: Default::default(),
         }
     }
 
@@ -614,6 +636,7 @@ impl StatusTool {
         StatusTool {
             handle,
             description_override: description,
+            param_overrides: Default::default(),
         }
     }
 }
@@ -634,7 +657,11 @@ impl Tool for StatusTool {
          refs from earlier calls may be stale."
     }
     fn parameters(&self) -> Value {
-        json!({"type": "object", "properties": {}})
+        let schema = json!({"type": "object", "properties": {}});
+        crate::agent::bigctx::packs::apply_param_descriptions(
+            &schema,
+            &self.param_overrides,
+        )
     }
     fn preview(&self, _args: &Value) -> String {
         "context status".to_string()
@@ -712,31 +739,32 @@ pub fn bigctx_tools_with(
             .get(name)
             .and_then(|over| over.description.clone())
     };
+    let params = |name: &str| -> std::collections::BTreeMap<String, String> {
+        overrides
+            .get(name)
+            .map(|over| over.param_descriptions.clone())
+            .unwrap_or_default()
+    };
+    let mut compress = CompressTool::with_description(handle.clone(), describe("compress"));
+    compress.param_overrides = params("compress");
+    let mut decompress = DecompressTool::with_description(handle.clone(), describe("decompress"));
+    decompress.param_overrides = params("decompress");
+    let mut retrieve = RetrieveTool::with_description(handle.clone(), describe("acp_retrieve"));
+    retrieve.param_overrides = params("acp_retrieve");
+    let mut search = SearchTool::with_description(handle.clone(), describe("search_context"));
+    search.param_overrides = params("search_context");
+    let mut absorb = AbsorbTool::with_description(handle.clone(), describe("absorb"));
+    absorb.param_overrides = params("absorb");
+    let mut status = StatusTool::with_description(handle, describe("acp_status"));
+    status.param_overrides = params("acp_status");
+
     vec![
-        Box::new(CompressTool::with_description(
-            handle.clone(),
-            describe("compress"),
-        )),
-        Box::new(DecompressTool::with_description(
-            handle.clone(),
-            describe("decompress"),
-        )),
-        Box::new(RetrieveTool::with_description(
-            handle.clone(),
-            describe("acp_retrieve"),
-        )),
-        Box::new(SearchTool::with_description(
-            handle.clone(),
-            describe("search_context"),
-        )),
-        Box::new(AbsorbTool::with_description(
-            handle.clone(),
-            describe("absorb"),
-        )),
-        Box::new(StatusTool::with_description(
-            handle,
-            describe("acp_status"),
-        )),
+        Box::new(compress),
+        Box::new(decompress),
+        Box::new(retrieve),
+        Box::new(search),
+        Box::new(absorb),
+        Box::new(status),
     ]
 }
 
@@ -755,6 +783,9 @@ pub struct AbsorbTool {
     /// A prompt pack's replacement description, when one is configured.
     /// `None` keeps the built-in text compiled into `description()`.
     description_override: Option<String>,
+    /// A prompt pack's per-parameter description overrides, applied to the
+    /// schema `parameters()` returns.
+    param_overrides: std::collections::BTreeMap<String, String>,
 }
 
 impl AbsorbTool {
@@ -762,6 +793,7 @@ impl AbsorbTool {
         AbsorbTool {
             handle,
             description_override: None,
+            param_overrides: Default::default(),
         }
     }
 
@@ -770,6 +802,7 @@ impl AbsorbTool {
         AbsorbTool {
             handle,
             description_override: description,
+            param_overrides: Default::default(),
         }
     }
 }
@@ -790,7 +823,7 @@ impl Tool for AbsorbTool {
          immediately when a tool result ends with an [ACP absorb] instruction."
     }
     fn parameters(&self) -> Value {
-        json!({
+        let schema = json!({
             "type": "object",
             "properties": {
                 "ref": {
@@ -803,7 +836,11 @@ impl Tool for AbsorbTool {
                 }
             },
             "required": ["ref", "summary"]
-        })
+        });
+        crate::agent::bigctx::packs::apply_param_descriptions(
+            &schema,
+            &self.param_overrides,
+        )
     }
     fn preview(&self, args: &Value) -> String {
         format!("absorb {}", args["ref"].as_str().unwrap_or(""))
@@ -879,6 +916,9 @@ pub struct SearchTool {
     /// A prompt pack's replacement description, when one is configured.
     /// `None` keeps the built-in text compiled into `description()`.
     description_override: Option<String>,
+    /// A prompt pack's per-parameter description overrides, applied to the
+    /// schema `parameters()` returns.
+    param_overrides: std::collections::BTreeMap<String, String>,
 }
 
 impl SearchTool {
@@ -886,6 +926,7 @@ impl SearchTool {
         SearchTool {
             handle,
             description_override: None,
+            param_overrides: Default::default(),
         }
     }
 
@@ -894,6 +935,7 @@ impl SearchTool {
         SearchTool {
             handle,
             description_override: description,
+            param_overrides: Default::default(),
         }
     }
 }
@@ -915,7 +957,7 @@ impl Tool for SearchTool {
          anything — it returns ranked refs with previews."
     }
     fn parameters(&self) -> Value {
-        json!({
+        let schema = json!({
             "type": "object",
             "properties": {
                 "query": {
@@ -932,7 +974,11 @@ impl Tool for SearchTool {
                 }
             },
             "required": ["query"]
-        })
+        });
+        crate::agent::bigctx::packs::apply_param_descriptions(
+            &schema,
+            &self.param_overrides,
+        )
     }
     fn preview(&self, args: &Value) -> String {
         format!(
@@ -1456,6 +1502,9 @@ pub struct RetrieveTool {
     /// A prompt pack's replacement description, when one is configured.
     /// `None` keeps the built-in text compiled into `description()`.
     description_override: Option<String>,
+    /// A prompt pack's per-parameter description overrides, applied to the
+    /// schema `parameters()` returns.
+    param_overrides: std::collections::BTreeMap<String, String>,
 }
 
 impl RetrieveTool {
@@ -1463,6 +1512,7 @@ impl RetrieveTool {
         RetrieveTool {
             handle,
             description_override: None,
+            param_overrides: Default::default(),
         }
     }
 
@@ -1471,6 +1521,7 @@ impl RetrieveTool {
         RetrieveTool {
             handle,
             description_override: description,
+            param_overrides: Default::default(),
         }
     }
 }
@@ -1492,7 +1543,7 @@ impl Tool for RetrieveTool {
          a pointer instead of the payload."
     }
     fn parameters(&self) -> Value {
-        json!({
+        let schema = json!({
             "type": "object",
             "properties": {
                 "ref": {
@@ -1501,7 +1552,11 @@ impl Tool for RetrieveTool {
                 }
             },
             "required": ["ref"]
-        })
+        });
+        crate::agent::bigctx::packs::apply_param_descriptions(
+            &schema,
+            &self.param_overrides,
+        )
     }
     fn preview(&self, args: &Value) -> String {
         format!("retrieve {}", args["ref"].as_str().unwrap_or("?"))

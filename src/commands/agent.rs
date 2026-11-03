@@ -383,9 +383,38 @@ fn execute_mode(args: &ParsedArgs) -> Result<i32, String> {
         // and a demand with no explanation of the protocol behind it reads as a
         // one-off instruction rather than a rule the session follows. Both are
         // head bytes, so both are decided here and never recomputed.
-        let absorb_cfg = crate::agent::bigctx::absorb::resolve_config(
-            &crate::agent::bigctx::config_from_json(0, settings.bigctx.as_ref()),
+        // The compression protocol section: what <acp> refs mean, the five
+        // tools, and that summaries are history rather than live instructions.
+        //
+        // Missing this was the largest gap against the reference kernel. The
+        // model saw citation markup on every message and had never been told
+        // what it was, so the natural response — reproduce it — would put the
+        // tags into its own output and then into the next turn's history. The
+        // section also carries a pack's rule texts, so a pack's rules reach the
+        // system prompt and not only the nudge.
+        //
+        // Appended once, like steering: these are head bytes.
+        let bigctx_cfg = crate::agent::bigctx::config_from_json_in(
+            0,
+            settings.bigctx.as_ref(),
+            &cwd,
         );
+        //
+        // A pack's rules when one is configured, the built-ins otherwise. Either
+        // way the protocol section is rendered: a session without a pack still
+        // needs to know what its citation refs mean.
+        let prompts = bigctx_cfg
+            .prompts
+            .clone()
+            .unwrap_or_else(crate::agent::bigctx::rules::default_prompts);
+        let protocol =
+            crate::agent::bigctx::sysprompt::render(&prompts, &bigctx_cfg.prompt_sections);
+        let base = system.as_deref().unwrap_or("");
+        system = Some(format!("{base}
+
+{protocol}"));
+
+        let absorb_cfg = crate::agent::bigctx::absorb::resolve_config(&bigctx_cfg);
         if absorb_cfg.enabled {
             let section = crate::agent::bigctx::absorb::build_system_prompt(
                 crate::agent::bigctx::absorb::ABSORB_TOOL_NAME,

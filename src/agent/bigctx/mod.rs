@@ -35,7 +35,10 @@ pub mod protected;
 pub mod nudge;
 pub mod nudge_text;
 pub mod output_steering;
+pub mod lean;
 pub mod packs;
+pub mod sections;
+pub mod sysprompt;
 pub mod pipeline;
 pub mod prune;
 pub mod recommend;
@@ -81,6 +84,7 @@ pub use output_steering::{
 };
 pub use pipeline::{process_turn, process_turn_with_store};
 pub use protected::{Protection, compute_protection};
+pub use sections::SectionOverrides;
 pub use packs::{
     apply_prompt_pack, default_resolver as default_pack_resolver, resolve_prompts as resolve_prompt_pack,
     Pack, PackSource, Resolver as PackResolver, ToolPromptOverride,

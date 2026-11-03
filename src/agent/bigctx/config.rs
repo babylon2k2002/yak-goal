@@ -138,6 +138,15 @@ pub struct BigctxConfig {
     /// resolved a pack, and every renderer falls back to the built-ins.
     #[serde(skip)]
     pub prompts: Option<crate::agent::bigctx::rules::Prompts>,
+    /// System-prompt section overrides from the pack.
+    #[serde(skip)]
+    pub prompt_sections: crate::agent::bigctx::sections::SectionOverrides,
+    /// Nudge section overrides from the pack.
+    #[serde(skip)]
+    pub nudge_sections: crate::agent::bigctx::sections::SectionOverrides,
+    /// Host-specific pack extras, passed through untouched.
+    #[serde(skip)]
+    pub adapters: Option<serde_json::Map<String, serde_json::Value>>,
     /// Tool-description overrides from the same pack. Kept beside `prompts`
     /// because they are the other half of one pack: resolving one without the
     /// other would apply half a pack and look like a bug in the file.
@@ -364,6 +373,9 @@ pub fn default_config(model_context_limit: u64) -> BigctxConfig {
         absorb: None,
         prompt_pack: None,
         prompts: None,
+        prompt_sections: Default::default(),
+        nudge_sections: Default::default(),
+        adapters: None,
         tool_prompts: Default::default(),
     }
 }

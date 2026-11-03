@@ -26,8 +26,19 @@ use crate::agent::bigctx::rules::Prompts;
 pub struct PackSurface {
     /// Individual rule texts. `None` means keep the built-in.
     pub prompts: PromptOverrides,
+    /// System-prompt sections, tri-state (replace / drop / keep).
+    pub prompt_sections: crate::agent::bigctx::sections::SectionOverrides,
+    /// Nudge sections, tri-state.
+    pub nudge_sections: crate::agent::bigctx::sections::SectionOverrides,
     /// Tool description overrides, keyed by tool name.
     pub tool_prompts: std::collections::BTreeMap<String, ToolPromptOverride>,
+    /// Host-specific extras, passed through untouched.
+    ///
+    /// Opaque on purpose: the set of keys belongs to the host reading it, and a
+    /// kernel that validated them would have to change every time a host added
+    /// one. Only the shape is checked (an object), because that is the only
+    /// thing the kernel can know is right.
+    pub adapters: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// One prompt text override per rule. `None` = use the built-in.
@@ -162,6 +173,57 @@ fn sanitize_tool_prompts(
     out
 }
 
+/// Replace the `description` of every schema property whose name appears in
+/// `overrides`, at any nesting depth.
+///
+/// Depth matters because a tool's arguments are not flat: `compress`'s `content`
+/// is a string-or-array whose object entries carry `startId`/`endId`/`summary`.
+/// A pack that can only describe top-level properties cannot reach the ones a
+/// model actually gets wrong.
+///
+/// Returns the input unchanged when there is nothing to override, and never
+/// mutates it: the schema is a shared constant, and rewriting it in place would
+/// leak one session's pack into the next.
+pub fn apply_param_descriptions(
+    schema: &serde_json::Value,
+    overrides: &std::collections::BTreeMap<String, String>,
+) -> serde_json::Value {
+    if overrides.is_empty() {
+        return schema.clone();
+    }
+    fn walk(
+        node: &serde_json::Value,
+        overrides: &std::collections::BTreeMap<String, String>,
+    ) -> serde_json::Value {
+        match node {
+            serde_json::Value::Object(map) => {
+                let mut out = serde_json::Map::with_capacity(map.len());
+                for (name, value) in map {
+                    let mut cloned = walk(value, overrides);
+                    // Only attach a description to something that is already an
+                    // object: a property named here but holding a scalar is not
+                    // a schema node, and adding a sibling key would corrupt it.
+                    if let Some(text) = overrides.get(name)
+                        && let Some(object) = cloned.as_object_mut()
+                    {
+                        object.insert(
+                            "description".to_string(),
+                            serde_json::Value::String(text.clone()),
+                        );
+                    }
+                    out.insert(name.clone(), cloned);
+                }
+                serde_json::Value::Object(out)
+            }
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(|i| walk(i, overrides)).collect())
+            }
+            other => other.clone(),
+        }
+    }
+    walk(schema, overrides)
+}
+
 /// Sanitise a raw pack file body. Malformed values are dropped, never coerced.
 pub fn sanitize(raw: Option<&serde_json::Value>) -> PackSurface {
     let Some(object) = raw.and_then(serde_json::Value::as_object) else {
@@ -169,7 +231,19 @@ pub fn sanitize(raw: Option<&serde_json::Value>) -> PackSurface {
     };
     PackSurface {
         prompts: sanitize_prompts(object.get("prompts")),
+        prompt_sections: crate::agent::bigctx::sections::SectionOverrides::from_json(
+            object.get("prompt_sections"),
+            crate::agent::bigctx::sysprompt::SECTION_KEYS,
+        ),
+        nudge_sections: crate::agent::bigctx::sections::SectionOverrides::from_json(
+            object.get("nudge_sections"),
+            crate::agent::bigctx::nudge_text::SECTION_KEYS,
+        ),
         tool_prompts: sanitize_tool_prompts(object.get("tool_prompts")),
+        adapters: object
+            .get("adapters")
+            .and_then(serde_json::Value::as_object)
+            .cloned(),
     }
 }
 
@@ -194,11 +268,12 @@ impl PackSource for BuiltinSource {
     fn resolve(&self, name: &str) -> Option<Pack> {
         match name {
             "default" => Some(default_pack()),
+            "lean" => Some(crate::agent::bigctx::lean::pack()),
             _ => None,
         }
     }
     fn list(&self) -> Vec<Pack> {
-        vec![default_pack()]
+        vec![default_pack(), crate::agent::bigctx::lean::pack()]
     }
 }
 
@@ -387,6 +462,9 @@ pub fn apply_prompt_pack(config: &mut crate::agent::bigctx::config::BigctxConfig
     // rather than a partial override.
     if let Some(pack) = resolver.resolve(&name) {
         config.tool_prompts = pack.surface.tool_prompts;
+        config.prompt_sections = pack.surface.prompt_sections;
+        config.nudge_sections = pack.surface.nudge_sections;
+        config.adapters = pack.surface.adapters;
     }
     warning
 }

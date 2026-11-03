@@ -106,6 +106,20 @@ fn decision_pressure(decision: &NudgeDecision) -> f64 {
     decision.pressure
 }
 
+/// The nudge sections a pack may override, in render order.
+pub const SECTION_KEYS: &[&str] = &[
+    "efficiency_note",
+    "emergency_header",
+    "tier2_guidance",
+    "tier3_guidance",
+];
+
+const DEFAULT_EFFICIENCY_NOTE: &str =
+    "This is an efficiency nudge to compress early and keep context lean — not an      overflow warning. A separate, stronger alert will appear if the context is      actually full.";
+
+const DEFAULT_EMERGENCY_HEADER: &str =
+    "⚠️ Context limit reached — compress now. Prioritize consumed tool outputs.";
+
 fn render(
     decision: &NudgeDecision,
     ranges: &ContextRanges,
@@ -116,25 +130,22 @@ fn render(
 ) -> String {
     let mut out: Vec<String> = Vec::new();
 
-    match voice {
-        NudgeVoice::Emergency => {
-            out.push(
-                "⚠️ Context limit reached — compress now. Prioritize consumed tool outputs."
-                    .to_string(),
-            );
+    // The header and the philosophy used to be one unit. They are now two
+    // sections so a pack can trim the prose without losing the philosophy, or
+    // drop the philosophy where the rules section already carries it.
+    let (header_key, header_default) = match voice {
+        NudgeVoice::Emergency => ("emergency_header", DEFAULT_EMERGENCY_HEADER),
+        NudgeVoice::Gentle => ("efficiency_note", DEFAULT_EFFICIENCY_NOTE),
+    };
+    let rendered_sections = config.nudge_sections.render(&[
+        (header_key, header_default),
+        ("philosophy", prompts.compress_philosophy.as_ref()),
+    ]);
+    for (i, text) in rendered_sections.iter().enumerate() {
+        if i > 0 {
             out.push(String::new());
-            out.push(prompts.compress_philosophy.to_string());
         }
-        NudgeVoice::Gentle => {
-            out.push(
-                "This is an efficiency nudge to compress early and keep context lean — not an \
-                 overflow warning. A separate, stronger alert will appear if the context is \
-                 actually full."
-                    .to_string(),
-            );
-            out.push(String::new());
-            out.push(prompts.compress_philosophy.to_string());
-        }
+        out.push(text.clone());
     }
 
     out.push(String::new());
@@ -152,7 +163,7 @@ fn render(
         && tier != Tier::One
     {
         out.push(String::new());
-        out.push(render_distillation(tier, state, prompts));
+        out.push(render_distillation(tier, state, prompts, config));
     } else {
         out.push(String::new());
         out.push(render_ranges(ranges));
@@ -207,7 +218,12 @@ fn render_ranges(ranges: &ContextRanges) -> String {
     out.trim_end().to_string()
 }
 
-fn render_distillation(tier: Tier, state: &CompressionState, prompts: &Prompts) -> String {
+fn render_distillation(
+    tier: Tier,
+    state: &CompressionState,
+    prompts: &Prompts,
+    config: &BigctxConfig,
+) -> String {
     let targets: Vec<&crate::agent::bigctx::types::CompressionBlock> = state
         .blocks
         .iter()
@@ -238,15 +254,32 @@ fn render_distillation(tier: Tier, state: &CompressionState, prompts: &Prompts) 
         }
         out.push('\n');
     }
-    if let Some(first) = targets.first()
-        && let Some(last) = targets.last()
-    {
-        out.push_str(&format!(
-            "\nCite them as startId=\"{}\", endId=\"{}\".\n",
+    // The citation line is the tier's guidance section: a pack may replace it
+    // with its own wording, or drop it where the rules already say the same
+    // thing.
+    let guidance_default = match (targets.first(), targets.last()) {
+        (Some(first), Some(last)) => format!(
+            "Cite them as startId=\"{}\", endId=\"{}\".",
             first.block_id, last.block_id
-        ));
+        ),
+        _ => String::new(),
+    };
+    let guidance_key = match tier {
+        Tier::Two => "tier2_guidance",
+        _ => "tier3_guidance",
+    };
+    let guidance = config
+        .nudge_sections
+        .render(&[(guidance_key, guidance_default.as_str())]);
+    for text in guidance {
+        out.push('
+');
+        out.push_str(&text);
+        out.push('
+');
     }
-    out.push_str("\n");
+    out.push_str("
+");
     out.push_str(prompts.rules_for(tier));
     out.trim_end().to_string()
 }
