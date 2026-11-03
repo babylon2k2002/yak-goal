@@ -1422,12 +1422,17 @@ fn an_overflow_truncates_and_resends_when_compaction_cannot_help() {
             let is_summariser = text.contains("context summarization assistant");
 
             if is_summariser {
-                // Compaction must fail for a reason the overflow path cannot
-                // recover from, so truncation is the only move left.
-                let payload = "{\"error\":{\"message\":\"internal server error\"}}";
+                // Compaction must fail, and fail *fast*: a 500 here is in the
+                // retryable class, so the transport retries it four times with
+                // 1s/2s/4s/8s backoff before the overflow path sees the failure
+                // at all. That turned this test into a 12-minute one. A 400 the
+                // classifier does not read as an overflow is a
+                // bad-request class: no retry, immediate failure, exactly the
+                // "summarising cannot help" case this test needs.
+                let payload = "{\"error\":{\"message\":\"summariser unavailable\"}}";
                 let _ = c.write_all(
                     format!(
-                        "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\n\
+                        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n\
                          content-length: {}\r\n\r\n{payload}",
                         payload.len()
                     )
