@@ -203,11 +203,32 @@ pub fn render_report(report: &Report) -> String {
         ));
     }
 
+    // Stated on its own line, and outside the `compression_count` branch: a
+    // session can absorb results before it ever folds a range, and folding the
+    // figure into `saved` would claim the savings are recoverable when an
+    // absorption leaves only the model's own summary.
+    if report.absorbed_count > 0 {
+        out.push_str(&format!(
+            "absorbed: {} tokens across {} tool result(s) — not recoverable,\n\
+             the summary is the record\n",
+            format_tokens(report.absorbed_tokens),
+            report.absorbed_count
+        ));
+    }
+
     if report.blocks.is_empty() {
         // Say what is true and what to do next. The old wording read as a
         // contradiction next to a non-empty `compressible` list, and a model
         // facing it looped on acp_status instead of calling compress.
-        if report.compressible.compressible.is_empty() {
+        //
+        // Once results have been absorbed, "nothing" is false: absorb already
+        // reclaimed tokens. The distinction matters because the two are
+        // different bargains — absorb leaves no block to decompress.
+        if report.absorbed_count > 0 {
+            out.push_str(
+                "\nno blocks folded yet — absorbed results left no block to decompress.\n",
+            );
+        } else if report.compressible.compressible.is_empty() {
             out.push_str("\ncompressed so far: nothing.\n");
         } else {
             out.push_str(
@@ -565,7 +586,11 @@ mod tests {
         assert!(rendered.contains("absorbed"), "got: {rendered}");
         assert!(
             rendered.contains("not recoverable"),
-            "the report must say an absorption is not decompressible"
+            "the report must say an absorption is not decompressible; got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("compressed so far: nothing"),
+            "absorbing is not 'nothing'; got: {rendered}"
         );
     }
 
