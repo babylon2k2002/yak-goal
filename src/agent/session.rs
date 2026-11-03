@@ -1283,8 +1283,7 @@ impl Session {
                 view.borrow_mut().pause();
                 let p = crate::theme::err();
                 eprintln!(
-                    "{}! context fold stalled: {reason} — the context stays over the "
-                    + "threshold and the next request may be rejected{}",
+                    "{}! context fold stalled: {reason} — the context stays over the threshold and the next request may be rejected{}",
                     p.red, p.reset
                 );
             }
@@ -1292,8 +1291,7 @@ impl Session {
                 view.borrow_mut().pause();
                 let p = crate::theme::err();
                 eprintln!(
-                    "{}! cut {results} tool result(s), {saved_tokens} tokens freed "
-                    + "— summarising failed, so detail was dropped that cannot be restored{}",
+                    "{}! cut {results} tool result(s), {saved_tokens} tokens freed — summarising failed, so detail was dropped that cannot be restored{}",
                     p.red, p.reset
                 );
             }
