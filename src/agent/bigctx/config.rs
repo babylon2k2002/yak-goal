@@ -120,6 +120,32 @@ pub struct BigctxConfig {
     /// parsing and its validation rules live in one place.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub absorb: Option<serde_json::Value>,
+    /// The prompt pack to use, if any.
+    ///
+    /// Only the *name* lives here. Resolving it needs the filesystem, which
+    /// this struct must not touch: it is cloned, compared and round-tripped
+    /// through serde, and a config that read a file on construction would make
+    /// equality depend on disk state. The name is resolved where the prompts
+    /// are actually needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_pack: Option<String>,
+    /// The resolved prompt set, filled in by whoever built this config with
+    /// filesystem access.
+    ///
+    /// Not serialised: it is derived from `prompt_pack` plus whatever is on
+    /// disk at load time, and persisting it would freeze one machine's pack
+    /// contents into another's session state. `None` means the caller never
+    /// resolved a pack, and every renderer falls back to the built-ins.
+    #[serde(skip)]
+    pub prompts: Option<crate::agent::bigctx::rules::Prompts>,
+    /// Tool-description overrides from the same pack. Kept beside `prompts`
+    /// because they are the other half of one pack: resolving one without the
+    /// other would apply half a pack and look like a bug in the file.
+    #[serde(skip)]
+    pub tool_prompts: std::collections::BTreeMap<
+        String,
+        crate::agent::bigctx::packs::ToolPromptOverride,
+    >,
 }
 
 /// Content-cached retrieval: keeping oversized tool results out of the context.
@@ -240,6 +266,46 @@ pub fn config_from_json(
     if let Some(raw) = object.get("absorb") {
         config.absorb = Some(raw.clone());
     }
+    if let Some(name) = object.get("prompt_pack").and_then(serde_json::Value::as_str) {
+        config.prompt_pack = Some(name.to_string());
+    }
+    // Resolve the pack here, once, using the process working directory.
+    //
+    // Every caller builds its config right before rendering a nudge or running
+    // the pipeline, and under `yak` the process cwd IS the project root for the
+    // whole session — so the project `.yak/packs` lookup works without threading
+    // a path through six call sites that do not otherwise need one.
+    //
+    // A pack that fails to load leaves `prompts` as None, which every renderer
+    // reads as "use the built-ins". The warning is not shown from here: this
+    // function runs several times per round, and a file that is missing once is
+    // missing every time — the user would see a wall of duplicates.
+    crate::agent::bigctx::packs::apply_prompt_pack(&mut config, &cwd_for_packs());
+    config
+}
+
+/// The working directory pack lookup uses.
+///
+/// `current_dir` can fail (deleted cwd). Falling back to an empty path makes
+/// every file source miss and leaves the built-ins in place, which is the safe
+/// direction: a prompt pack is optional, compression is not.
+fn cwd_for_packs() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_default()
+}
+
+/// [`config_from_json`], plus prompt-pack resolution against `cwd`.
+///
+/// The split exists because resolving a pack touches the filesystem and
+/// `config_from_json` is called from places that have no meaningful working
+/// directory (tests, the status command). Those callers get the built-in
+/// prompts; a real session uses this one and gets the pack.
+pub fn config_from_json_in(
+    model_context_limit: u64,
+    overrides: Option<&serde_json::Value>,
+    cwd: &std::path::Path,
+) -> BigctxConfig {
+    let mut config = config_from_json(model_context_limit, overrides);
+    crate::agent::bigctx::packs::apply_prompt_pack(&mut config, cwd);
     config
 }
 
@@ -296,6 +362,9 @@ pub fn default_config(model_context_limit: u64) -> BigctxConfig {
         // *says*, not what it reads, so it is opt-in.
         output_steering: crate::agent::bigctx::output_steering::OutputSteeringConfig::default(),
         absorb: None,
+        prompt_pack: None,
+        prompts: None,
+        tool_prompts: Default::default(),
     }
 }
 

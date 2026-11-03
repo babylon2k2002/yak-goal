@@ -275,11 +275,25 @@ fn looks_like_ref(text: &str) -> bool {
 /// The `compress` tool.
 pub struct CompressTool {
     handle: BigctxHandle,
+    /// A prompt pack's replacement description, when one is configured.
+    /// `None` keeps the built-in text compiled into `description()`.
+    description_override: Option<String>,
 }
 
 impl CompressTool {
     pub fn new(handle: BigctxHandle) -> CompressTool {
-        CompressTool { handle }
+        CompressTool {
+            handle,
+            description_override: None,
+        }
+    }
+
+    /// As [`CompressTool::new`], with a pack-supplied description.
+    pub fn with_description(handle: BigctxHandle, description: Option<String>) -> CompressTool {
+        CompressTool {
+            handle,
+            description_override: description,
+        }
     }
 }
 
@@ -291,6 +305,9 @@ impl Tool for CompressTool {
         Tier::Write
     }
     fn description(&self) -> &str {
+        if let Some(text) = self.description_override.as_deref() {
+            return text;
+        }
         "Replace consumed conversation ranges with self-contained summaries you write, identified \
          by their refs. Batch every range into ONE call. Use when the content is genuinely \
          consumed — you have extracted what you need and will not need the originals again. The \
@@ -485,11 +502,25 @@ fn describe(error: &CompressError) -> String {
 /// The `decompress` tool: make a block's material visible again.
 pub struct DecompressTool {
     handle: BigctxHandle,
+    /// A prompt pack's replacement description, when one is configured.
+    /// `None` keeps the built-in text compiled into `description()`.
+    description_override: Option<String>,
 }
 
 impl DecompressTool {
     pub fn new(handle: BigctxHandle) -> DecompressTool {
-        DecompressTool { handle }
+        DecompressTool {
+            handle,
+            description_override: None,
+        }
+    }
+
+    /// As [`DecompressTool::new`], with a pack-supplied description.
+    pub fn with_description(handle: BigctxHandle, description: Option<String>) -> DecompressTool {
+        DecompressTool {
+            handle,
+            description_override: description,
+        }
     }
 }
 
@@ -501,6 +532,9 @@ impl Tool for DecompressTool {
         Tier::Write
     }
     fn description(&self) -> &str {
+        if let Some(text) = self.description_override.as_deref() {
+            return text;
+        }
         "Restore a compressed block so its original messages become visible again. Use when a \
          summary turns out not to carry what you need. The block id comes from acp_status."
     }
@@ -562,11 +596,25 @@ pub fn parse_block_id(raw: &str) -> Option<String> {
 /// The `acp_status` tool: what is folded, what is left, what may be folded.
 pub struct StatusTool {
     handle: BigctxHandle,
+    /// A prompt pack's replacement description, when one is configured.
+    /// `None` keeps the built-in text compiled into `description()`.
+    description_override: Option<String>,
 }
 
 impl StatusTool {
     pub fn new(handle: BigctxHandle) -> StatusTool {
-        StatusTool { handle }
+        StatusTool {
+            handle,
+            description_override: None,
+        }
+    }
+
+    /// As [`StatusTool::new`], with a pack-supplied description.
+    pub fn with_description(handle: BigctxHandle, description: Option<String>) -> StatusTool {
+        StatusTool {
+            handle,
+            description_override: description,
+        }
     }
 }
 
@@ -578,6 +626,9 @@ impl Tool for StatusTool {
         Tier::Read
     }
     fn description(&self) -> &str {
+        if let Some(text) = self.description_override.as_deref() {
+            return text;
+        }
         "Report the context: which blocks are folded, how many tokens they saved, and which \
          ranges are still compressible. Call this before a compress call to get the current refs — \
          refs from earlier calls may be stale."
@@ -642,15 +693,50 @@ cache:
     text
 }
 
-/// Every bigctx tool, bound to one handle.
+/// Every bigctx tool, bound to one handle, with the built-in descriptions.
 pub fn bigctx_tools(handle: BigctxHandle) -> Vec<Box<dyn Tool>> {
+    bigctx_tools_with(handle, &std::collections::BTreeMap::new())
+}
+
+/// As [`bigctx_tools`], applying a prompt pack's tool-description overrides.
+///
+/// Descriptions are baked into the tool objects rather than looked up per call:
+/// the registry is built once per task, and a description that changed between
+/// two requests would move the head of the prompt and cost a cache miss.
+pub fn bigctx_tools_with(
+    handle: BigctxHandle,
+    overrides: &std::collections::BTreeMap<String, crate::agent::bigctx::packs::ToolPromptOverride>,
+) -> Vec<Box<dyn Tool>> {
+    let describe = |name: &str| -> Option<String> {
+        overrides
+            .get(name)
+            .and_then(|over| over.description.clone())
+    };
     vec![
-        Box::new(CompressTool::new(handle.clone())),
-        Box::new(DecompressTool::new(handle.clone())),
-        Box::new(RetrieveTool::new(handle.clone())),
-        Box::new(SearchTool::new(handle.clone())),
-        Box::new(AbsorbTool::new(handle.clone())),
-        Box::new(StatusTool::new(handle)),
+        Box::new(CompressTool::with_description(
+            handle.clone(),
+            describe("compress"),
+        )),
+        Box::new(DecompressTool::with_description(
+            handle.clone(),
+            describe("decompress"),
+        )),
+        Box::new(RetrieveTool::with_description(
+            handle.clone(),
+            describe("acp_retrieve"),
+        )),
+        Box::new(SearchTool::with_description(
+            handle.clone(),
+            describe("search_context"),
+        )),
+        Box::new(AbsorbTool::with_description(
+            handle.clone(),
+            describe("absorb"),
+        )),
+        Box::new(StatusTool::with_description(
+            handle,
+            describe("acp_status"),
+        )),
     ]
 }
 
@@ -666,11 +752,25 @@ pub fn bigctx_tools(handle: BigctxHandle) -> Vec<Box<dyn Tool>> {
 /// the next turn and the model's own summary becomes the durable record.
 pub struct AbsorbTool {
     handle: BigctxHandle,
+    /// A prompt pack's replacement description, when one is configured.
+    /// `None` keeps the built-in text compiled into `description()`.
+    description_override: Option<String>,
 }
 
 impl AbsorbTool {
     pub fn new(handle: BigctxHandle) -> AbsorbTool {
-        AbsorbTool { handle }
+        AbsorbTool {
+            handle,
+            description_override: None,
+        }
+    }
+
+    /// As [`AbsorbTool::new`], with a pack-supplied description.
+    pub fn with_description(handle: BigctxHandle, description: Option<String>) -> AbsorbTool {
+        AbsorbTool {
+            handle,
+            description_override: description,
+        }
     }
 }
 
@@ -682,6 +782,9 @@ impl Tool for AbsorbTool {
         Tier::Read
     }
     fn description(&self) -> &str {
+        if let Some(text) = self.description_override.as_deref() {
+            return text;
+        }
         "Distil a large tool result into its essentials. The original output is then removed \
          from the context and your summary becomes the only durable record of it. Call this \
          immediately when a tool result ends with an [ACP absorb] instruction."
@@ -773,11 +876,25 @@ impl AbsorbTool {
 /// search costs one pass over the query rather than the corpus.
 pub struct SearchTool {
     handle: BigctxHandle,
+    /// A prompt pack's replacement description, when one is configured.
+    /// `None` keeps the built-in text compiled into `description()`.
+    description_override: Option<String>,
 }
 
 impl SearchTool {
     pub fn new(handle: BigctxHandle) -> SearchTool {
-        SearchTool { handle }
+        SearchTool {
+            handle,
+            description_override: None,
+        }
+    }
+
+    /// As [`SearchTool::new`], with a pack-supplied description.
+    pub fn with_description(handle: BigctxHandle, description: Option<String>) -> SearchTool {
+        SearchTool {
+            handle,
+            description_override: description,
+        }
     }
 }
 
@@ -789,6 +906,9 @@ impl Tool for SearchTool {
         Tier::Read
     }
     fn description(&self) -> &str {
+        if let Some(text) = self.description_override.as_deref() {
+            return text;
+        }
         "Search the conversation by content, including material that has been folded into \
          summaries. Use this to find which block or message holds a detail before calling \
          decompress (blockId) or acp_retrieve (ref). Searching is cheap and does not restore \
@@ -1333,11 +1453,25 @@ mod tests {
 /// simply gone from the model's point of view, and it would have to guess.
 pub struct RetrieveTool {
     handle: BigctxHandle,
+    /// A prompt pack's replacement description, when one is configured.
+    /// `None` keeps the built-in text compiled into `description()`.
+    description_override: Option<String>,
 }
 
 impl RetrieveTool {
     pub fn new(handle: BigctxHandle) -> RetrieveTool {
-        RetrieveTool { handle }
+        RetrieveTool {
+            handle,
+            description_override: None,
+        }
+    }
+
+    /// As [`RetrieveTool::new`], with a pack-supplied description.
+    pub fn with_description(handle: BigctxHandle, description: Option<String>) -> RetrieveTool {
+        RetrieveTool {
+            handle,
+            description_override: description,
+        }
     }
 }
 
@@ -1349,6 +1483,9 @@ impl Tool for RetrieveTool {
         Tier::Read
     }
     fn description(&self) -> &str {
+        if let Some(text) = self.description_override.as_deref() {
+            return text;
+        }
         "Retrieve the full text of a stored tool result. Placeholders like \
          `📦 [acp-stored #m00042 · file read · 40,120 tok]` mark results that were kept out of the \
          context to save space; call this with the ref to read one back. Large originals return \

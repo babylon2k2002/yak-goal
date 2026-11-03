@@ -60,6 +60,22 @@ pub fn render_nudge(
     state: &CompressionState,
     config: &BigctxConfig,
 ) -> Option<RenderedNudge> {
+    let prompts = config.prompts.clone().unwrap_or_else(default_prompts);
+    render_nudge_with(decision, ranges, state, config, &prompts)
+}
+
+/// As [`render_nudge`], with an explicit prompt set.
+///
+/// Used when a pack overrides the rules: the texts are resolved once by the
+/// caller rather than per nudge, because resolving touches the filesystem and a
+/// nudge is rendered on turns where nothing has changed.
+pub fn render_nudge_with(
+    decision: &NudgeDecision,
+    ranges: &ContextRanges,
+    state: &CompressionState,
+    config: &BigctxConfig,
+    prompts: &Prompts,
+) -> Option<RenderedNudge> {
     if !decision.inject {
         return None;
     }
@@ -77,7 +93,7 @@ pub fn render_nudge(
 
     Some(RenderedNudge {
         voice,
-        text: render(decision, ranges, state, config, voice, &default_prompts()),
+        text: render(decision, ranges, state, config, voice, prompts),
     })
 }
 

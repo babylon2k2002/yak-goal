@@ -648,7 +648,20 @@ impl Session {
         // and these three carry long descriptions the budget is not sized for.
         // They are also useless without a session to compress, so they belong
         // to the session's registry rather than the global one.
-        tools.extend(crate::agent::bigctx::bigctx_tools(self.bigctx_handle.clone()));
+        // The pack's tool descriptions come from the session's config, which
+        // resolved the pack once at construction. Passing them here (rather
+        // than looking them up per call) keeps a description stable across
+        // rounds, so it cannot move the prompt head and cost a cache miss.
+        let tool_prompts = crate::agent::bigctx::config_from_json_in(
+            0,
+            self.bigctx_config.as_ref(),
+            &self.cwd,
+        )
+        .tool_prompts;
+        tools.extend(crate::agent::bigctx::bigctx_tools_with(
+            self.bigctx_handle.clone(),
+            &tool_prompts,
+        ));
         self.extensions.mount_tools(&mut tools);
         self.tools = tools;
     }

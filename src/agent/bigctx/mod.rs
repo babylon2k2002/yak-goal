@@ -69,7 +69,7 @@ pub use cache_report::{
     CacheLedger, CacheReport, CacheSample, FoldEvent, build_cache_report, render_cache_report,
 };
 pub use compress::{apply_compression, decompress_block};
-pub use config::{BigctxConfig, config_from_json, default_config};
+pub use config::{BigctxConfig, config_from_json, config_from_json_in, default_config};
 pub use crush::{CrushResult, crush_tool_results};
 pub use hide_consumed::hide_consumed_compress_calls;
 pub use host::{IdScheme, project, render};
@@ -82,7 +82,8 @@ pub use output_steering::{
 pub use pipeline::{process_turn, process_turn_with_store};
 pub use protected::{Protection, compute_protection};
 pub use packs::{
-    resolve_prompts as resolve_prompt_pack, Pack, PackSource, Resolver as PackResolver,
+    apply_prompt_pack, default_resolver as default_pack_resolver, resolve_prompts as resolve_prompt_pack,
+    Pack, PackSource, Resolver as PackResolver, ToolPromptOverride,
 };
 pub use prune::{PruneOptions, prune};
 pub use recommend::{ContextRanges, screen};

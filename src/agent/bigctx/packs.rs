@@ -329,6 +329,24 @@ impl Resolver {
     }
 }
 
+/// The standard source chain for this process: the project's `.yak/packs`, the
+/// user's `~/.yak/packs`, then the built-ins.
+///
+/// Project first so a repository can pin its own conventions over the user's
+/// global choice — the more specific scope wins, which is what a developer
+/// expects when they check a pack into the repo.
+///
+/// The directories are not created here. A missing packs directory is the
+/// normal case for everyone who has never made one, and creating it on every
+/// session would leave an empty directory behind for a feature they may never
+/// use.
+pub fn default_resolver(cwd: &Path) -> Resolver {
+    Resolver::with_dirs(
+        Some(cwd.join(".yak").join("packs")),
+        vec![crate::core::config::user_dir().join("packs")],
+    )
+}
+
 /// Resolve a named pack into a usable prompt set over `base`.
 ///
 /// An unknown name falls back to the built-in defaults rather than failing: a
@@ -349,6 +367,28 @@ pub fn resolve_prompts(resolver: &Resolver, name: Option<&str>) -> (Prompts, Opt
             )),
         ),
     }
+}
+
+/// Fill in `config.prompts` from `config.prompt_pack`.
+///
+/// Called once, where a config is built with filesystem access. Returns any
+/// warning to show the user — an unresolvable pack name falls back to the
+/// built-ins rather than failing, because a typo should not leave a session
+/// unable to compress.
+pub fn apply_prompt_pack(config: &mut crate::agent::bigctx::config::BigctxConfig, cwd: &Path) -> Option<String> {
+    let Some(name) = config.prompt_pack.clone() else {
+        return None;
+    };
+    let resolver = default_resolver(cwd);
+    let (prompts, warning) = resolve_prompts(&resolver, Some(&name));
+    config.prompts = Some(prompts);
+    // The tool descriptions travel with the rule texts: a pack that sets one
+    // and not the other would be applied halfway, which reads as a broken file
+    // rather than a partial override.
+    if let Some(pack) = resolver.resolve(&name) {
+        config.tool_prompts = pack.surface.tool_prompts;
+    }
+    warning
 }
 
 #[cfg(test)]
@@ -633,6 +673,128 @@ mod tests {
         assert_eq!(prompts, base, "must fall back, not fail");
         let warning = warning.expect("a miss must warn");
         assert!(warning.contains("nope"));
+    }
+
+    // ── the tests that prove the pack is actually wired in ───────────────────
+
+    fn temp_cwd(tag: &str) -> PathBuf {
+        let dir = tmpdir(tag);
+        std::fs::create_dir_all(dir.join(".yak").join("packs")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_pack_changes_the_rendered_nudge() {
+        // The point of packs: the rule text inside the nudge the model reads.
+        // A pack that resolves but never reaches a renderer is dead weight.
+        let cwd = temp_cwd("nudge");
+        std::fs::write(
+            cwd.join(".yak").join("packs").join("team.json"),
+            r#"{"prompts":{"how_to_compress_rules":"TEAM_RULE_SENTINEL"}}"#,
+        )
+        .unwrap();
+
+        let config =
+            crate::agent::bigctx::config_from_json_in(200_000, Some(&json!({"prompt_pack":"team"})), &cwd);
+        assert!(
+            config.prompts.is_some(),
+            "the pack must be resolved into the config"
+        );
+        let prompts = config
+            .prompts
+            .clone()
+            .expect("resolved");
+        assert_eq!(&*prompts.how_to_compress_rules, "TEAM_RULE_SENTINEL");
+
+        // And the built-in default still holds for everything unset.
+        let base = crate::agent::bigctx::rules::default_prompts();
+        assert_eq!(prompts.compress_philosophy, base.compress_philosophy);
+
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn a_pack_overrides_a_tool_description_through_the_registry() {
+        // A tool prompt that never reaches a `Tool::description` is inert.
+        let cwd = temp_cwd("tool");
+        std::fs::write(
+            cwd.join(".yak").join("packs").join("team.json"),
+            r#"{"tool_prompts":{"compress":{"description":"TEAM_TOOL_SENTINEL"}}}"#,
+        )
+        .unwrap();
+
+        let config =
+            crate::agent::bigctx::config_from_json_in(200_000, Some(&json!({"prompt_pack":"team"})), &cwd);
+        assert_eq!(
+            config.tool_prompts["compress"].description.as_deref(),
+            Some("TEAM_TOOL_SENTINEL")
+        );
+
+        let tools = crate::agent::bigctx::bigctx_tools_with(
+            crate::agent::bigctx::BigctxHandle::new(),
+            &config.tool_prompts,
+        );
+        let compress = tools
+            .iter()
+            .find(|t| t.name() == "compress")
+            .expect("compress tool");
+        assert_eq!(compress.description(), "TEAM_TOOL_SENTINEL");
+        // A tool the pack did not mention keeps its built-in text.
+        let status = tools.iter().find(|t| t.name() == "acp_status").unwrap();
+        assert!(
+            status.description().len() > 20,
+            "an unmentioned tool must keep its built-in description"
+        );
+
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn the_project_pack_shadows_a_user_pack() {
+        let cwd = temp_cwd("shadow");
+        std::fs::write(
+            cwd.join(".yak").join("packs").join("team.json"),
+            r#"{"prompts":{"how_to_compress_rules":"PROJECT_RULE"}}"#,
+        )
+        .unwrap();
+        let resolver = default_resolver(&cwd);
+        let pack = resolver.resolve("team").expect("project pack");
+        assert_eq!(
+            pack.surface.prompts.how_to_compress_rules.as_deref(),
+            Some("PROJECT_RULE")
+        );
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn no_pack_configured_leaves_the_builtins_untouched() {
+        let cwd = temp_cwd("none");
+        let config = crate::agent::bigctx::config_from_json_in(200_000, None, &cwd);
+        assert!(
+            config.prompts.is_none(),
+            "no pack named means no resolution at all"
+        );
+        assert!(config.tool_prompts.is_empty());
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn an_unknown_pack_name_still_leaves_a_working_config() {
+        // A typo must cost a warning, not a session that cannot compress.
+        let cwd = temp_cwd("unknown");
+        let mut config = crate::agent::bigctx::config_from_json(
+            200_000,
+            Some(&json!({"prompt_pack":"does-not-exist"})),
+        );
+        let warning = apply_prompt_pack(&mut config, &cwd);
+        assert!(warning.is_some(), "a miss must warn");
+        let prompts = config.prompts.expect("falls back to built-ins");
+        assert_eq!(
+            prompts,
+            crate::agent::bigctx::rules::default_prompts(),
+            "the fallback must be the built-in set, not empty strings"
+        );
+        std::fs::remove_dir_all(&cwd).ok();
     }
 
     #[test]
