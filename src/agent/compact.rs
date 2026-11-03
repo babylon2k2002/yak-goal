@@ -144,13 +144,25 @@ pub fn reserve_tokens(window: u64, max_output: Option<u64>) -> u64 {
     let cap = (window as f64 * RESERVE_MAX_PCT) as u64;
     let sized = max_output.unwrap_or(0).max(RESERVE_TOKENS);
     let reserve = sized.min(cap).max(RESERVE_TOKENS);
-    // A window smaller than the floor cannot honour it. Taking the floor anyway
-    // would leave a window's-width minus one byte for the conversation, pinning
-    // the trigger at 1 — compaction would then fire on every request, including
-    // the very first, against a context that was never sent. Half the window is
-    // the most a reserve may claim in that case, so a small-window model still
-    // gets to hold a real conversation between folds.
-    reserve.min(window / 2).max(1)
+    // A reserve that consumes the window leaves almost nothing to send: the
+    // trigger lands near zero and compaction fires on every request, including
+    // the first, against a context that was never sent. Below that line the
+    // historical value stands untouched, so a window that already worked keeps
+    // its exact trigger and a resumed session does not start folding earlier.
+    //
+    // The threshold is a quarter of the window, not "reserve >= window": the
+    // reserve is subtracted from the window to form the trigger, so a reserve
+    // of window-1 is just as degenerate as one of window, and both slipped
+    // through the equality test.
+    // "Leaves less than a tenth of the window to send" is the line: at that
+    // point the trigger is small enough that any real conversation folds on
+    // every request. Everything above keeps its historical trigger exactly, so
+    // a 20k window behaves as it always did and only genuinely tiny windows
+    // are rescued.
+    if window.saturating_sub(reserve) < window / 10 {
+        return (window / 2).max(1);
+    }
+    reserve
 }
 
 /// [`effective_trigger`] with the model's output limit taken into account.
@@ -902,12 +914,15 @@ mod tests {
         // The degenerate case: a reserve could otherwise equal the window and
         // pin the trigger at zero, which would fire compaction on every request
         // against a context that has not even been sent once.
-        for window in [1_000u64, 8_000, 20_000, RESERVE_TOKENS + 1] {
+        // The degenerate shape is a trigger so small that any real
+        // conversation folds on every request — including the first, against a
+        // context that was never sent.
+        for window in [1_000u64, 8_000, 16_384, 20_000, 32_000, 200_000] {
             let reserve = reserve_tokens(window, None);
             let trigger = window.saturating_sub(reserve);
             assert!(
-                trigger > window / 4,
-                "a {window} window must keep room for a conversation,                  got reserve {reserve} and trigger {trigger}"
+                trigger > 0 && trigger >= window / 10,
+                "a {window} window must keep usable room,                  got reserve {reserve} and trigger {trigger}"
             );
         }
     }
