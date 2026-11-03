@@ -69,6 +69,16 @@ pub enum AgentUpdate {
         block: String,
         removed: usize,
     },
+    /// The request was refused for exceeding the window, compaction could not
+    /// fix it, and the oversized tool results were cut to make the retry fit.
+    ///
+    /// Reported because it is lossy: a fold leaves a block the model can
+    /// restore, this does not. The user should know which of the two just
+    /// happened to their history.
+    TruncatedForOverflow {
+        results: usize,
+        saved_tokens: u64,
+    },
     /// The automatic fold ran but could not get the context back under its
     /// floor, and says why.
     ///
@@ -733,6 +743,26 @@ pub fn run_agent(
                     overflow_compactions += 1;
                     continue;
                 }
+                // Compaction could not get there. Resending the same oversized
+                // request would be refused again for the same reason, so the
+                // only remaining move that keeps the run alive is to cut the
+                // bulk: the largest tool results lose their middles, and the
+                // request that goes out is at least smaller.
+                //
+                // This is deliberately the last resort. It loses information —
+                // unlike a fold, which leaves a block to restore — so it only
+                // runs when summarising has already failed.
+                let before = compact::estimate_tokens(&history, usage_marker);
+                let pruned = compact::prune_tool_results(&mut history);
+                if pruned.count > 0 {
+                    let after = compact::estimate_tokens(&history, usage_marker);
+                    on_update(AgentUpdate::TruncatedForOverflow {
+                        results: pruned.count,
+                        saved_tokens: before.saturating_sub(after),
+                    });
+                    overflow_compactions += 1;
+                    continue;
+                }
             }
             // A failed round is worth a resend whenever the failure is the
             // flaky kind: no output was handed out, so the replay cannot
@@ -1327,7 +1357,11 @@ fn maybe_compact(
     let Some(cfg) = cfg else {
         return after;
     };
-    let trigger = compact::effective_trigger(cfg.trigger_tokens, model.context_window);
+    let trigger = compact::effective_trigger_for(
+        cfg.trigger_tokens,
+        model.context_window,
+        compact::max_output_of(model),
+    );
     // The usage report covered everything except the assistant we just pushed.
     // A round whose counts never arrived is priced from the text instead (the
     // same chars/4 math `prune_seed_to_fit` runs), because a gateway that omits
@@ -1537,7 +1571,11 @@ pub fn compact_manual(
     opts: &AgentOptions<'_>,
     on_update: &mut dyn FnMut(AgentUpdate),
 ) -> Result<usize, String> {
-    let trigger = compact::effective_trigger(cfg.trigger_tokens, model.context_window);
+    let trigger = compact::effective_trigger_for(
+        cfg.trigger_tokens,
+        model.context_window,
+        compact::max_output_of(model),
+    );
     let mut skip_round = false;
     let mut ch = CompactHooks {
         hooks: opts.hooks,
@@ -1579,7 +1617,11 @@ fn force_compact(
         model,
         history,
         cfg,
-        compact::effective_trigger(cfg.trigger_tokens, model.context_window),
+        compact::effective_trigger_for(
+            cfg.trigger_tokens,
+            model.context_window,
+            compact::max_output_of(model),
+        ),
         &mut after,
         &mut *sink.on_update,
         ch,

@@ -114,10 +114,74 @@ pub fn should_compact(estimate: u64, trigger: u64) -> bool {
     trigger > 0 && estimate >= trigger
 }
 
-/// The room every auto-compaction leaves below the model's real window for the
-/// next answer and the summarizer call itself — the reserve
-/// (the compaction module).
+/// The smallest reserve auto-compaction keeps.
+///
+/// A reserve exists for two things: the answer the model is about to write, and
+/// the summariser call that runs when compaction fires (a summariser needs room
+/// for its own input plus its output). This floor covers a modest answer; the
+/// sized reserve below covers the rest.
 pub const RESERVE_TOKENS: u64 = 16_384;
+
+/// The largest share of the window a reserve may claim.
+///
+/// A reserve has to leave room to work in. On a small window a reserve sized by
+/// output alone could claim most of it, and compaction would fire constantly
+/// against a context that could still hold the conversation.
+const RESERVE_MAX_PCT: f64 = 0.25;
+
+/// How much room to leave below the window.
+///
+/// Sized by the model's own output limit when one is known, because the reserve
+/// has to hold the answer that limit permits: a 32K-output model needs more
+/// headroom than a 4K one on the same window. Clamped to
+/// [`RESERVE_MAX_PCT`] of the window and floored at [`RESERVE_TOKENS`], so a
+/// misconfigured limit cannot reserve the whole window, and an unknown limit
+/// behaves exactly as before.
+pub fn reserve_tokens(window: u64, max_output: Option<u64>) -> u64 {
+    let cap = (window as f64 * RESERVE_MAX_PCT) as u64;
+    let sized = max_output.unwrap_or(0).max(RESERVE_TOKENS);
+    // The floor wins over the cap when the window is small: a reserve smaller
+    // than the floor would leave the summariser no room, and a window that
+    // cannot fit the floor is a window this cannot help with anyway.
+    let reserve = sized.min(cap).max(RESERVE_TOKENS);
+    reserve.min(window.saturating_sub(1))
+}
+
+/// [`effective_trigger`] with the model's output limit taken into account.
+///
+/// The two-argument form stays for callers that have no model in hand; this is
+/// what the agent loop uses, because it is the one place that knows the output
+/// limit.
+pub fn effective_trigger_for(
+    configured: Option<u64>,
+    window: Option<u64>,
+    max_output: Option<u64>,
+) -> u64 {
+    let Some(w) = window else {
+        return effective_trigger(configured, window);
+    };
+    let ceiling = w.saturating_sub(reserve_tokens(w, max_output));
+    match (configured, Some(ceiling)) {
+        (Some(0), _) => 0,
+        (_, None) | (None, Some(0)) => 0,
+        (None, Some(c)) => c,
+        (Some(n), Some(c)) => n.min(c),
+    }
+}
+
+/// The model's declared output limit, from its `-o max_tokens=…` option.
+///
+/// Read leniently: a non-numeric value is treated as absent rather than
+/// defaulting to 0, so a typo leaves the previous behaviour instead of silently
+/// shrinking the reserve to the floor.
+pub fn max_output_of(model: &crate::providers::ResolvedModel) -> Option<u64> {
+    model
+        .options
+        .iter()
+        .find(|(k, _)| k == "max_tokens" || k == "max_completion_tokens")
+        .and_then(|(_, v)| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+}
 
 /// The auto-compaction trigger. Unconfigured (`None`) with a known window
 /// means `window - reserve` — auto-compaction is on by default, anchored to

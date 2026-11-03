@@ -1048,6 +1048,12 @@ impl Session {
                     view.borrow_mut().pause();
                     view.borrow_mut().resume_wait();
                 }
+                AgentUpdate::TruncatedForOverflow { .. } => {
+                    // Same: the retry is about to be sent, and the line must
+                    // not be swallowed by the next progress update.
+                    view.borrow_mut().pause();
+                    view.borrow_mut().resume_wait();
+                }
                 AgentUpdate::CompactStalled { reason } => {
                     // compaction is due and cannot run: the session keeps
                     // growing over the window, so the reason is the one thing
@@ -1277,141 +1283,24 @@ impl Session {
                 view.borrow_mut().pause();
                 let p = crate::theme::err();
                 eprintln!(
-                    "{}! context fold stalled: {reason} — the context stays over the                      threshold and the next request may be rejected{}",
+                    "{}! context fold stalled: {reason} — the context stays over the "
+                    + "threshold and the next request may be rejected{}",
+                    p.red, p.reset
+                );
+            }
+            AgentUpdate::TruncatedForOverflow { results, saved_tokens } => {
+                view.borrow_mut().pause();
+                let p = crate::theme::err();
+                eprintln!(
+                    "{}! cut {results} tool result(s), {saved_tokens} tokens freed "
+                    + "— summarising failed, so detail was dropped that cannot be restored{}",
                     p.red, p.reset
                 );
             }
             _ => {}
         };
-        let result = crate::agent::compact_manual(
-            model,
-            &mut self.seed,
-            &self.compact,
-            focus,
-            &opts,
-            &mut on_update,
-        );
-        view.borrow_mut().abort();
-        crate::core::http::clear_interrupt();
-        result.map(|removed| {
-            // the folded conversation is one round: the summary message plus
-            // the kept tail, exactly the slice a resume rebuilds from
-            persist_round(
-                self.store.as_ref(),
-                &mut self.conversation_id,
-                &mut self.branch_parent,
-                &mut self.persist_error,
-                &identity,
-                &self.seed,
-                None,
-                "",
-                started,
-            );
-            let p = crate::theme::err();
-            eprintln!(
-                "{}compacted — {} messages folded into a summary{}",
-                p.dim, removed, p.reset
-            );
-        })
-    }
-
-    /// `--json`: the same task, with a line-delimited JSON event stream as
-    /// the output surface instead of the terminal UI. Every [`AgentUpdate`]
-    /// becomes one object and the closing `result` object carries the final
-    /// answer — the shape a supervising process parses (the `subagent`
-    /// example extension, an editor plugin, CI). Approvals still work: their
-    /// prompt goes to stderr, so stdout stays parseable.
-    fn run_task_json(
-        &mut self,
-        prompt: &str,
-        attachments: Vec<crate::providers::Attachment>,
-    ) -> Result<(crate::agent::AgentOutcome, String), String> {
-        let Some(model) = self.model.as_ref() else {
-            return Err(
-                "No model configured. Run /login to add a provider, then /model to pick one."
-                    .to_string(),
-            );
-        };
-        let opts = agent_opts(
-            self.max_request_bytes,
-            self.system.as_deref(),
-            &self.cwd,
-            self.stream,
-            &self.compact,
-            self.thinking.as_deref(),
-            &self.extensions,
-            &self.cache_key,
-            self.cache_anchor(),
-            self.cache_ttl,
-            self.goal.as_ref(),
-            self.bigctx_handle.clone(),
-            self.bigctx_config.clone(),
-            self.bigctx_round,
-            self.cache_ledger.clone(),
-            Some(self.ccr_store.clone()),
-        );
-        // the terminal path renders the reasoning trace through TaskView;
-        // here it is only carried into the stored turn
-        let mut reasoning = String::new();
-        let mut round_reasoning = String::new();
-        let mut round_started = std::time::Instant::now();
-        let mut total = crate::core::http::Usage::default();
-        let mut last_usage: Option<crate::core::http::Usage> = None;
-        let identity = TaskIdentity {
-            model,
-            cwd: &self.cwd,
-            system: self.system.as_deref(),
-        };
-        // the json path sends the compressed view too, so a --json session gets
-        // the same folding as the terminal one
-        let ((mut view_seed, bigctx_state), nudge) = bigctx_view_with_nudge(
-            &self.seed,
-            self.bigctx.as_ref(),
-            self.bigctx_round,
-            self.model.as_ref().and_then(|m| m.context_window),
-            self.bigctx_config.as_ref(),
-            None,
-        );
-        // The nudge rides the tail of the view: the head is the provider's
-        // cached prefix, and rewriting it would cost a full cache miss.
-        if let Some(text) = nudge.as_deref() {
-            inject_nudge(&mut view_seed, text);
-        }
-        let mut on_update = |u: AgentUpdate| {
-            match &u {
-                AgentUpdate::ReasoningDelta(text) => {
-                    reasoning.push_str(text);
-                    round_reasoning.push_str(text);
-                }
-                // same accounting as the terminal path, so the session totals
-                // and /status agree in both modes
-                AgentUpdate::TurnEnd { usage: Some(usage) } => {
-                    total.add(*usage);
-                    last_usage = Some(*usage);
-                }
-                // the round lands in the thread file here and is not emitted:
-                // the event stream stays the UI surface, persistence is not
-                // part of the contract
-                AgentUpdate::RoundEnd { messages, usage } => {
-                    persist_round(
-                        self.store.as_ref(),
-                        &mut self.conversation_id,
-                        &mut self.branch_parent,
-                        &mut self.persist_error,
-                        &identity,
-                        messages,
-                        *usage,
-                        &round_reasoning,
-                        round_started,
-                    );
-                    round_reasoning.clear();
-                    round_started = std::time::Instant::now();
-                    return;
-                }
-                _ => {}
-            }
-            emit_event(&event_json(&u));
-        };
+        emit_event(&event_json(&u));
+    };
         // --approval allow answers the ask-list prompt instead of failing
         // closed: a subagent child runs with stdin closed, and a hard deny
         // would just send the model looking for unlisted ways to do the same
@@ -1674,6 +1563,16 @@ fn event_json(u: &AgentUpdate) -> serde_json::Value {
         }
         AgentUpdate::AutoFoldStalled { reason } => {
             serde_json::json!({"type": "auto_fold_stalled", "reason": reason})
+        }
+        AgentUpdate::TruncatedForOverflow {
+            results,
+            saved_tokens,
+        } => {
+            serde_json::json!({
+                "type": "truncated_for_overflow",
+                "results": results,
+                "saved_tokens": saved_tokens
+            })
         }
         AgentUpdate::Compacting => serde_json::json!({"type": "compacting"}),
         AgentUpdate::CompactStalled { reason } => {
