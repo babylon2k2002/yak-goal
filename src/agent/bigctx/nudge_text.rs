@@ -272,14 +272,11 @@ fn render_distillation(
         .nudge_sections
         .render(&[(guidance_key, guidance_default.as_str())]);
     for text in guidance {
-        out.push('
-');
+        out.push('\n');
         out.push_str(&text);
-        out.push('
-');
+        out.push('\n');
     }
-    out.push_str("
-");
+    out.push_str("\n");
     out.push_str(prompts.rules_for(tier));
     out.trim_end().to_string()
 }
