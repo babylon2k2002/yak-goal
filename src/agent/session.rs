@@ -129,7 +129,7 @@ impl Session {
             self.model.as_ref().and_then(|m| m.context_window),
         );
         if crate::agent::compact::should_compact(estimate, trigger) {
-            crate::agent::compact::prune_tool_results(&mut self.seed);
+            crate::agent::compact::prune_tool_results(&mut self.seed, Some(&crate::agent::compact::retrieve_dir()));
         }
     }
 
@@ -1190,7 +1190,7 @@ pub fn rebuild_chain(turns: &[StoredTurn], chain: &[usize]) -> Result<Rebuilt, S
     }
     // Only the kept window is worth reading off disk: an older image rides as
     // provenance and the adapters render the missing payload as a note.
-    let start = image_window_start(&msgs).unwrap_or(0);
+    let start = image_window_start(&msgs, IMAGE_TURNS_KEPT).unwrap_or(0);
     for m in &mut msgs[start..] {
         let restored = rehydrated(m);
         *m = restored;
@@ -1216,7 +1216,14 @@ const IMAGE_TURNS_KEPT: usize = 2;
 /// turns — from tool results too, since a screenshot can enter as a `read`
 /// result and belongs to the turn it ran in.
 pub(crate) fn budget_images(msgs: &mut [Msg]) {
-    let Some(start) = image_window_start(msgs) else {
+    retain_image_turns(msgs, IMAGE_TURNS_KEPT);
+}
+
+/// Keep only the newest `keep` user turns' pixels; `0` drops every image. The
+/// overflow path tightens the window with this when a provider still refuses
+/// a prompt that the normal two-turn window did not fit.
+pub(crate) fn retain_image_turns(msgs: &mut [Msg], keep: usize) {
+    let Some(start) = image_window_start(msgs, keep) else {
         return;
     };
     for m in &mut msgs[..start] {
@@ -1224,17 +1231,19 @@ pub(crate) fn budget_images(msgs: &mut [Msg]) {
     }
 }
 
-/// Where the kept image window starts: the index of the `IMAGE_TURNS_KEPT`-th
-/// newest user turn. The window is anchored to turns, not to image-carrying
-/// turns — a lone screenshot must age out as the conversation moves on, or a
-/// thread that ever carried one pays for it forever. `None` when the history
-/// holds fewer user turns than the cap, so nothing is taken away.
-fn image_window_start(msgs: &[Msg]) -> Option<usize> {
+/// Where the kept image window starts: the index of the `keep`-th newest user
+/// turn. The window is anchored to turns, not to image-carrying turns — a lone
+/// screenshot must age out as the conversation moves on, or a thread that ever
+/// carried one pays for it forever. `None` when the history holds fewer user
+/// turns than the cap, so nothing is taken away.
+fn image_window_start(msgs: &[Msg], keep: usize) -> Option<usize> {
+    if keep == 0 {
+        // keep nothing: every stored image goes, from the first message on
+        return Some(0);
+    }
     // walk from the end; the cap-th newest user turn is where the window
-    // opens, and fewer than `IMAGE_TURNS_KEPT` user turns keeps everything.
-    // saturating, not `left -= 1`: a cap of 0 must mean "drop everything
-    // from the first user turn", not a usize underflow wrapping huge
-    let mut left = IMAGE_TURNS_KEPT;
+    // opens, and fewer than `keep` user turns keeps everything.
+    let mut left = keep;
     for (i, m) in msgs.iter().enumerate().rev() {
         if matches!(m, Msg::User { .. }) {
             left = left.saturating_sub(1);

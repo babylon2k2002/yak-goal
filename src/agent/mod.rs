@@ -238,6 +238,13 @@ pub fn run_agent(
         .collect();
 
     let mut history: Vec<Msg> = seed;
+    // the persisted goal is the one fact a fold must never paraphrase away;
+    // read it once per run, then hand its text to each compaction
+    let goal_text = opts
+        .goal
+        .as_ref()
+        .and_then(|g| g.current())
+        .map(|g| g.objective);
     // where the round in flight starts: everything from here on is the round
     // the next `RoundEnd` reports. Assigned fresh after the loop-top
     // compaction check (a rebuild shifts every index); the recovery and
@@ -346,6 +353,7 @@ pub fn run_agent(
             usage_marker,
             cfg_now.as_ref(),
             model.context_window,
+            model.kind == "anthropic",
             on_update,
         );
         // the pre-request compaction check: a session
@@ -359,6 +367,7 @@ pub fn run_agent(
                 skip_round: &mut skip_round,
                 reason: "trigger",
                 focus: None,
+                goal: goal_text.as_deref(),
             };
             let after = maybe_compact(
                 model,
@@ -444,12 +453,21 @@ pub fn run_agent(
                 && crate::core::http::context_overflow(&e)
                 && let Some(cfg) = cfg_now.as_ref()
             {
+                // images are the most expensive, worst-cached thing in the
+                // request: when a provider still refuses after the normal
+                // two-turn image window, tighten it before summarizing (first
+                // to the newest turn, then to none)
+                crate::agent::session::retain_image_turns(
+                    &mut history,
+                    if overflow_compactions == 0 { 1 } else { 0 },
+                );
                 let mut sink = StallSink::new(&mut compact_stalled, on_update);
                 let mut ch = CompactHooks {
                     hooks: opts.hooks,
                     skip_round: &mut skip_round,
                     reason: "overflow",
                     focus: None,
+                    goal: goal_text.as_deref(),
                 };
                 if force_compact(
                     model,
@@ -587,6 +605,7 @@ pub fn run_agent(
                     skip_round: &mut skip_round,
                     reason: "overflow",
                     focus: None,
+                    goal: goal_text.as_deref(),
                 };
                 if force_compact(
                     model,
@@ -860,6 +879,7 @@ fn price_and_rewrite(
     usage_marker: Option<(usize, Usage)>,
     cfg: Option<&compact::CompactConfig>,
     window: Option<u64>,
+    drop_reasoning: bool,
     on_update: &mut dyn FnMut(AgentUpdate),
 ) -> Option<u64> {
     let mut used_tokens = cfg.map(|_| compact::estimate_tokens(history, usage_marker));
@@ -872,9 +892,16 @@ fn price_and_rewrite(
     if rewrite {
         compact::trim_old_attachments(history);
         // the pass is idempotent, so its notice fires at most once per result
-        let stale = compact::prune_stale_tool_results(history);
+        let stale = compact::prune_stale_tool_results(history, Some(&compact::retrieve_dir()));
         if stale.count > 0 {
             on_update(AgentUpdate::ToolResultsPruned { count: stale.count });
+        }
+        // Anthropic bills a prior turn's thinking trace but lets a client
+        // omit it; dropping the oldest run is the shape its API accepts (a
+        // gap between kept blocks is what it rejects, and a suffix has none).
+        // Other wires keep theirs: codex reasoning items must round-trip.
+        if drop_reasoning {
+            compact::prune_stale_reasoning(history);
         }
         // the passes edited the prefix: re-price rather than hand the pre-trim
         // number to the compaction gate
@@ -926,7 +953,7 @@ fn maybe_compact(
         // The usage marker covers the un-pruned prefix, so re-estimating over
         // it would report the identical number; subtract what the projection
         // frees.
-        let pruned = compact::prune_tool_results(history);
+        let pruned = compact::prune_tool_results(history, Some(&compact::retrieve_dir()));
         if pruned.count > 0 {
             estimate = estimate.saturating_sub(pruned.freed_tokens);
             (sink.on_update)(AgentUpdate::ToolResultsPruned {
@@ -1000,6 +1027,22 @@ struct CompactHooks<'a> {
     skip_round: &'a mut bool,
     reason: &'a str,
     focus: Option<&'a str>,
+    /// the persisted goal's objective, kept verbatim through a fold
+    goal: Option<&'a str>,
+}
+
+/// Split a checkpoint at the verbatim block appended by
+/// `compact::preserved_checkpoints`: the body is what folds append to, and the
+/// carried block is replaced by the fresh one (or kept as-is when the prefix no
+/// longer has the plan/goal to re-derive it).
+fn split_checkpoints(text: &str) -> (String, Option<String>) {
+    match text.find(compact::CHECKPOINT_MARKER) {
+        Some(i) => (
+            text[..i].trim_end().to_string(),
+            Some(text[i + compact::CHECKPOINT_MARKER.len()..].to_string()),
+        ),
+        None => (text.to_string(), None),
+    }
 }
 
 /// Replace the prefix below the cut with a summary of it. `Err` names why the
@@ -1047,20 +1090,40 @@ fn compact_now(
     let Some(cut) = compact::find_cut(history, cfg.effective_keep_recent(trigger)) else {
         return Err("no turn boundary can be dropped without orphaning a tool result".to_string());
     };
-    let summary = compact::summarize(model, &history[..cut], ch.focus)?;
-    if summary.trim().is_empty() {
+    // The checkpoint is append-only: the fold writes a delta for the new
+    // messages and appends it, so earlier summary text (and the exact facts it
+    // pinned) survives every fold instead of being re-paraphrased. One tier-2
+    // call condenses it back down only once it has actually grown expensive.
+    let previous = match history.first() {
+        Some(Msg::Summary { text }) if !text.trim().is_empty() => Some(text.as_str()),
+        _ => None,
+    };
+    let (previous_body, carried) = previous
+        .map(split_checkpoints)
+        .unwrap_or_else(|| (String::new(), None));
+    let delta = compact::summarize(model, &history[..cut], ch.focus)?;
+    if delta.trim().is_empty() {
         return Err("the summarizer returned nothing".to_string());
     }
-    // the model's active plan lives in the prefix being dropped; re-attach it
-    // to the summary that replaces it, so the checklist survives compaction
-    // as the exact list the model last wrote (not a paraphrase the
-    // summarizer may compress or drop)
-    let summary = match compact::preserved_plan(&history[..cut]) {
-        Some(plan) => format!(
-            "{summary}\n\n[Your active task list was preserved across context compression]\n{plan}"
-        ),
-        None => summary,
+    let mut summary = if previous_body.is_empty() {
+        delta
+    } else {
+        format!("{previous_body}\n\n{delta}")
     };
+    if compact::text_tokens(&summary) > compact::SUMMARY_MERGE_TOKENS {
+        summary = compact::consolidate(model, &summary, ch.focus)?;
+        if summary.trim().is_empty() {
+            return Err("the summarizer returned nothing".to_string());
+        }
+    }
+    // the model's active plan and the persisted goal live in the prefix being
+    // dropped; re-attach them verbatim so the checklist and objective survive
+    // compaction as written, not as a paraphrase the summarizer may compress
+    let checkpoint = compact::preserved_checkpoints(&history[..cut], ch.goal).or(carried);
+    if let Some(checkpoint) = checkpoint {
+        summary.push_str(compact::CHECKPOINT_MARKER);
+        summary.push_str(&checkpoint);
+    }
     let tail = history.split_off(cut);
     history.clear();
     history.push(Msg::Summary { text: summary });
@@ -1111,12 +1174,18 @@ pub fn compact_manual(
     on_update: &mut dyn FnMut(AgentUpdate),
 ) -> Result<usize, String> {
     let trigger = compact::effective_trigger(cfg.trigger_tokens, model.context_window);
+    let goal_text = opts
+        .goal
+        .as_ref()
+        .and_then(|g| g.current())
+        .map(|g| g.objective);
     let mut skip_round = false;
     let mut ch = CompactHooks {
         hooks: opts.hooks,
         skip_round: &mut skip_round,
         reason: "manual",
         focus,
+        goal: goal_text.as_deref(),
     };
     let mut after = AfterTurn {
         usage_marker: None,

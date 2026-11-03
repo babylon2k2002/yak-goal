@@ -126,6 +126,7 @@ fn a_stalled_compaction_is_reported_once() {
             skip_round: &mut no_skip,
             reason: "trigger",
             focus: None,
+            goal: None,
         };
         let _ = maybe_compact(
             &model,
@@ -158,6 +159,7 @@ fn a_stalled_compaction_is_reported_once() {
             skip_round: &mut no_skip,
             reason: "trigger",
             focus: None,
+            goal: None,
         };
         let _ = maybe_compact(
             &model,

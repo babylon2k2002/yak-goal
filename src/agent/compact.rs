@@ -1,9 +1,11 @@
 //! Context compaction: estimate tokens (last usage + chars/4 tail), cut at a
 //! turn boundary keeping a recent window, and summarize the dropped prefix
-//! with one tool-free LLM call (one strategy, no menu).
+//! with one tool-free LLM call (one strategy, no menu). A pruned tool result
+//! is archived to a content-addressed file before its middle is cut, so the
+//! full output stays retrievable instead of being lost.
 
 use crate::core::http::{Event, Usage};
-use crate::providers::Msg;
+use crate::providers::{Attachment, Msg};
 use crate::providers::PromptInput;
 
 #[derive(Clone)]
@@ -64,10 +66,42 @@ pub(crate) fn text_tokens(text: &str) -> u64 {
     ascii.div_ceil(4) + wide
 }
 
+/// Rough token cost of one attachment still carrying its payload. Images are
+/// priced flat near the vision encoders' own ceiling (OpenAI's high-detail max
+/// is 2805; Anthropic's ~1534) instead of by base64 length — bytes over-count a
+/// screenshot some 15x, and reading real pixel dimensions would need a
+/// container parser this tree does not carry. A non-image payload (a document
+/// or audio) rides the wire as base64 text, so chars/4 matches how it is
+/// billed. A payload-less record is either a URL the adapter fetches (a
+/// conservative flat cost) or a resumed provenance stub the wire never sees.
+const IMAGE_TOKENS: u64 = 1_600;
+const REMOTE_ATTACHMENT_TOKENS: u64 = 2_048;
+
+fn attachment_tokens(a: &Attachment) -> u64 {
+    if a.base64_data.is_empty() {
+        if a.url.is_some() {
+            REMOTE_ATTACHMENT_TOKENS
+        } else {
+            0
+        }
+    } else if a.is_image() {
+        IMAGE_TOKENS
+    } else {
+        (a.base64_data.len() as u64).div_ceil(4)
+    }
+}
+
+fn attachments_tokens(attachments: &[Attachment]) -> u64 {
+    attachments.iter().map(attachment_tokens).sum()
+}
+
 /// Rough token cost of one message (text estimate plus a per-message overhead).
 fn msg_tokens(msg: &Msg) -> u64 {
-    let text: &str = match msg {
-        Msg::User { text, .. } | Msg::Summary { text } => text,
+    match msg {
+        Msg::User { text, attachments } => {
+            text_tokens(text) + attachments_tokens(attachments) + 16
+        }
+        Msg::Summary { text } => text_tokens(text) + 16,
         Msg::Assistant {
             text,
             tool_calls,
@@ -85,11 +119,14 @@ fn msg_tokens(msg: &Msg) -> u64 {
             // compaction trigger from lagging the real prompt size on
             // hosts that require the trace back
             let trace = reasoning.as_deref().map(text_tokens).unwrap_or(0);
-            return text_tokens(text) + calls + trace + 16;
+            text_tokens(text) + calls + trace + 16
         }
-        Msg::ToolResult { content, .. } => content,
-    };
-    text_tokens(text) + 16
+        Msg::ToolResult {
+            content,
+            attachments,
+            ..
+        } => text_tokens(content) + attachments_tokens(attachments) + 16,
+    }
 }
 
 /// Estimate the context size: the last reported usage covers the first
@@ -211,8 +248,9 @@ const SECTIONS: &str = "## Goal\n\
                          - [Any data, examples, or references needed to continue]\n\
                          - [Or \"(none)\" if not applicable]\n\
                          \n\
-                         Keep each section concise. Preserve exact file paths, function names, and \
-                         error messages.";
+                         Keep each section concise. KEEP verbatim: file paths, function/type names, \
+                         commands, error messages, numeric values, IDs. DROP play-by-play narration, \
+                         superseded attempts, and anything derivable cheaply.";
 
 const TEMPLATE: &str = "The messages above are a conversation to summarize. Create a structured \
                         context checkpoint summary that another LLM will use to continue the work.\n\
@@ -220,19 +258,33 @@ const TEMPLATE: &str = "The messages above are a conversation to summarize. Crea
                         Use this EXACT format:\n\
                         \n";
 
-const UPDATE_TEMPLATE: &str = "The messages above are NEW conversation messages to incorporate into \
-                              the existing summary provided in <previous-summary> tags.\n\
+const DELTA_TEMPLATE: &str = "The messages above are NEW conversation messages since the last \
+                              checkpoint, whose summary is in <previous-summary> tags.\n\
                               \n\
-                              Update the existing structured summary with new information. RULES:\n\
-                              - PRESERVE all existing information from the previous summary\n\
-                              - ADD new progress, decisions, and context from the new messages\n\
-                              - UPDATE the Progress section: move items from \"In Progress\" to \"Done\" when completed\n\
-                              - UPDATE \"Next Steps\" based on what was accomplished\n\
-                              - PRESERVE exact file paths, function names, and error messages\n\
-                              - If something is no longer relevant, you may remove it\n\
+                              Write ONLY a short update to that checkpoint. RULES:\n\
+                              - Report only what the new messages ADD: progress, decisions,\n\
+                              constraints, and what changes about the next step.\n\
+                              - Do NOT repeat or restate anything already in the previous summary.\n\
+                              - Do NOT re-emit the whole checkpoint; the caller appends this update to it.\n\
+                              - Preserve exact file paths, function names, and error messages.\n\
+                              - If a prior item is now done or no longer relevant, say so in one bullet.\n\
                               \n\
-                              Use this EXACT format:\n\
+                              Use the same section headings as the checkpoint, with only the changed \
+                              bullets under each. Omit unchanged sections entirely.\n\
                               \n";
+
+const DELTA_SECTIONS: &str = "Keep it concise. KEEP verbatim: file paths, function/type names, \
+                              commands, error messages, numeric values, IDs. DROP play-by-play \
+                              narration and superseded attempts.";
+
+const CONSOLIDATE_TEMPLATE: &str = "The checkpoint below has grown long. Condense it into one tight \
+                                    structured summary that another LLM will use to continue the \
+                                    work. Merge duplicates, drop narration, keep every load-bearing \
+                                    fact (paths, names, decisions, constraints, error messages, IDs). \
+                                    Add nothing that is not already in the checkpoint.\n\
+                                    \n\
+                                    Output the same EXACT format:\n\
+                                    \n";
 
 /// Keep the summarizer's own request bounded: per-message truncation alone
 /// still lets a long prefix overflow the context window, which turns the
@@ -325,24 +377,50 @@ pub(crate) fn preserved_plan(prefix: &[Msg]) -> Option<String> {
     })
 }
 
+/// Marks the verbatim tail of a checkpoint (the plan/goal block). Folds strip
+/// it before appending their delta and re-append the freshest one, so the
+/// block never accumulates copies.
+pub const CHECKPOINT_MARKER: &str = "\n\n[preserved across context compression]\n";
+
+/// The facts a checkpoint must carry verbatim even though the model wrote them
+/// elsewhere: the active task list (the exact list the model last wrote) and
+/// the persisted goal. `None` when neither is present.
+pub fn preserved_checkpoints(prefix: &[Msg], goal: Option<&str>) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(plan) = preserved_plan(prefix) {
+        parts.push(format!("[active task list]\n{plan}"));
+    }
+    if let Some(goal) = goal.map(str::trim).filter(|g| !g.is_empty()) {
+        parts.push(format!("[active goal]\n{goal}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    }
+}
+
 /// Run the summarization call: streaming, no tools. A prefix that already
-/// starts with a summary is an incremental update (the
-/// `UPDATE_SUMMARIZATION_PROMPT`), not a from-scratch re-summary.
+/// starts with a summary is an incremental update: the checkpoint is
+/// append-only, so the call is told to return only the delta and the previous
+/// summary rides in as context to keep it from being restated.
 pub fn summarize(
     model: &crate::providers::ResolvedModel,
     prefix: &[Msg],
     focus: Option<&str>,
 ) -> Result<String, String> {
-    let (template, conversation) = match prefix.first() {
+    let (template, sections, conversation) = match prefix.first() {
         Some(Msg::Summary { text }) => (
-            UPDATE_TEMPLATE,
+            DELTA_TEMPLATE,
+            DELTA_SECTIONS,
             format!(
-                "<previous-summary>\n{text}\n</previous-summary>\n\n<conversation>\n{}</conversation>",
+                "<previous-summary>\n{text}\n</previous-summary>\n\n<new-messages>\n{}\n</new-messages>",
                 serialize_prefix(&prefix[1..])
             ),
         ),
         _ => (
             TEMPLATE,
+            SECTIONS,
             format!(
                 "<conversation>\n{}</conversation>",
                 serialize_prefix(prefix)
@@ -354,15 +432,39 @@ pub fn summarize(
     // summarizer reads them as emphasis, not as part of the conversation
     let prompt = match focus {
         Some(focus) if !focus.trim().is_empty() => {
-            format!("{template}\n\nAdditional focus: {focus}\n{SECTIONS}\n\n{conversation}")
+            format!("{template}\n\nAdditional focus: {focus}\n{sections}\n\n{conversation}")
         }
-        _ => format!("{template}\n{SECTIONS}\n\n{conversation}"),
+        _ => format!("{template}\n{sections}\n\n{conversation}"),
     };
+    run_summarizer(model, &prompt)
+}
+
+/// One tier-2 pass: condense a checkpoint that has outgrown
+/// [`SUMMARY_MERGE_TOKENS`] back into the same tight structure. It is the one
+/// path that rewrites earlier checkpoint text (every fold appends); it runs
+/// only once the append-only text has actually grown expensive, so the usual
+/// fold pays no extra model call.
+pub fn consolidate(
+    model: &crate::providers::ResolvedModel,
+    checkpoint: &str,
+    focus: Option<&str>,
+) -> Result<String, String> {
+    let instructions = match focus {
+        Some(focus) if !focus.trim().is_empty() => format!("\n\nAdditional focus: {focus}"),
+        _ => String::new(),
+    };
+    let prompt = format!(
+        "{CONSOLIDATE_TEMPLATE}{instructions}\n{SECTIONS}\n\n<checkpoint>\n{checkpoint}\n</checkpoint>"
+    );
+    run_summarizer(model, &prompt)
+}
+
+fn run_summarizer(model: &crate::providers::ResolvedModel, prompt: &str) -> Result<String, String> {
     let input = PromptInput {
         max_request_bytes: crate::core::http::MAX_REQUEST_BYTES,
         system: Some(SUMMARIZER_SYSTEM),
         history: &[],
-        prompt: &prompt,
+        prompt,
         attachments: &[],
         tools: &[],
         reasoning: None,
@@ -468,10 +570,48 @@ pub const STALE_PRUNE_THRESHOLD_CHARS: usize = 32_768;
 /// still need verbatim.
 pub const KEEP_FRESH_MESSAGES: usize = 6;
 
+/// A thinking trace shorter than this is left alone: it costs little and the
+/// churn of editing the prefix (one cache miss) buys almost nothing. The drop
+/// targets the long traces that dominate a thinking model's context.
+pub const REASONING_DROP_THRESHOLD_CHARS: usize = 2048;
+
+/// An append-only checkpoint is only condensed (one extra summarizer call)
+/// once it grows past this many tokens; below it the checkpoint stays exactly
+/// as the folds wrote it, with nothing rewritten.
+pub const SUMMARY_MERGE_TOKENS: u64 = 6_000;
+
+/// The directory a pruned tool result is archived to before its middle is cut:
+/// content-addressed files under `user_dir()/tmp/retrieve`, swept with the
+/// rest of `tmp/` by `core::tmp`. The full text leaves the model's context but
+/// stays in reach of the `read` tool, so a pruned command's output is still
+/// retrievable after the chars/4 cutoff.
+pub fn retrieve_dir() -> std::path::PathBuf {
+    crate::core::config::user_dir().join("tmp").join("retrieve")
+}
+
+/// Write the original behind a content hash and return its path. `None` when
+/// there is nowhere to write; the pruning still proceeds, the marker just
+/// falls back to telling the model to re-run the command.
+fn save_original(content: &str, dir: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    let dir = dir?;
+    std::fs::create_dir_all(dir).ok()?;
+    let path = dir.join(format!("{}.txt", crate::core::sha256::hex(content.as_bytes())));
+    if path.exists() {
+        return Some(path);
+    }
+    crate::core::fsx::write_atomic(&path, content.as_bytes(), Some(0o600)).ok()?;
+    Some(path)
+}
+
 /// Project one over-budget tool result down to head + marker + tail. `None`
 /// when the result fits. Returns the projected text and the tokens it keeps
-/// out of the next request.
-fn prune_one(content: &str, threshold: usize) -> Option<(String, u64)> {
+/// out of the next request. The cut middle is archived first (see
+/// [`retrieve_dir`]) so the model can still read it back.
+fn prune_one(
+    content: &str,
+    threshold: usize,
+    dir: Option<&std::path::Path>,
+) -> Option<(String, u64)> {
     let total = content.chars().count();
     if total <= threshold {
         return None;
@@ -490,10 +630,18 @@ fn prune_one(content: &str, threshold: usize) -> Option<(String, u64)> {
     let head = &content[..head_end];
     let tail = &content[tail_start..];
     let dropped = total - PRUNE_HEAD_CHARS - PRUNE_TAIL_CHARS;
-    let projected = format!(
-        "{head}\n[... {dropped} chars of the middle were cut to fit the context window; \
-         re-run the command or re-read the file if you need them ...]\n{tail}"
-    );
+    let hint = match save_original(content, dir) {
+        Some(path) => format!(
+            "[... {dropped} chars of the middle were cut to fit the context window; \
+             the full output is saved at {} — read it if you need it ...]",
+            path.display()
+        ),
+        None => format!(
+            "[... {dropped} chars of the middle were cut to fit the context window; \
+             re-run the command or re-read the file if you need them ...]"
+        ),
+    };
+    let projected = format!("{head}\n{hint}\n{tail}");
     let freed = text_tokens(content).saturating_sub(text_tokens(&projected));
     Some((projected, freed))
 }
@@ -511,9 +659,12 @@ pub struct PrunedResults {
 /// once compaction pressure is confirmed, before the summarizer picks its
 /// cut — it costs no model call and may relieve enough to skip
 /// summarization entirely (the caller subtracts `freed_tokens` to see that).
-pub fn prune_tool_results(history: &mut [Msg]) -> PrunedResults {
+pub fn prune_tool_results(
+    history: &mut [Msg],
+    dir: Option<&std::path::Path>,
+) -> PrunedResults {
     let len = history.len();
-    prune_matching(history, PRUNE_THRESHOLD_CHARS, len)
+    prune_matching(history, PRUNE_THRESHOLD_CHARS, len, dir)
 }
 
 /// The every-round pass, run before each request regardless of compaction
@@ -522,12 +673,74 @@ pub fn prune_tool_results(history: &mut [Msg]) -> PrunedResults {
 /// projected down too. Recent results stay verbatim — the model usually
 /// needs those — while a huge one from earlier in the task stops being
 /// re-sent every round.
-pub fn prune_stale_tool_results(history: &mut [Msg]) -> PrunedResults {
+pub fn prune_stale_tool_results(
+    history: &mut [Msg],
+    dir: Option<&std::path::Path>,
+) -> PrunedResults {
     let stale_up_to = history.len().saturating_sub(KEEP_FRESH_MESSAGES);
-    prune_matching(history, STALE_PRUNE_THRESHOLD_CHARS, stale_up_to)
+    prune_matching(history, STALE_PRUNE_THRESHOLD_CHARS, stale_up_to, dir)
 }
 
-fn prune_matching(history: &mut [Msg], threshold: usize, up_to: usize) -> PrunedResults {
+/// Drop old thinking traces: a reasoning block is only needed on the turn that
+/// produced it, and Anthropic's API explicitly lets a client omit prior turns'
+/// thinking. A kept suffix is the safe shape — the blocks removed are the
+/// OLDEST run, never a gap between two kept ones, which is what the
+/// preserved-thinking models reject. Only called for the anthropic wire:
+/// codex reasoning items must be passed back, and an openai-compat gateway
+/// that demands `reasoning_content` back would 400 on a gap.
+pub fn prune_stale_reasoning(history: &mut [Msg]) -> PrunedResults {
+    let up_to = history.len().saturating_sub(KEEP_FRESH_MESSAGES);
+    // owned copy so the result map does not borrow history while it is mutated
+    let last: std::collections::HashMap<String, usize> =
+        crate::providers::last_result_index(history)
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+    let mut out = PrunedResults {
+        count: 0,
+        freed_tokens: 0,
+    };
+    for msg in history[..up_to].iter_mut() {
+        // a tool-use turn stays open while any of its results is still in the
+        // kept window, so only turns whose results all sit below the cut are
+        // safe to strip
+        let closed = match msg {
+            Msg::Assistant { tool_calls, .. } => tool_calls
+                .iter()
+                .all(|c| last.get(&c.id).is_some_and(|&j| j < up_to)),
+            _ => continue,
+        };
+        if !closed {
+            continue;
+        }
+        let Msg::Assistant {
+            reasoning,
+            reasoning_meta,
+            ..
+        } = msg
+        else {
+            continue;
+        };
+        let Some(trace) = reasoning.as_deref() else {
+            continue;
+        };
+        if trace.chars().count() <= REASONING_DROP_THRESHOLD_CHARS {
+            continue;
+        }
+        out.freed_tokens += text_tokens(trace);
+        *reasoning = None;
+        *reasoning_meta = None;
+        out.count += 1;
+    }
+    out
+}
+
+fn prune_matching(
+    history: &mut [Msg],
+    threshold: usize,
+    up_to: usize,
+    dir: Option<&std::path::Path>,
+) -> PrunedResults {
     let mut out = PrunedResults {
         count: 0,
         freed_tokens: 0,
@@ -536,7 +749,7 @@ fn prune_matching(history: &mut [Msg], threshold: usize, up_to: usize) -> Pruned
         let Msg::ToolResult { content, .. } = msg else {
             continue;
         };
-        let Some((projected, freed)) = prune_one(content, threshold) else {
+        let Some((projected, freed)) = prune_one(content, threshold, dir) else {
             continue;
         };
         *content = projected;
@@ -856,7 +1069,7 @@ mod tests {
             Msg::tool_result("2", "bash", "small"),
         ];
         let before = estimate_tokens(&history, None);
-        let pruned = prune_tool_results(&mut history);
+        let pruned = prune_tool_results(&mut history, None);
         assert_eq!(pruned.count, 1);
         let content = match &history[0] {
             Msg::ToolResult { content, .. } => content,
@@ -879,7 +1092,7 @@ mod tests {
         assert_eq!(before - after, pruned.freed_tokens);
         assert!(pruned.freed_tokens > 3_000, "{}", pruned.freed_tokens);
         // a pruned result is under threshold: the second pass is a no-op
-        let again = prune_tool_results(&mut history);
+        let again = prune_tool_results(&mut history, None);
         assert_eq!((again.count, again.freed_tokens), (0, 0));
         // small results are untouched
         match &history[1] {
@@ -904,7 +1117,7 @@ mod tests {
         // the dump sits well before the fresh window
         let mut history = vec![small.clone(), big()];
         history.extend(filler(KEEP_FRESH_MESSAGES + 2));
-        let pruned = prune_stale_tool_results(&mut history);
+        let pruned = prune_stale_tool_results(&mut history, None);
         assert_eq!(pruned.count, 1, "only the old dump");
         assert!(pruned.freed_tokens > 8_000);
         match (&history[0], &history[1]) {
@@ -915,13 +1128,13 @@ mod tests {
             _ => unreachable!(),
         }
         // idempotent: the next round changes nothing and reports nothing
-        let again = prune_stale_tool_results(&mut history);
+        let again = prune_stale_tool_results(&mut history, None);
         assert_eq!((again.count, again.freed_tokens), (0, 0));
 
         // a result of the same size inside the fresh window stays whole
         let mut fresh = filler(1);
         fresh.push(big());
-        let untouched = prune_stale_tool_results(&mut fresh);
+        let untouched = prune_stale_tool_results(&mut fresh, None);
         assert_eq!(untouched.count, 0, "recent results stay verbatim");
     }
 
@@ -929,7 +1142,7 @@ mod tests {
     fn pruning_cuts_on_codepoint_boundaries() {
         // byte-indexed slicing would split a CJK char mid-codepoint
         let mut history = vec![Msg::tool_result("1", "read", "中".repeat(10_000))];
-        assert_eq!(prune_tool_results(&mut history).count, 1);
+        assert_eq!(prune_tool_results(&mut history, None).count, 1);
         let content = match &history[0] {
             Msg::ToolResult { content, .. } => content,
             _ => unreachable!(),
@@ -961,5 +1174,111 @@ mod tests {
             None
         );
         assert_eq!(preserved_plan(&[]), None);
+    }
+
+    #[test]
+    fn image_attachments_are_priced_near_the_vision_ceiling() {
+        let stub = crate::providers::Attachment {
+            mime_type: "image/png".into(),
+            base64_data: String::new(),
+            filename: Some("shot.png".into()),
+            path: Some("/gone.png".into()),
+            url: None,
+        };
+        let plain = Msg::user("hi");
+        // a payload-less provenance stub is never sent: it costs nothing
+        let with_stub = Msg::user_with("hi", vec![stub.clone()]);
+        assert_eq!(msg_tokens(&with_stub), msg_tokens(&plain));
+        // a live screenshot costs the flat image price, not its 4MB of base64
+        let shot = crate::providers::Attachment {
+            base64_data: "A".repeat(4 * 1024 * 1024),
+            ..stub.clone()
+        };
+        let with_shot = Msg::user_with("hi", vec![shot]);
+        assert_eq!(msg_tokens(&with_shot) - msg_tokens(&plain), IMAGE_TOKENS);
+        // a non-image payload rides as base64 text: priced by its length
+        let doc = crate::providers::Attachment {
+            mime_type: "application/pdf".into(),
+            base64_data: "A".repeat(8_000),
+            ..stub
+        };
+        let with_doc = Msg::user_with("hi", vec![doc]);
+        assert_eq!(msg_tokens(&with_doc) - msg_tokens(&plain), 2_000);
+    }
+
+    /// Old thinking traces are dropped (Anthropic omits prior-turn thinking);
+    /// the fresh window and any still-open tool-use turn keep theirs verbatim.
+    #[test]
+    fn stale_reasoning_is_dropped_fresh_and_open_turns_keep_it() {
+        let long = || "t".repeat(REASONING_DROP_THRESHOLD_CHARS + 1);
+        let call = |id: &str, r: Option<String>| Msg::Assistant {
+            text: String::new(),
+            tool_calls: vec![super::super::ToolCall {
+                id: id.into(),
+                name: "bash".into(),
+                arguments: json!({"command": "ls"}),
+            }],
+            reasoning: r,
+            reasoning_meta: None,
+        };
+        let mut history = vec![
+            user("task"),
+            call("1", Some(long())),
+            Msg::tool_result("1", "bash", "ok"),
+        ];
+        history.extend((0..KEEP_FRESH_MESSAGES).map(|i| Msg::assistant(format!("step {i}"))));
+        let pruned = prune_stale_reasoning(&mut history);
+        assert_eq!(pruned.count, 1);
+        assert!(pruned.freed_tokens > 0);
+        assert!(matches!(
+            &history[1],
+            Msg::Assistant { reasoning: None, .. }
+        ));
+        // idempotent
+        assert_eq!(prune_stale_reasoning(&mut history).count, 0);
+
+        // a trace inside the fresh window is never touched
+        let mut fresh = vec![Msg::assistant("x")];
+        fresh.extend((0..KEEP_FRESH_MESSAGES - 1).map(|i| Msg::assistant(format!("s{i}"))));
+        fresh.push(call("9", Some(long())));
+        assert_eq!(prune_stale_reasoning(&mut fresh).count, 0);
+
+        // an open tool-use turn (its result still inside the kept window)
+        // keeps its thinking even though the assistant sits below the cut
+        let mut open = vec![
+            user("task"),
+            call("2", Some(long())),
+            Msg::tool_result("2", "bash", "ok"),
+        ];
+        open.extend((0..KEEP_FRESH_MESSAGES - 1).map(|i| Msg::assistant(format!("s{i}"))));
+        assert_eq!(prune_stale_reasoning(&mut open).count, 0);
+    }
+
+    /// A pruned tool result is archived whole to a file the marker names, so
+    /// the middle that left the context is still reachable by `read`.
+    #[test]
+    fn pruned_middle_is_archived_and_pointed_at() {
+        let dir = crate::core::testutil::scratch_dir("compact-retrieve");
+        let content = "z".repeat(20_000);
+        let mut history = vec![Msg::tool_result("1", "bash", content.clone())];
+        let pruned = prune_tool_results(&mut history, Some(dir.as_path()));
+        assert_eq!(pruned.count, 1);
+        let projected = match &history[0] {
+            Msg::ToolResult { content, .. } => content.clone(),
+            _ => unreachable!(),
+        };
+        assert!(projected.contains("saved at"), "{projected}");
+        // exactly one content-addressed file, holding the untouched original
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(std::fs::read_to_string(&files[0]).unwrap(), content);
+        assert!(
+            projected.contains(&files[0].display().to_string()),
+            "the marker names the file: {projected}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
