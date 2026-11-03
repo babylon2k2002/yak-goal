@@ -125,7 +125,6 @@ pub const SECTION_KEYS: &[&str] = &[
     "emergency_header",
     "tier2_guidance",
     "tier3_guidance",
-    "philosophy",
 ];
 
 const DEFAULT_EFFICIENCY_NOTE: &str = "This is an efficiency nudge to compress early and keep context lean — not an overflow warning. A separate, stronger alert will appear if the context is actually full.";

@@ -114,21 +114,6 @@ fn tool_prompts() -> BTreeMap<String, ToolPromptOverride> {
             ..Default::default()
         },
     );
-    // The fifth tool. It was missing here while the default prompt still named
-    // it, so the lean pack kept one full-length description and the saving was
-    // smaller than the pack claims — with nothing to indicate it. The test
-    // above reads the tool list out of the default prompt precisely so a sixth
-    // tool cannot be added without this being noticed.
-    out.insert(
-        "absorb".to_string(),
-        ToolPromptOverride {
-            description: Some(
-                "Distil one large tool result now so its original stops being re-sent."
-                    .to_string(),
-            ),
-            ..Default::default()
-        },
-    );
     out
 }
 
