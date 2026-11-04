@@ -761,9 +761,12 @@ pub fn run_agent(
 /// `HTTP <code>: <body>`, and a transport/stream failure as the bare message.
 /// So a status-coded failure is transient only when the *provider* broke
 /// (5xx, 408, 429); any other 4xx is the request's fault and resending the
-/// same body changes nothing. Anything without a status came from the
-/// transport or the stream layer and is retryable by construction. The caller
-/// caps how many times this may happen.
+/// same body changes nothing. A bare message is a transport or stream failure
+/// only when it says so; the empty message a gateway's bare `error` event
+/// produces is the one exception. Anything else without a status is a local
+/// configuration or input error (unknown provider, unsupported attachment)
+/// that a replay would only repeat. The caller caps how many times this may
+/// happen.
 fn recoverable_failure(error: &str) -> bool {
     // a press is not the provider being flaky: resending would ignore the
     // user and replay a request they already cancelled
@@ -785,10 +788,13 @@ fn recoverable_failure(error: &str) -> bool {
                 .unwrap_or(0);
             code >= 500 || code == 408 || code == 429
         }
-        // status 0: a transport failure or a stream that broke before its
-        // completion marker. Retryable — including the empty message a
-        // gateway's bare `error` event used to produce.
-        None => true,
+        // status 0: the only replayable case left is the empty message a
+        // gateway's bare `error` event produces. Connection/server failures
+        // already spent their retry budget inside `core/http.rs`, a stream
+        // drop after output is matched above, and a local configuration error
+        // (unknown provider, unsupported attachment) never reached the wire —
+        // replaying it just repeats the same failure.
+        None => error.is_empty(),
     }
 }
 
