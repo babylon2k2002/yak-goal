@@ -11,6 +11,13 @@ use std::time::{Duration, SystemTime};
 /// finds the images it references, short enough that the dir stays bounded.
 pub const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// Retrieved originals (`tmp/retrieve`, written by `agent::compact` before a
+/// tool result's middle is cut) outlive the scratch files: the thread that
+/// carries the marker can stay resumable for months, and a marker pointing at
+/// a deleted archive is a dead end. A quarter is the compromise between "the
+/// transcript still works" and "the directory stays bounded".
+pub const RETRIEVE_RETENTION: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+
 /// Delete regular files in `dir` last modified more than `retention` before
 /// `now`; returns how many went. A missing dir is simply nothing to do, and
 /// an entry that cannot be stat'ed or removed is left alone rather than
@@ -36,13 +43,14 @@ pub fn prune_before(dir: &Path, now: SystemTime, retention: Duration) -> usize {
     removed
 }
 
-/// Prune the user's tmp dir against the wall clock.
+/// Prune the user's tmp dir against the wall clock. The top level is
+/// non-recursive, so `retrieve/` (content-addressed originals) is swept on its
+/// own, longer clock instead of dying with the pasted images it sits next to.
 pub fn prune_user_tmp() -> usize {
-    prune_before(
-        &crate::core::config::user_dir().join("tmp"),
-        SystemTime::now(),
-        RETENTION,
-    )
+    let tmp = crate::core::config::user_dir().join("tmp");
+    let now = SystemTime::now();
+    prune_before(&tmp, now, RETENTION)
+        + prune_before(&tmp.join("retrieve"), now, RETRIEVE_RETENTION)
 }
 
 #[cfg(test)]
@@ -65,6 +73,25 @@ mod tests {
             dir.join("inner").is_dir(),
             "directories are not ours to cut"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retrieved_originals_outlive_the_scratch_window() {
+        // a pruned tool result's archive is what a resumed thread's marker
+        // points at: the week that clears a pasted screenshot must not clear it
+        let dir = crate::core::testutil::scratch_dir("tmp-retrieve");
+        std::fs::write(dir.join("abc.txt"), b"full output").unwrap();
+        let past_week = SystemTime::now() + RETENTION + Duration::from_secs(60);
+        assert_eq!(
+            prune_before(&dir, past_week, RETRIEVE_RETENTION),
+            0,
+            "still inside the archive's own window"
+        );
+        assert!(dir.join("abc.txt").exists());
+        let past_quarter = SystemTime::now() + RETRIEVE_RETENTION + Duration::from_secs(60);
+        assert_eq!(prune_before(&dir, past_quarter, RETRIEVE_RETENTION), 1);
+        assert!(!dir.join("abc.txt").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
