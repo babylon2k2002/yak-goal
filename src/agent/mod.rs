@@ -1227,12 +1227,14 @@ pub fn compact_manual(
         .and_then(|g| g.current())
         .map(|g| g.objective);
     let mut skip_round = false;
+    let mut rounds = 0u32;
     let mut ch = CompactHooks {
         hooks: opts.hooks,
         skip_round: &mut skip_round,
         reason: "manual",
         focus,
         goal: goal_text.as_deref(),
+        rounds_since_fold: &mut rounds,
     };
     let mut after = AfterTurn {
         usage_marker: None,
