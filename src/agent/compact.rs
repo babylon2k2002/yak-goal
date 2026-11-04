@@ -565,6 +565,11 @@ pub const PRUNE_TAIL_CHARS: usize = 1024;
 /// it may still be read verbatim by the model and are left alone until
 /// compaction pressure lowers the bar to [`PRUNE_THRESHOLD_CHARS`].
 pub const STALE_PRUNE_THRESHOLD_CHARS: usize = 32_768;
+/// Sizes the dominating-result pass projects to: a result larger than the
+/// whole keep window is already unkeepable, so a smaller head/tail is all the
+/// next request needs (the exact text is in the archive).
+pub const DOMINATING_HEAD_CHARS: usize = 2_048;
+pub const DOMINATING_TAIL_CHARS: usize = 512;
 /// How many trailing messages count as fresh (never stale-pruned): the
 /// current task's recent tool results, which the model is most likely to
 /// still need verbatim.
@@ -612,24 +617,37 @@ fn prune_one(
     threshold: usize,
     dir: Option<&std::path::Path>,
 ) -> Option<(String, u64)> {
-    let total = content.chars().count();
-    if total <= threshold {
+    if content.chars().count() <= threshold {
         return None;
     }
+    prune_one_sized(content, PRUNE_HEAD_CHARS, PRUNE_TAIL_CHARS, dir)
+}
+
+/// The same projection with caller-chosen head/tail sizes. The dominating-
+/// result pass keeps a smaller window: the result already outweighs everything
+/// compaction would keep, so the exact text lives in the archive and the model
+/// only needs the shape.
+fn prune_one_sized(
+    content: &str,
+    head_chars: usize,
+    tail_chars: usize,
+    dir: Option<&std::path::Path>,
+) -> Option<(String, u64)> {
+    let total = content.chars().count();
     // char-indexed cuts: byte offsets would split CJK text mid-codepoint
     let head_end = content
         .char_indices()
-        .nth(PRUNE_HEAD_CHARS)
+        .nth(head_chars)
         .map(|(i, _)| i)
         .unwrap_or(content.len());
     let tail_start = content
         .char_indices()
-        .nth_back(PRUNE_TAIL_CHARS)
+        .nth_back(tail_chars)
         .map(|(i, _)| i)
         .unwrap_or(0);
     let head = &content[..head_end];
     let tail = &content[tail_start..];
-    let dropped = total - PRUNE_HEAD_CHARS - PRUNE_TAIL_CHARS;
+    let dropped = total.saturating_sub(head_chars + tail_chars);
     let hint = match save_original(content, dir) {
         Some(path) => format!(
             "[... {dropped} chars of the middle were cut to fit the context window; \
@@ -665,6 +683,40 @@ pub fn prune_tool_results(
 ) -> PrunedResults {
     let len = history.len();
     prune_matching(history, PRUNE_THRESHOLD_CHARS, len, dir)
+}
+
+/// Project any single tool result that alone outweighs the window compaction
+/// would keep (`keep_tokens`). Such a result cannot survive a fold whatever
+/// the cut: summarizing it paraphrases the exact text the model may still
+/// need, while the archive holds it whole. Cutting it to head + tail first
+/// usually brings the request under the trigger, so the summarizer is never
+/// called — the fold-storm a single huge read causes at a small window.
+pub fn prune_dominating_results(
+    history: &mut [Msg],
+    keep_tokens: u64,
+    dir: Option<&std::path::Path>,
+) -> PrunedResults {
+    let mut out = PrunedResults {
+        count: 0,
+        freed_tokens: 0,
+    };
+    for msg in history.iter_mut() {
+        let Msg::ToolResult { content, .. } = msg else {
+            continue;
+        };
+        if text_tokens(content) <= keep_tokens {
+            continue;
+        }
+        let Some((projected, freed)) =
+            prune_one_sized(content, DOMINATING_HEAD_CHARS, DOMINATING_TAIL_CHARS, dir)
+        else {
+            continue;
+        };
+        *content = projected;
+        out.count += 1;
+        out.freed_tokens += freed;
+    }
+    out
 }
 
 /// The every-round pass, run before each request regardless of compaction

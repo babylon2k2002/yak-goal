@@ -968,6 +968,23 @@ fn maybe_compact(
         }
     }
     if compact::should_compact(estimate, trigger) {
+        // A result that alone outweighs the window the fold would keep cannot
+        // survive any cut: the summarizer would paraphrase the exact text the
+        // model may still need, while the archive holds it whole. Project it
+        // first — one huge read at a small window used to fold on every round.
+        let pruned = compact::prune_dominating_results(
+            history,
+            cfg.effective_keep_recent(trigger),
+            Some(&compact::retrieve_dir()),
+        );
+        if pruned.count > 0 {
+            estimate = estimate.saturating_sub(pruned.freed_tokens);
+            (sink.on_update)(AgentUpdate::ToolResultsPruned {
+                count: pruned.count,
+            });
+        }
+    }
+    if compact::should_compact(estimate, trigger) {
         // the summarize call below replays the whole dropped prefix to the
         // model and is the task's own work (not a provider prefill the next
         // round waits out): say so before it starts, or a long fold reads
