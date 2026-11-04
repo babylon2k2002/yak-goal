@@ -1015,9 +1015,16 @@ fn maybe_compact(
             ch,
         ) {
             Ok(()) => *ch.rounds_since_fold = 0,
-            // The history is untouched either way: the run continues, but a
-            // session that keeps growing past the trigger has to say why
-            Err(reason) => sink.stalled(reason),
+            // A stall is structural (no legal cut this round), not transient:
+            // retrying it immediately would only pay another summarizer call
+            // for the same refusal, so a failed fold waits out the cooldown
+            // exactly as a successful one does. The history is untouched, the
+            // run continues, and a session that keeps growing past the trigger
+            // still says why once per run.
+            Err(reason) => {
+                *ch.rounds_since_fold = 0;
+                sink.stalled(reason);
+            }
         }
     }
     after
