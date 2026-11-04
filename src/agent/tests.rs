@@ -117,6 +117,7 @@ fn a_stalled_compaction_is_reported_once() {
     let mut history = vec![Msg::user("the task"), Msg::user("more")];
     let mut warned = false;
     let mut no_skip = false;
+    let mut rounds = FOLD_COOLDOWN_ROUNDS;
     let mut updates: Vec<AgentUpdate> = Vec::new();
     {
         let mut push = |u: AgentUpdate| updates.push(u);
@@ -127,6 +128,7 @@ fn a_stalled_compaction_is_reported_once() {
             reason: "trigger",
             focus: None,
             goal: None,
+            rounds_since_fold: &mut rounds,
         };
         let _ = maybe_compact(
             &model,
@@ -160,6 +162,7 @@ fn a_stalled_compaction_is_reported_once() {
             reason: "trigger",
             focus: None,
             goal: None,
+            rounds_since_fold: &mut rounds,
         };
         let _ = maybe_compact(
             &model,

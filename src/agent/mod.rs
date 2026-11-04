@@ -260,6 +260,10 @@ pub fn run_agent(
     let mut usage_marker: Option<(usize, Usage)> = None;
     // one compaction-stalled notice per run (see `maybe_compact`)
     let mut compact_stalled = false;
+    // rounds since the last fold: the trigger path waits out the cooldown so a
+    // chunk-reading model at a small window cannot fold every other round. It
+    // starts past the cooldown so a run's first fold is never delayed.
+    let mut rounds_since_fold = FOLD_COOLDOWN_ROUNDS;
     // how many times a refused request was answered with a fresh compaction:
     // bounded, so a provider that refuses everything ends the run
     const MAX_OVERFLOW_COMPACTIONS: usize = 2;
@@ -368,6 +372,7 @@ pub fn run_agent(
                 reason: "trigger",
                 focus: None,
                 goal: goal_text.as_deref(),
+                rounds_since_fold: &mut rounds_since_fold,
             };
             let after = maybe_compact(
                 model,
@@ -468,6 +473,7 @@ pub fn run_agent(
                     reason: "overflow",
                     focus: None,
                     goal: goal_text.as_deref(),
+                    rounds_since_fold: &mut rounds_since_fold,
                 };
                 if force_compact(
                     model,
@@ -606,6 +612,7 @@ pub fn run_agent(
                     reason: "overflow",
                     focus: None,
                     goal: goal_text.as_deref(),
+                    rounds_since_fold: &mut rounds_since_fold,
                 };
                 if force_compact(
                     model,
@@ -984,11 +991,19 @@ fn maybe_compact(
             });
         }
     }
-    if compact::should_compact(estimate, trigger) {
-        // the summarize call below replays the whole dropped prefix to the
-        // model and is the task's own work (not a provider prefill the next
-        // round waits out): say so before it starts, or a long fold reads
-        // as a hung terminal
+    // A fold has to earn its summarizer call: it must free real space (the
+    // droppable prefix, not a few hundred tokens) and the previous fold must
+    // have settled. Both only gate the predicted trigger; a provider refusal
+    // or an explicit /compact always folds.
+    let cooldown_ok = if ch.reason == "trigger" {
+        *ch.rounds_since_fold += 1;
+        *ch.rounds_since_fold >= FOLD_COOLDOWN_ROUNDS
+    } else {
+        true
+    };
+    let keep = cfg.effective_keep_recent(trigger);
+    let worth_it = ch.reason != "trigger" || estimate.saturating_sub(keep) >= trigger / 2;
+    if compact::should_compact(estimate, trigger) && cooldown_ok && worth_it {
         (sink.on_update)(AgentUpdate::Compacting);
         match compact_now(
             model,
@@ -999,7 +1014,7 @@ fn maybe_compact(
             &mut *sink.on_update,
             ch,
         ) {
-            Ok(()) => {}
+            Ok(()) => *ch.rounds_since_fold = 0,
             // The history is untouched either way: the run continues, but a
             // session that keeps growing past the trigger has to say why
             Err(reason) => sink.stalled(reason),
@@ -1052,7 +1067,16 @@ struct CompactHooks<'a> {
     focus: Option<&'a str>,
     /// the persisted goal's objective, kept verbatim through a fold
     goal: Option<&'a str>,
+    /// rounds since the last successful fold (see `FOLD_COOLDOWN_ROUNDS`)
+    rounds_since_fold: &'a mut u32,
 }
+
+/// A fold costs a summarizer call and rewrites the cached prefix from the cut
+/// down. The trigger path therefore waits this many rounds after a successful
+/// fold: a small window with a model that reads in chunks used to fold every
+/// other round. A provider refusal (the overflow path) ignores the cooldown —
+/// retrying the same prompt unchanged cannot help.
+const FOLD_COOLDOWN_ROUNDS: u32 = 2;
 
 /// Split a checkpoint at the verbatim block appended by
 /// `compact::preserved_checkpoints`: the body is what folds append to, and the
